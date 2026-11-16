@@ -1,7 +1,6 @@
 #![allow(clippy::let_unit_value)]
 
 mod app_state;
-mod display_link;
 mod event_loop;
 mod hardware_keyboard;
 mod hardware_mouse;
@@ -21,6 +20,7 @@ pub(crate) use self::event_loop::{
     PlatformSpecificEventLoopAttributes,
 };
 pub(crate) use self::monitor::{MonitorHandle, VideoModeHandle};
+pub(crate) use self::view::set_log_hook;
 pub(crate) use self::window::{PlatformSpecificWindowAttributes, Window, WindowId};
 pub(crate) use crate::cursor::{
     NoCustomCursor as PlatformCustomCursor, NoCustomCursor as PlatformCustomCursorSource,

@@ -187,7 +187,7 @@ pub struct VersionJobStatus {
     pub error: Option<String>,
 }
 
-struct JobState {
+pub struct JobState {
     status: Mutex<VersionJobStatus>,
     cancel: AtomicBool,
 }

@@ -220,8 +220,3 @@ pub mod platform;
 #[cfg(all(test, not(target_os = "ios")))]
 #[path = "platform_impl/ios/hardware_keyboard.rs"]
 mod ios_hardware_keyboard_tests;
-
-// Horizon: refresh-rate lifecycle policy is platform-independent.
-#[cfg(all(test, not(target_os = "ios")))]
-#[path = "platform_impl/ios/display_link_policy.rs"]
-mod ios_display_link_policy_tests;

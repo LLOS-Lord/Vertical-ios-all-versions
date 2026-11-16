@@ -85,14 +85,12 @@ declare_class!(
 
         #[method(sceneDidBecomeActive:)]
         fn active(&self, scene: &UIWindowScene) {
-            super::display_link::active(MainThreadMarker::new().unwrap(), true);
             app_state::handle_nonuser_event(MainThreadMarker::new().unwrap(), EventWrapper::StaticEvent(Event::Resumed));
             windows(scene, Some(true), None);
         }
 
         #[method(sceneWillResignActive:)]
         fn inactive(&self, scene: &UIWindowScene) {
-            super::display_link::active(MainThreadMarker::new().unwrap(), false);
             windows(scene, Some(false), None);
             app_state::handle_nonuser_event(MainThreadMarker::new().unwrap(), EventWrapper::StaticEvent(Event::Suspended));
         }
@@ -101,11 +99,10 @@ declare_class!(
         fn foreground(&self, scene: &UIWindowScene) { windows(scene, None, Some(false)); }
 
         #[method(sceneDidEnterBackground:)]
-        fn background(&self, scene: &UIWindowScene) { super::display_link::active(MainThreadMarker::new().unwrap(), false); windows(scene, None, Some(true)); }
+        fn background(&self, scene: &UIWindowScene) { windows(scene, None, Some(true)); }
 
         #[method(sceneDidDisconnect:)]
         fn disconnect(&self, scene: &UIWindowScene) {
-            super::display_link::active(MainThreadMarker::new().unwrap(), false);
             windows(scene, Some(false), None);
             SCENE.with(|s| { s.borrow_mut().take(); });
         }

@@ -33,7 +33,6 @@ fn launcher_visibility(window: Option<&winit::window::Window>, visible: bool) ->
     #[cfg(target_os = "ios")]
     if let Some(window) = window {
         use winit::platform::ios::{ValidOrientations, WindowExtIOS};
-        window.set_preferred_frame_rate(if visible { None } else { Some(120) });
         window.set_valid_orientations(if visible {
             ValidOrientations::LandscapeAndPortrait
         } else {

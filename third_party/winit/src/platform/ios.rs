@@ -97,10 +97,6 @@ impl<T: 'static> EventLoopExtIOS for EventLoop<T> {
 
 /// Additional methods on [`Window`] that are specific to iOS.
 pub trait WindowExtIOS {
-    /// Horizon: requests a display refresh hint, capped by this window's screen.
-    /// `None` or zero pauses the hint's display link. The scene must also be active.
-    fn set_preferred_frame_rate(&self, frames_per_second: Option<u32>);
-
     /// Sets the [`contentScaleFactor`] of the underlying [`UIWindow`] to `scale_factor`.
     ///
     /// The default value is device dependent, and it's recommended GLES or Metal applications set
@@ -196,13 +192,16 @@ pub trait WindowExtIOS {
     ///
     /// The default is to not recognize gestures.
     fn recognize_rotation_gesture(&self, should_recognize: bool);
+
+    /// Whether the system draws a hardware mouse's pointer itself.
+    ///
+    /// This is true on iPadOS, whose pointer hovers and clicks. It is false on iOS, where a
+    /// connected mouse is seen only through its relative motion, so an application that shows
+    /// a pointer in its own screens has to draw it.
+    fn has_system_pointer(&self) -> bool;
 }
 
 impl WindowExtIOS for Window {
-    fn set_preferred_frame_rate(&self, frames_per_second: Option<u32>) {
-        self.window.maybe_queue_on_main(move |w| w.set_preferred_frame_rate(frames_per_second));
-    }
-
     #[inline]
     fn set_scale_factor(&self, scale_factor: f64) {
         self.window.maybe_queue_on_main(move |w| w.set_scale_factor(scale_factor))
@@ -264,6 +263,11 @@ impl WindowExtIOS for Window {
     #[inline]
     fn recognize_rotation_gesture(&self, should_recognize: bool) {
         self.window.maybe_queue_on_main(move |w| w.recognize_rotation_gesture(should_recognize));
+    }
+
+    #[inline]
+    fn has_system_pointer(&self) -> bool {
+        self.window.maybe_wait_on_main(|w| w.has_system_pointer())
     }
 }
 
@@ -440,4 +444,13 @@ pub enum StatusBarStyle {
     Default,
     LightContent,
     DarkContent,
+}
+
+/// Sends winit's own messages about this app (what the keyboard typed, and what asked for it)
+/// to `hook`, beside the device console they always go to.
+///
+/// winit has no logger of its own on iOS, and the console is where those lines end up; a game
+/// that keeps a log file of its own wants them in it, next to its own side of the story.
+pub fn set_log_hook(hook: Option<fn(&str)>) {
+    crate::platform_impl::set_log_hook(hook);
 }

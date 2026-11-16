@@ -8,9 +8,10 @@ Archive SHA-256 (also the original Cargo.lock checksum):
 Upstream revision: `e9809ef54b18499bb4f2cac945719ecc2a61061b`.
 The upstream Apache-2.0 license and copyright notices are retained in LICENSE.
 
-The patch is confined to Cargo.toml (UIKit binding features), src/lib.rs (host mapping and refresh-policy tests), src/platform/ios.rs (refresh hints),
-and src/platform_impl/ios/{mod,app_state,display_link,display_link_policy,view,view_controller,window,event_loop,scene,hardware_keyboard,hardware_mouse}.rs.
-`src/event.rs` also provides the iOS-only virtual-key constructor described below. All other files are the unmodified published crate. Root Cargo.toml patches crates.io so local
+The patch is confined to Cargo.toml (UIKit binding features), src/lib.rs (host mapping tests),
+src/event.rs (`KeyEvent::synthetic`, a key event for a touch control's mapped key), and
+src/platform_impl/ios/{mod,view,view_controller,window,event_loop,scene,hardware_keyboard,hardware_mouse}.rs.
+All other files are the unmodified published crate. Root Cargo.toml patches crates.io so local
 and CI builds use the same input backend; Cargo.lock removes only winit's registry source/checksum.
 
 UIKit UIKey physical HID usages produce ordinary winit keyboard events, with layout text,
@@ -24,7 +25,9 @@ relative movement, captured buttons, and scroll. New mice are attached during re
 disconnection releases buttons. Handler queues remain Apple's documented main-thread default.
 Captured indirect pointer touches are suppressed so one click does not also hit touch controls.
 
-The app requires iOS 16; pointer lock/GCMouse require iPadOS 14 and UIKey requires iOS 13.4.
+The app requires iOS 15; UIKey requires iOS 13.4 and GCMouse requires iOS 14. pointerLockState
+is readable on iOS 14, but prefersPointerLocked/setNeedsUpdateOfPrefersPointerLocked are iOS 16,
+so capture requests are skipped on iOS 15 and the pointer stays uncaptured there.
 UIKit ultimately decides whether to honor lock requests. Touch/controller input remains the
 fallback when no supported mouse is present. No cursor warping or private API is used.
 
@@ -54,21 +57,3 @@ bounds multiplied by its content scale. Safe-area insets must not shrink the Met
 which fills that view: doing so stretches the image and shifts rendered button locations away
 from their input regions after renderer recreation. Touches and indirect-pointer clicks use
 view-local coordinates, matching hover events, including across orientation changes.
-
-## Custom touch key transport
-
-`KeyEvent::from_virtual_key` creates an iOS-only physical key press/release without invented text or repeat events. Custom touch bindings use it to reach the same menu/edit-box handlers as physical keys. Horizon marks this dispatch as touch input so it neither claims hardware ownership nor adds virtual keys to the physical keyboard ledger.
-
-## ProMotion refresh rate
-
-`CADisableMinimumFrameDurationOnPhone` permits high refresh rates. The new
-`WindowExtIOS::set_preferred_frame_rate` supplies a bounded display-link hint;
-`None`/zero pauses it. The link is allocated only for an active game request,
-not at app launch. UIKit scene/application inactivity pauses it independently,
-and termination invalidates it. A resumed scene cannot restart a stopped game.
-
-The launcher pauses it while covering the engine. The game's effective frame
-limit updates it, including title-menu, idle, Battery Mode and native lower-limit
-policies. The requested range is capped by the window's actual screen maximum.
-The callback does no work; the existing game loop still decides when to draw.
-Pure host tests cover start/cover/background/resume and hardware/frame-limit caps.

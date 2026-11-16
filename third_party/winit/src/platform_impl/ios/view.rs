@@ -5,13 +5,16 @@ use std::collections::HashMap;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
+use objc2_foundation::{
+    CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSProcessInfo, NSProcessInfoThermalState,
+    NSSet, NSString,
+};
 use objc2_ui_kit::{
-    UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
+    UICoordinateSpace, UIDevice, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
     UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
     UIPanGestureRecognizer, UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder,
-    UIRotationGestureRecognizer, UITapGestureRecognizer, UITextInputTraits, UITouch, UITouchPhase,
-    UITouchType, UITraitEnvironment, UIView,
+    UIRotationGestureRecognizer, UIScreen, UITapGestureRecognizer, UITextInputTraits, UITouch,
+    UITouchPhase, UITouchType, UITraitEnvironment, UIUserInterfaceIdiom, UIView,
 };
 
 use super::app_state::{self, EventWrapper};
@@ -75,7 +78,9 @@ declare_class!(
             let mtm = MainThreadMarker::new().unwrap();
             let _: () = unsafe { msg_send![super(self), layoutSubviews] };
 
-            let window = self.window().unwrap();
+            // A full-screen modal (the launcher) takes the game's view out of its window while
+            // it covers it, and that view can still be laid out: there is no window to resize to.
+            let Some(window) = self.window() else { return };
             let window_bounds = window.bounds();
             // If the app is started in landscape, the view frame and window bounds can be mismatched.
             // The view frame will be in portrait and the window bounds in landscape. So apply the
@@ -190,6 +195,11 @@ declare_class!(
                     (TouchPhase::Moved, recognizer.scale() - last_scale)
                 }
                 UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
+                    log_to_console(&format!(
+                        "pinch gesture {:?} at {:.2}; the zoom it had is undone",
+                        recognizer.state(),
+                        recognizer.scale()
+                    ));
                     self.ivars().rotation_last_delta.set(0.0);
                     // Pass -delta so that action is reversed
                     (TouchPhase::Cancelled, -recognizer.scale())
@@ -248,6 +258,11 @@ declare_class!(
                     (TouchPhase::Ended, recognizer.rotation() - last_rotation)
                 }
                 UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
+                    log_to_console(&format!(
+                        "rotation gesture {:?} at {:.1} degrees; the turn it had is undone",
+                        recognizer.state(),
+                        recognizer.rotation().to_degrees()
+                    ));
                     self.ivars().rotation_last_delta.set(0.0);
 
                     // Pass -delta so that action is reversed
@@ -300,6 +315,12 @@ declare_class!(
                 }
                 UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
                     let last_pan: CGPoint = self.ivars().pan_last_delta.replace(CGPoint{x:0.0, y:0.0});
+                    log_to_console(&format!(
+                        "pan gesture {:?} after ({:.0}, {:.0}) points; the swipe it had is undone",
+                        recognizer.state(),
+                        last_pan.x,
+                        last_pan.y
+                    ));
 
                     // Pass -delta so that action is reversed
                     (TouchPhase::Cancelled, -last_pan.x, -last_pan.y)
@@ -408,12 +429,98 @@ declare_class!(
     }
 );
 
+/// The device console (`os_log`): the game's own log has no winit messages on a phone, and a build that
+/// types nothing into a field needs the keyboard's side of the story beside the game's.
+pub(super) fn log_to_console(message: &str) {
+    // The game's log, when it asked for these (`set_log_hook`): a phone's console is not in
+    // the zip a player shares, its `logs/latest.log` is.
+    if let Some(hook) = *LOG_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        hook(message);
+    }
+    extern "C" {
+        // `NSLog(NSString *format, ...)`: the format is an object, not a C string. Handing it a
+        // `c"%s"` messages a C buffer as an `NSString` and segfaults in `objc_msgSend`.
+        fn NSLog(format: *mut objc2::runtime::AnyObject, ...);
+    }
+    let format = NSString::from_str("%@");
+    let line = NSString::from_str(message);
+    // SAFETY: both arguments are live `NSString`s and `%@` forwards the second one unchanged.
+    unsafe {
+        NSLog(
+            &*format as *const NSString as *mut objc2::runtime::AnyObject,
+            &*line as *const NSString as *mut objc2::runtime::AnyObject,
+        );
+    }
+}
+
+/// Where [`log_to_console`]'s messages go besides the console.
+static LOG_HOOK: std::sync::Mutex<Option<fn(&str)>> = std::sync::Mutex::new(None);
+
+/// Sends [`log_to_console`]'s messages to `hook` (the game's log) as well.
+pub(crate) fn set_log_hook(hook: Option<fn(&str)>) {
+    *LOG_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+}
+
+/// The phone this build runs on, once: a graphics line or a missed touch means more beside the screen it
+/// was drawn on and the heat and power the phone was under when it happened.
+#[allow(deprecated)] // `UIScreen::mainScreen` is the only screen at this point: no window exists yet.
+pub(super) fn log_device_once(mtm: MainThreadMarker) {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if LOGGED.set(()).is_err() {
+        return;
+    }
+    let device = UIDevice::currentDevice(mtm);
+    // SAFETY: plain getters on a live `UIDevice`.
+    let (system, model, version) = unsafe {
+        (
+            device.systemName(),
+            device.model(),
+            device.systemVersion(),
+        )
+    };
+    log_to_console(&format!(
+        "device: {system} {version}, {model}, {:?}",
+        device.userInterfaceIdiom()
+    ));
+    let process = NSProcessInfo::processInfo();
+    let thermal = match unsafe { process.thermalState() } {
+        NSProcessInfoThermalState::Nominal => "nominal",
+        NSProcessInfoThermalState::Fair => "fair",
+        NSProcessInfoThermalState::Serious => "serious",
+        NSProcessInfoThermalState::Critical => "critical",
+        other => return log_to_console(&format!("device: unknown thermal state {other:?}")),
+    };
+    log_to_console(&format!(
+        "device: {:.1} GB RAM, {} cores, thermal {thermal}, low power mode {}",
+        unsafe { process.physicalMemory() } as f64 / (1024.0 * 1024.0 * 1024.0),
+        unsafe { process.activeProcessorCount() },
+        unsafe { process.isLowPowerModeEnabled() },
+    ));
+    let screen = UIScreen::mainScreen(mtm);
+    let bounds = screen.bounds();
+    let scale = screen.scale();
+    log_to_console(&format!(
+        "screen: {}x{} points at {scale}x ({}x{} pixels), up to {} Hz",
+        bounds.size.width,
+        bounds.size.height,
+        bounds.size.width * scale,
+        bounds.size.height * scale,
+        screen.maximumFramesPerSecond(),
+    ));
+}
+
 impl WinitView {
     pub(crate) fn new(
         mtm: MainThreadMarker,
         window_attributes: &WindowAttributes,
         frame: CGRect,
     ) -> Retained<Self> {
+        log_device_once(mtm);
         let this = mtm.alloc().set_ivars(WinitViewState {
             pinch_gesture_recognizer: RefCell::new(None),
             doubletap_gesture_recognizer: RefCell::new(None),
@@ -643,18 +750,35 @@ impl WinitView {
     }
 
     pub(crate) fn set_mouse_captured(&self, captured: bool) {
+        if self.ivars().mouse.captured() != captured {
+            log_to_console(&format!("mouse capture: {captured}"));
+        }
         self.ivars().mouse.capture(captured);
         self.update_mice();
     }
 
     pub(crate) fn update_mice(&self) {
         if let Some(window) = self.window() {
-            self.ivars().mouse.update(RootWindowId(window.id()));
+            let size = self.bounds().size;
+            let scale = self.contentScaleFactor() as f64;
+            // A phone has no system pointer to lock or to hover with: its mouse's relative
+            // motion is what the game's cursor follows.
+            let phone = UIDevice::currentDevice(MainThreadMarker::from(self)).userInterfaceIdiom()
+                == UIUserInterfaceIdiom::Phone;
+            self.ivars().mouse.update(
+                RootWindowId(window.id()),
+                (size.width * scale, size.height * scale),
+                scale,
+                phone,
+            );
         }
     }
 
     pub(crate) fn set_ime_allowed(&self, allowed: bool) {
-        self.ivars().ime_allowed.set(allowed);
+        let was = self.ivars().ime_allowed.replace(allowed);
+        if was != allowed {
+            log_to_console(&format!("the game asked for the keyboard: {allowed}"));
+        }
         unsafe {
             self.reloadInputViews();
             self.becomeFirstResponder();
@@ -751,6 +875,11 @@ impl WinitView {
     }
 
     fn handle_insert_text(&self, text: &NSString) {
+        log_to_console(&format!(
+            "the keyboard typed {:?} (keyboard allowed: {})",
+            text.to_string(),
+            self.ivars().ime_allowed.get()
+        ));
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();
@@ -792,6 +921,7 @@ impl WinitView {
     }
 
     fn handle_delete_backward(&self) {
+        log_to_console("the keyboard deleted a character");
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();
