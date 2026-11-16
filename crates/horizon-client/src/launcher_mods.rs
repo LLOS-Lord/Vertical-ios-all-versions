@@ -136,7 +136,10 @@ pub fn list_installed(home: &Path) -> Vec<InstalledModRow> {
         .and_then(|v| v["entries"].as_array().cloned())
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|e| e["id"].as_str().map(|id| (id.to_owned(), e)))
+        .filter_map(|e| {
+            let id = e["id"].as_str()?.to_owned();
+            Some((id, e))
+        })
         .collect();
 
     let mut rows = Vec::new();

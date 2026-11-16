@@ -19,7 +19,7 @@ use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -933,27 +933,29 @@ pub fn cancel_job() {
 
 fn begin_job(version_id: &str, source: &str, initial_detail: &str) -> Result<Arc<JobState>, String> {
     let job = global_job().clone();
-    let mut st = job.status.lock().unwrap_or_else(|e| e.into_inner());
-    if st.active {
-        return Err(format!(
-            "Already installing Minecraft {} ({}). Cancel or wait for it to finish.",
-            st.version_id, st.stage
-        ));
+    {
+        let mut st = job.status.lock().unwrap_or_else(|e| e.into_inner());
+        if st.active {
+            return Err(format!(
+                "Already installing Minecraft {} ({}). Cancel or wait for it to finish.",
+                st.version_id, st.stage
+            ));
+        }
+        job.cancel.store(false, Ordering::Relaxed);
+        *st = VersionJobStatus {
+            active: true,
+            version_id: version_id.to_owned(),
+            source: source.to_owned(),
+            stage: "starting".into(),
+            detail: initial_detail.to_owned(),
+            received_bytes: 0,
+            total_bytes: 0,
+            completed_files: 0,
+            total_files: 0,
+            done: false,
+            error: None,
+        };
     }
-    job.cancel.store(false, Ordering::Relaxed);
-    *st = VersionJobStatus {
-        active: true,
-        version_id: version_id.to_owned(),
-        source: source.to_owned(),
-        stage: "starting".into(),
-        detail: initial_detail.to_owned(),
-        received_bytes: 0,
-        total_bytes: 0,
-        completed_files: 0,
-        total_files: 0,
-        done: false,
-        error: None,
-    };
     Ok(job)
 }
 
@@ -1099,14 +1101,14 @@ fn run_prepared_download(
         st.stage = "installing".into();
         st.detail = format!("Unpacking prepared game files for {version_id}…");
     });
-    let pack = crate::import::Pack::open(&archive_path)?;
-    if pack.kind() != crate::import::Kind::Resources {
+    let pack = crate::import::Pack::open(&archive_path).map_err(|e| e.to_string())?;
+    if pack.kind != crate::import::Kind::Resources {
         let _ = fs::remove_dir_all(&work_dir);
         return Err("Archive is not a prepared Horizon game-files bundle (missing horizon-resources.json).".into());
     }
     let version_home = home.join("versions").join(version_id);
     fs::create_dir_all(&version_home).map_err(|e| format!("{}: {e}", version_home.display()))?;
-    let installed = pack.install(&version_home)?;
+    let installed = pack.install(&version_home).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(&work_dir);
 
     let full_sim = has_simulation_tables(&installed.path);
@@ -1402,7 +1404,10 @@ pub fn prepare_mojang_on_device(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry.name().map_err(|e| e.to_string())?.replace('\\', "/");
+        if entry.is_symlink() {
+            continue;
+        }
         let keep = name == "pack.mcmeta"
             || name == "pack.png"
             || name.starts_with("assets/")
@@ -1524,7 +1529,7 @@ pub fn prepare_mojang_on_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::{io::Write, net::TcpListener};
 
     fn temp_home(tag: &str) -> PathBuf {
         static SEQ: AtomicUsize = AtomicUsize::new(0);

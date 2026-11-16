@@ -418,7 +418,8 @@ struct ModsSectionView: View {
             isPresented: $importingFile,
             allowedContentTypes: [
                 UTType(filenameExtension: "hmod") ?? .data,
-                UTType(filenameExtension: "jar") ?? .javaArchive,
+                UTType(filenameExtension: "jar") ?? .zip,
+                .zip,
                 .data,
             ]
         ) { result in

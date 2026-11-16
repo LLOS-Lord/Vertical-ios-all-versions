@@ -729,7 +729,7 @@ mod tests {
         );
         assert_eq!(
             ServerVersion::from_version_id("1.21"),
-            Some(ServerVersion::V1_21)
+            Some(ServerVersion::V1_21_1)
         );
         assert_eq!(
             ServerVersion::from_version_id("1.20.4"),
