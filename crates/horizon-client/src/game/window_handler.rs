@@ -69,6 +69,19 @@ impl Game<'_> {
         if !ours {
             return;
         }
+        // The launcher's SwiftUI views cover the game and take the pointer: a phone's mouse
+        // reports relative motion instead of hover, so these window events are no longer
+        // filtered by a UIKit view above the game's.
+        if horizon_ios_launcher::covered()
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseWheel { .. }
+            )
+        {
+            return;
+        }
         // A disconnected guest is being removed on the next poll; its title must never own
         // global launcher actions or open a new world on the shared native event loop.
         if self.splitscreen.guest
@@ -104,7 +117,6 @@ impl Game<'_> {
         // window's own keys, never the ones the socket made up.
         self.trace_window_event(origin, &event);
         if let WindowEvent::KeyboardInput { event, .. } = &event
-            && !self.touch_synthetic_input()
             && let PhysicalKey::Code(key) = event.physical_key
         {
             if event.state == ElementState::Pressed {
@@ -250,6 +262,7 @@ impl Game<'_> {
         }
         horizon_client::spans::time("server_packs", || self.tick_server_packs());
         horizon_client::spans::time("control", || self.poll_control(event_loop));
+        self.memory_tick(Instant::now());
         if !self.splitscreen.guest && !self.options.split_guest {
             self.poll_launcher(event_loop);
             self.sync_airplay();

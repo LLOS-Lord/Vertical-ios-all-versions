@@ -9,7 +9,13 @@ pub const LIMIT: usize = 1024 * 1024;
 pub fn redact(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     if [
-        "accesstoken", "refreshtoken", "idtoken", "token =", "token :", "user code", "access_token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "token =",
+        "token :",
+        "user code",
+        "access_token",
         "refresh_token",
         "id_token",
         "token:",

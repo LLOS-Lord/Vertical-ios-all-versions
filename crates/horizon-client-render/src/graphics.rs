@@ -965,10 +965,22 @@ impl Default for Graphics {
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
             gpu_culling: GpuCullingMode::Off,
-            entity_culling: EntityCullingMode::Off,
+            entity_culling: if cfg!(target_os = "ios") {
+                EntityCullingMode::Asynchronous
+            } else {
+                EntityCullingMode::Off
+            },
             entity_culling_precheck: 64,
-            particle_culling: ParticleCullingMode::Off,
-            leaf_culling: LeafCullingMode::Off,
+            particle_culling: if cfg!(target_os = "ios") {
+                ParticleCullingMode::Asynchronous
+            } else {
+                ParticleCullingMode::Off
+            },
+            leaf_culling: if cfg!(target_os = "ios") {
+                LeafCullingMode::Hidden
+            } else {
+                LeafCullingMode::Off
+            },
             opaque_ice: false,
             cache_shulker_boxes: false,
             // Sign text has used its renderer cache independently of the new model caches.
@@ -992,9 +1004,16 @@ impl Default for Graphics {
             parallel_tick: ParallelTickMode::Off,
             overlay: Overlay::Off,
             // A phone's GPU is fill-bound at its screen's resolution (a Mali-G51 at 2340x1080: 27 fps with
-            // 14 ms of CPU a frame); the HUD stays at the screen's own resolution.
-            resolution_scale: if cfg!(target_os = "android") { 50 } else { 100 },
-            dynamic_resolution: false,
+            // 14 ms of CPU a frame, and an Apple A11 at 2208x1242 @3x Retina); the HUD stays at the
+            // screen's own resolution, while Dynamic Resolution lifts faster iOS GPUs up to 100% at 60 fps.
+            resolution_scale: if cfg!(target_os = "android") {
+                50
+            } else if cfg!(target_os = "ios") {
+                55
+            } else {
+                100
+            },
+            dynamic_resolution: cfg!(target_os = "ios"),
             target_fps: 60,
             fxaa: false,
             taa: false,

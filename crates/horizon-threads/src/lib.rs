@@ -153,7 +153,28 @@ mod par_chunks_tests {
 /// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
 /// 20 ms with 9 workers to 7 ms with 3 (#11294).
 pub fn default_workers() -> usize {
+    #[cfg(target_os = "ios")]
+    {
+        return ios_workers_for(worker_count(), performance_cores);
+    }
+    #[cfg(not(target_os = "ios"))]
     workers_for(worker_count(), performance_cores)
+}
+
+/// iPhones pair 2 performance cores with 4 efficiency cores (`hw.perflevel0.physicalcpu == 2`).
+/// Counting only performance cores left a single worker thread (`2 - 1 = 1`) for all chunk
+/// generation, lighting and meshing while 4 efficiency cores sat idle. Because [`behind`] places
+/// iOS pool workers in `QOS_CLASS_UTILITY` (behind the `QOS_CLASS_USER_INTERACTIVE` render and
+/// server threads), half the machine's cores (`3` on a 6-core iPhone) run in parallel on the
+/// efficiency cluster without preempting frame or tick work.
+#[cfg(any(target_os = "ios", test))]
+fn ios_workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
+    let base = workers_for(cores, performance);
+    if cores >= 4 && base < 2 {
+        (cores / 2).clamp(2, 4)
+    } else {
+        base
+    }
 }
 
 /// [`default_workers`] for `cores` cores, of which `performance` (asked only here, the
@@ -377,7 +398,14 @@ fn behind() -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "ios")]
+fn behind() -> bool {
+    // SAFETY: sets the calling thread's own QoS class to utility so XNU schedules chunk
+    // workers onto efficiency cores behind USER_INTERACTIVE render/server threads.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) == 0 }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
 fn behind() -> bool {
     false
 }
@@ -778,6 +806,11 @@ mod tests {
         // Never fewer than one worker.
         assert_eq!(workers_for(1, || None), 1);
         assert_eq!(workers_for(2, || Some(1)), 1);
+        // 6-core iPhones (2P + 4E, e.g. Apple A11..A18) get 3 utility workers instead of 1.
+        assert_eq!(super::ios_workers_for(6, || Some(2)), 3);
+        // iPad M-series (4P + 4E / 4P + 6E) keeps its performance-core worker count.
+        assert_eq!(super::ios_workers_for(8, || Some(4)), 3);
+        assert_eq!(super::ios_workers_for(10, || Some(4)), 3);
     }
 
     /// Platforms without asymmetric core detection (Windows, etc.) are unchanged: the count is the one the pool always had.

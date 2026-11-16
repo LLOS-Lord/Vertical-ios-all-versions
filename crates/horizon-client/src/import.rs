@@ -177,7 +177,13 @@ pub struct Installed {
 /// because a `resources` folder under its working directory means something else there.
 pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let has = |dir: &Path| dir.join(Kind::Resources.marker()).exists();
-    let sibling_is_external = home.is_none_or(|h| !sibling.starts_with(h));
+    let canon_or_abs = |p: &Path| {
+        fs::canonicalize(p)
+            .or_else(|_| std::path::absolute(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let sibling_is_external =
+        home.is_none_or(|h| !canon_or_abs(sibling).starts_with(canon_or_abs(h)));
     if sibling_is_external && has(sibling) {
         return Some(sibling.to_owned());
     }
@@ -741,10 +747,8 @@ pub fn scan(home: &Path) -> Vec<Installed> {
                     let _ = fs::remove_file(&path);
                 }
                 Err(error) => {
-                    let parked = path.with_extension(format!(
-                        "{}.failed",
-                        ext.as_deref().unwrap_or("mod")
-                    ));
+                    let parked =
+                        path.with_extension(format!("{}.failed", ext.as_deref().unwrap_or("mod")));
                     log::error!(
                         "Horizon: {} would not import as mod: {error}; leaving it as {}",
                         path.display(),

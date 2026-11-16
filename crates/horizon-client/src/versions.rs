@@ -72,11 +72,8 @@ pub const REQUIRED_SIMULATION_FILES: &[&str] = &[
 ];
 
 /// Optional metadata files written by `horizon-prepare` and linked when present.
-const OPTIONAL_SIMULATION_FILES: &[&str] = &[
-    "horizon-prepare.json",
-    "asset-index.json",
-    "pack.png",
-];
+const OPTIONAL_SIMULATION_FILES: &[&str] =
+    &["horizon-prepare.json", "asset-index.json", "pack.png"];
 
 /// Required nested worldgen & font files verified before declaring a resource directory playable.
 const REQUIRED_NESTED_FILES: &[&str] = &[
@@ -550,8 +547,8 @@ pub fn apply_active_protocol_preference(home: &Path) {
     let sel = load_selection(home);
     let active_id = active_version_id(home);
     if sel.older_servers {
-        let target = ServerVersion::from_version_id(&active_id)
-            .filter(|v| *v != ServerVersion::Current);
+        let target =
+            ServerVersion::from_version_id(&active_id).filter(|v| *v != ServerVersion::Current);
         horizon_protocol::adapter::set_preferred_server_version(target);
     } else {
         horizon_protocol::adapter::set_preferred_server_version(None);
@@ -590,8 +587,7 @@ pub fn delete_version(home: &Path, version_id: &str) -> Result<(), String> {
     let version_dir = home.join("versions").join(&clean);
     let mut removed = false;
     if version_dir.exists() {
-        fs::remove_dir_all(&version_dir)
-            .map_err(|e| format!("{}: {e}", version_dir.display()))?;
+        fs::remove_dir_all(&version_dir).map_err(|e| format!("{}: {e}", version_dir.display()))?;
         removed = true;
     }
     let legacy = home.join("resources");
@@ -623,7 +619,9 @@ pub fn delete_version(home: &Path, version_id: &str) -> Result<(), String> {
 /// version texture overlays never bleed across other versions.
 pub fn find_simulation_base(home: &Path) -> Option<PathBuf> {
     let preferred = [
-        home.join("versions").join(SIM_BASE_DIR_NAME).join("resources"),
+        home.join("versions")
+            .join(SIM_BASE_DIR_NAME)
+            .join("resources"),
         home.join("versions")
             .join(horizon_core::VANILLA_VERSION)
             .join("resources"),
@@ -719,10 +717,7 @@ fn build_manifest_from_base(base: &Path, version_id: &str) -> Value {
         "data_version".to_owned(),
         json!(i64::from(horizon_world::DATA_VERSION)),
     );
-    obj.insert(
-        "minecraft".to_owned(),
-        json!(horizon_core::VANILLA_VERSION),
-    );
+    obj.insert("minecraft".to_owned(), json!(horizon_core::VANILLA_VERSION));
     obj.insert("source_minecraft".to_owned(), json!(version_id));
     obj.insert("full_simulation".to_owned(), json!(true));
     Value::Object(obj)
@@ -799,6 +794,190 @@ fn populate_from_simulation_base(base: &Path, target_resources: &Path, version_i
     linked
 }
 
+/// Resolve the effective Minecraft version label for a prepared `resources` directory.
+/// Multi-version installs keep `"minecraft": "26.3"` for engine schema checks and store the
+/// user-selected version in `"source_minecraft"` (as well as `version-profile.json`).
+pub fn version_id_for_root(root: &Path) -> String {
+    let profile_id = || {
+        let mut candidates = vec![root.join("version-profile.json")];
+        if let Some(parent) = root.parent() {
+            candidates.push(parent.join("version-profile.json"));
+        }
+        candidates.into_iter().find_map(|p| {
+            let ptext = fs::read_to_string(p).ok()?;
+            let pval: Value = serde_json::from_str(&ptext).ok()?;
+            pval["id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_owned())
+        })
+    };
+    if let Ok(text) = fs::read_to_string(root.join("horizon-resources.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&text)
+    {
+        if let Some(src) = val["source_minecraft"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return src.trim().to_owned();
+        }
+        if let Some(id) = profile_id() {
+            return id;
+        }
+        if let Some(mc) = val["minecraft"].as_str().filter(|s| !s.trim().is_empty()) {
+            return mc.trim().to_owned();
+        }
+    }
+    if let Some(id) = profile_id() {
+        return id;
+    }
+    horizon_core::VANILLA_VERSION.to_owned()
+}
+
+/// Heal any 1x1 `client.jar` placeholder assets (such as `panorama_0..5.png` or `unifont.json`) and
+/// missing `assets/pack.mcmeta` in an already-installed `resources` directory using the cached
+/// Mojang `minecraft/assets/objects` store (and `find_simulation_base` as fallback), without any
+/// network download. Writes `.horizon-assets-healed-v1` once verified so subsequent launches are O(1).
+pub fn heal_placeholder_assets(home: &Path, root: &Path) -> usize {
+    if !root.is_dir() {
+        return 0;
+    }
+    let marker = root.join(".horizon-assets-healed-v1");
+    let pano0 = root.join("assets/minecraft/textures/gui/title/background/panorama_0.png");
+    let pack_mcmeta = root.join("assets/pack.mcmeta");
+    let pano_valid = |p: &Path| fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() >= 4096);
+    if marker.is_file() && pano_valid(&pano0) && pack_mcmeta.is_file() {
+        return 0;
+    }
+
+    let version_id = version_id_for_root(root);
+    let is_native_pinned = version_id == horizon_core::VANILLA_VERSION;
+    let mut healed = 0usize;
+
+    for cache_root in [home.join("minecraft"), home.to_path_buf()] {
+        let objects_dir = cache_root.join("assets/objects");
+        if !objects_dir.is_dir() {
+            continue;
+        }
+        let index_id = fs::read_to_string(
+            cache_root
+                .join("versions")
+                .join(&version_id)
+                .join(format!("{version_id}.json")),
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v["assetIndex"]["id"].as_str().map(str::to_owned));
+
+        let mut candidate_indexes = Vec::new();
+        if let Some(id) = index_id {
+            candidate_indexes.push(cache_root.join("assets/indexes").join(format!("{id}.json")));
+        }
+        candidate_indexes.push(
+            cache_root
+                .join("assets/indexes")
+                .join(format!("{version_id}.json")),
+        );
+        if is_native_pinned && let Ok(entries) = fs::read_dir(cache_root.join("assets/indexes")) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json")
+                    && !candidate_indexes.contains(&p)
+                {
+                    candidate_indexes.push(p);
+                }
+            }
+        }
+
+        let Some(asset_index) = candidate_indexes.into_iter().find_map(|p| {
+            fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        }) else {
+            continue;
+        };
+
+        if let Some(objs) = asset_index["objects"].as_object() {
+            for (logical, meta) in objs {
+                let Some(hash) = meta["hash"].as_str().filter(|h| h.len() >= 2) else {
+                    continue;
+                };
+                let clean_rel = logical.trim_start_matches('/');
+                if clean_rel.is_empty() || clean_rel.contains("..") {
+                    continue;
+                }
+                if !is_native_pinned {
+                    let allowed_non_native = clean_rel.contains("/sounds/")
+                        || clean_rel.starts_with("minecraft/sounds/")
+                        || clean_rel.contains("textures/gui/title/background/panorama_")
+                        || (clean_rel.contains("/textures/")
+                            && !clean_rel.contains("/textures/gui/"));
+                    if !allowed_non_native {
+                        continue;
+                    }
+                }
+                let src = objects_dir
+                    .join(&hash[..2].to_ascii_lowercase())
+                    .join(hash.to_ascii_lowercase());
+                if !src.is_file() {
+                    continue;
+                }
+                let dst = if clean_rel.starts_with("assets/") {
+                    root.join(clean_rel)
+                } else if clean_rel == "pack.mcmeta" {
+                    root.join("assets").join("pack.mcmeta")
+                } else if clean_rel.starts_with("pack.") {
+                    root.join(clean_rel)
+                } else {
+                    root.join("assets").join(clean_rel)
+                };
+                let want_size = meta["size"].as_u64().unwrap_or(0);
+                let needs_replace = match fs::metadata(&dst) {
+                    Ok(m) if m.is_file() => want_size > 0 && m.len() != want_size,
+                    _ => true,
+                };
+                if needs_replace && replace_link_or_copy_file(&src, &dst).is_ok() {
+                    healed += 1;
+                }
+            }
+        }
+        break;
+    }
+
+    if let Some(base) = find_simulation_base(home)
+        && base != root
+    {
+        for i in 0..6 {
+            let rel = format!("assets/minecraft/textures/gui/title/background/panorama_{i}.png");
+            let dst = root.join(&rel);
+            let src = base.join(&rel);
+            if !pano_valid(&dst)
+                && pano_valid(&src)
+                && replace_link_or_copy_file(&src, &dst).is_ok()
+            {
+                healed += 1;
+            }
+        }
+        if !pack_mcmeta.is_file() {
+            let src_pack = base.join("assets/pack.mcmeta");
+            if src_pack.is_file() && replace_link_or_copy_file(&src_pack, &pack_mcmeta).is_ok() {
+                healed += 1;
+            }
+        }
+    }
+
+    if pano_valid(&pano0) && pack_mcmeta.is_file() {
+        let _ = fs::write(&marker, b"1\n");
+    }
+    if healed > 0 {
+        log::info!(
+            "Horizon: healed {healed} placeholder/missing asset(s) in {} ({version_id})",
+            root.display()
+        );
+    }
+    healed
+}
+
 /// Upgrade any previously downloaded Mojang versions that were prepared before a full simulation
 /// base arrived on the device.
 pub fn upgrade_partial_mojang_versions(home: &Path, base_resources: &Path) -> usize {
@@ -863,7 +1042,11 @@ fn fetch_json_url(url: &str) -> Result<Value, String> {
     serde_json::from_str(&body).map_err(|e| format!("{url}: {e}"))
 }
 
-fn fetch_bytes_verified(url: &str, expected_sha1: Option<&str>, max_bytes: u64) -> Result<Vec<u8>, String> {
+fn fetch_bytes_verified(
+    url: &str,
+    expected_sha1: Option<&str>,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     if let Some(path) = url.strip_prefix("file://") {
         fs::File::open(path)
@@ -888,7 +1071,9 @@ fn fetch_bytes_verified(url: &str, expected_sha1: Option<&str>, max_bytes: u64) 
     if let Some(want) = expected_sha1.filter(|s| !s.is_empty()) {
         let got = hex_lower(&Sha1::digest(&bytes));
         if !got.eq_ignore_ascii_case(want) {
-            return Err(format!("{url}: SHA-1 mismatch (expected {want}, got {got})"));
+            return Err(format!(
+                "{url}: SHA-1 mismatch (expected {want}, got {got})"
+            ));
         }
     }
     Ok(bytes)
@@ -957,7 +1142,9 @@ pub fn fetch_prepared_catalog(
                             .unwrap_or(horizon_core::VANILLA_VERSION)
                             .to_owned();
                         let id = raw["id"].as_str().unwrap_or(entry_url).to_owned();
-                        if let Some(existing) = out.iter_mut().find(|e| e.id == id || e.url == entry_url) {
+                        if let Some(existing) =
+                            out.iter_mut().find(|e| e.id == id || e.url == entry_url)
+                        {
                             if let Some(lbl) = raw["label"].as_str() {
                                 existing.label = lbl.to_owned();
                             }
@@ -1138,7 +1325,11 @@ pub fn cancel_job() {
     }
 }
 
-fn begin_job(version_id: &str, source: &str, initial_detail: &str) -> Result<Arc<JobState>, String> {
+fn begin_job(
+    version_id: &str,
+    source: &str,
+    initial_detail: &str,
+) -> Result<Arc<JobState>, String> {
     let job = global_job().clone();
     {
         let mut st = job.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -1222,13 +1413,8 @@ pub fn start_prepared_download(
     let initial = job_status();
 
     std::thread::spawn(move || {
-        let outcome = run_prepared_download(
-            &job,
-            &home,
-            &url,
-            &version_id,
-            expected_sha256.as_deref(),
-        );
+        let outcome =
+            run_prepared_download(&job, &home, &url, &version_id, expected_sha256.as_deref());
         update_job(&job, |st| {
             st.active = false;
             match outcome {
@@ -1256,7 +1442,9 @@ fn run_prepared_download(
     version_id: &str,
     expected_sha256: Option<&str>,
 ) -> Result<(), String> {
-    let work_dir = home.join("versions").join(format!(".download-{version_id}"));
+    let work_dir = home
+        .join("versions")
+        .join(format!(".download-{version_id}"));
     fs::create_dir_all(&work_dir).map_err(|e| format!("{}: {e}", work_dir.display()))?;
 
     let archive_path = if let Some(local_path) = url.strip_prefix("file://") {
@@ -1284,8 +1472,7 @@ fn run_prepared_download(
                 });
             }
         });
-        let fetched =
-            crate::import::download::fetch_resumable(url, &work_dir, &received, &total);
+        let fetched = crate::import::download::fetch_resumable(url, &work_dir, &received, &total);
         done_flag.store(true, Ordering::Relaxed);
         let _ = monitor.join();
         update_job(job, |st| {
@@ -1311,7 +1498,10 @@ fn run_prepared_download(
     let pack = crate::import::Pack::open(&archive_path).map_err(|e| e.to_string())?;
     if pack.kind != crate::import::Kind::Resources {
         let _ = fs::remove_dir_all(&work_dir);
-        return Err("Archive is not a prepared Horizon game-files bundle (missing horizon-resources.json).".into());
+        return Err(
+            "Archive is not a prepared Horizon game-files bundle (missing horizon-resources.json)."
+                .into(),
+        );
     }
     let version_home = home.join("versions").join(version_id);
     fs::create_dir_all(&version_home).map_err(|e| format!("{}: {e}", version_home.display()))?;
@@ -1322,7 +1512,9 @@ fn run_prepared_download(
     if !full_sim {
         return Err(validate_playable_root(&installed.path)
             .err()
-            .unwrap_or_else(|| "Downloaded archive is missing required Horizon simulation tables.".into()));
+            .unwrap_or_else(|| {
+                "Downloaded archive is missing required Horizon simulation tables.".into()
+            }));
     }
     let profile = VersionProfile {
         id: version_id.to_owned(),
@@ -1448,7 +1640,11 @@ pub fn start_repair_versions(
     let label = clean_target
         .clone()
         .unwrap_or_else(|| horizon_core::VANILLA_VERSION.to_owned());
-    let job = begin_job(&label, "horizon-repair", "Checking Horizon simulation runtime…")?;
+    let job = begin_job(
+        &label,
+        "horizon-repair",
+        "Checking Horizon simulation runtime…",
+    )?;
     let initial = job_status();
 
     std::thread::spawn(move || {
@@ -1498,14 +1694,22 @@ fn run_repair_versions(
     let mc_cache = home.join("minecraft");
     let objects_dir = mc_cache.join("assets/objects");
     if let Some(tid) = target_id {
-        let jar = mc_cache.join("versions").join(tid).join(format!("{tid}.jar"));
-        let meta_path = mc_cache.join("versions").join(tid).join(format!("{tid}.json"));
+        let jar = mc_cache
+            .join("versions")
+            .join(tid)
+            .join(format!("{tid}.jar"));
+        let meta_path = mc_cache
+            .join("versions")
+            .join(tid)
+            .join(format!("{tid}.json"));
         if jar.is_file()
             && let Ok(meta_text) = fs::read_to_string(&meta_path)
             && let Ok(meta) = serde_json::from_str::<Value>(&meta_text)
         {
             let idx_id = meta["assetIndex"]["id"].as_str().unwrap_or(tid);
-            let idx_path = mc_cache.join("assets/indexes").join(format!("{idx_id}.json"));
+            let idx_path = mc_cache
+                .join("assets/indexes")
+                .join(format!("{idx_id}.json"));
             let asset_index = fs::read_to_string(&idx_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -1565,9 +1769,16 @@ fn run_repair_versions(
 
 /// Start downloading & preparing an official Mojang version (`client.jar` + asset index + objects)
 /// directly on the device into `Documents/versions/<id>/resources/`.
-pub fn start_mojang_download(home: PathBuf, version_id: String) -> Result<VersionJobStatus, String> {
+pub fn start_mojang_download(
+    home: PathBuf,
+    version_id: String,
+) -> Result<VersionJobStatus, String> {
     let clean = sanitize_version_id(&version_id).ok_or("invalid Mojang version id")?;
-    let job = begin_job(&clean, "mojang-official", "Fetching Mojang version manifest…")?;
+    let job = begin_job(
+        &clean,
+        "mojang-official",
+        "Fetching Mojang version manifest…",
+    )?;
     let initial = job_status();
 
     std::thread::spawn(move || {
@@ -1613,9 +1824,13 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
     let version_json_sha1 = entry["sha1"].as_str();
 
     check_cancelled(job)?;
-    let version_json_bytes = fetch_bytes_verified(version_json_json_url(version_json_url), version_json_sha1, 16 << 20)?;
-    let version_meta: Value =
-        serde_json::from_slice(&version_json_bytes).map_err(|e| format!("{version_id}.json: {e}"))?;
+    let version_json_bytes = fetch_bytes_verified(
+        version_json_json_url(version_json_url),
+        version_json_sha1,
+        16 << 20,
+    )?;
+    let version_meta: Value = serde_json::from_slice(&version_json_bytes)
+        .map_err(|e| format!("{version_id}.json: {e}"))?;
 
     let client_dl = &version_meta["downloads"]["client"];
     let client_url = client_dl["url"]
@@ -1628,8 +1843,11 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
     let mc_cache = home.join("minecraft");
     let jar_dir = mc_cache.join("versions").join(version_id);
     fs::create_dir_all(&jar_dir).map_err(|e| format!("{}: {e}", jar_dir.display()))?;
-    fs::write(jar_dir.join(format!("{version_id}.json")), &version_json_bytes)
-        .map_err(|e| e.to_string())?;
+    fs::write(
+        jar_dir.join(format!("{version_id}.json")),
+        &version_json_bytes,
+    )
+    .map_err(|e| e.to_string())?;
 
     let jar_path = jar_dir.join(format!("{version_id}.jar"));
     let jar_ok = client_sha1.is_some_and(|want| {
@@ -1712,7 +1930,10 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
             scope.spawn(|| {
                 loop {
                     if job.cancel.load(Ordering::Relaxed)
-                        || first_error.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                        || first_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some()
                     {
                         break;
                     }
@@ -1734,8 +1955,8 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
                                     let _ = fs::create_dir_all(parent);
                                 }
                                 let tmp = obj_path.with_extension("part");
-                                if let Err(e) =
-                                    fs::write(&tmp, &bytes).and_then(|()| fs::rename(&tmp, &obj_path))
+                                if let Err(e) = fs::write(&tmp, &bytes)
+                                    .and_then(|()| fs::rename(&tmp, &obj_path))
                                 {
                                     *first_error.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(format!("{}: {e}", obj_path.display()));
@@ -1749,8 +1970,7 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
                         }
                     }
                     let done_now = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let bytes_now =
-                        downloaded_bytes.fetch_add(size, Ordering::Relaxed) + size;
+                    let bytes_now = downloaded_bytes.fetch_add(size, Ordering::Relaxed) + size;
                     if done_now % 8 == 0 || done_now == total_files {
                         update_job(job, |st| {
                             st.completed_files = done_now;
@@ -2022,7 +2242,9 @@ pub fn prepare_mojang_on_device(
             name == "pack.png"
                 || (name.starts_with("assets/minecraft/textures/")
                     && (!name.starts_with("assets/minecraft/textures/gui/")
-                        || name.starts_with("assets/minecraft/textures/gui/title/background/panorama_")))
+                        || name.starts_with(
+                            "assets/minecraft/textures/gui/title/background/panorama_",
+                        )))
                 || name.starts_with("assets/minecraft/sounds/")
         };
         if !keep || name.contains("..") || name.starts_with('/') {
@@ -2066,12 +2288,18 @@ pub fn prepare_mojang_on_device(
             }
             let dst = if clean_rel.starts_with("assets/") {
                 staging.join(clean_rel)
-            } else if clean_rel == "pack.mcmeta" || clean_rel.starts_with("pack.") {
+            } else if clean_rel == "pack.mcmeta" {
+                staging.join("assets").join("pack.mcmeta")
+            } else if clean_rel.starts_with("pack.") {
                 staging.join(clean_rel)
             } else {
                 staging.join("assets").join(clean_rel)
             };
-            if link_or_copy_file(&src, &dst).is_ok() {
+            // `client.jar` ships tiny 1x1 placeholder PNGs (`panorama_0..5.png`, icons) and stub
+            // font metadata at paths whose real content lives in Mojang's `assetIndex` CDN objects;
+            // overwrite those placeholders (`replace_link_or_copy_file` unlinks first so shared
+            // hardlinks are never mutated in place).
+            if replace_link_or_copy_file(&src, &dst).is_ok() {
                 files += 1;
                 bytes += meta["size"].as_u64().unwrap_or(0);
             }
@@ -2102,9 +2330,7 @@ pub fn prepare_mojang_on_device(
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
         write_unlinked(&staging.join("horizon-resources.json"), &manifest_bytes)
             .map_err(|e| e.to_string())?;
-        notes.push_str(
-            " Tap Complete Setup to download Horizon's simulation runtime (~45 MB).",
-        );
+        notes.push_str(" Tap Complete Setup to download Horizon's simulation runtime (~45 MB).");
     }
 
     let profile = VersionProfile {
@@ -2186,7 +2412,11 @@ mod tests {
             }
             fs::write(p, b"{}").unwrap();
         }
-        fs::write(root.join("assets/pack.mcmeta"), br#"{"pack":{"pack_format":55}}"#).unwrap();
+        fs::write(
+            root.join("assets/pack.mcmeta"),
+            br#"{"pack":{"pack_format":55}}"#,
+        )
+        .unwrap();
         fs::write(root.join("assets/minecraft/sounds.json"), b"{}").unwrap();
         fs::write(root.join("assets/minecraft/lang/en_us.json"), b"{}").unwrap();
         fs::write(
@@ -2282,10 +2512,9 @@ mod tests {
         assert!(ver_root.join("assets/minecraft/items/stone.json").is_file());
         assert!(!ver_root.join("data/minecraft/recipes/stone.json").exists());
         // Verify base `horizon-resources.json` was NOT mutated via hardlink (`source_minecraft` absent in base)!
-        let base_manifest: Value = serde_json::from_slice(
-            &fs::read(base_26_3.join("horizon-resources.json")).unwrap(),
-        )
-        .unwrap();
+        let base_manifest: Value =
+            serde_json::from_slice(&fs::read(base_26_3.join("horizon-resources.json")).unwrap())
+                .unwrap();
         assert!(base_manifest.get("source_minecraft").is_none());
 
         // 3. Verify switching active versions updates `import::resources_root` & protocol preference!
@@ -2342,13 +2571,117 @@ mod tests {
         server.join().unwrap();
 
         let installed = list_installed(&home);
-        let v = installed.iter().find(|i| i.id == "1.21.4").expect("1.21.4 installed");
+        let v = installed
+            .iter()
+            .find(|i| i.id == "1.21.4")
+            .expect("1.21.4 installed");
         assert!(v.ready && v.full_simulation && v.active);
         assert_eq!(v.protocol, Some(769));
         assert_eq!(
             horizon_protocol::adapter::preferred_server_version(),
             Some(ServerVersion::V1_21_4)
         );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn prepare_mojang_overwrites_jar_placeholders_and_heals_existing_installs() {
+        let home = temp_home("heal-pano");
+        let base_26_3 = home.join("versions/.sim-base-26.3/resources");
+        write_fake_prepared_root(&base_26_3, "26.3");
+
+        // Build a synthetic client.jar containing a 150-byte 1x1 placeholder panorama_0.png
+        let jar_path = home.join("minecraft/versions/26.3/26.3.jar");
+        fs::create_dir_all(jar_path.parent().unwrap()).unwrap();
+        {
+            let file = fs::File::create(&jar_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file(
+                "assets/minecraft/textures/gui/title/background/panorama_0.png",
+                opts,
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut zw, &[0u8; 150]).unwrap();
+            zw.finish().unwrap();
+        }
+
+        // Write real 8,192-byte panorama_0.png + pack.mcmeta into `minecraft/assets/objects`
+        let real_pano = vec![0x89u8; 8192];
+        let pano_hash = hex_lower(&Sha1::digest(&real_pano));
+        let pack_bytes = br#"{"pack":{"description":"Minecraft","min_format":84,"max_format":84}}"#;
+        let pack_hash = hex_lower(&Sha1::digest(pack_bytes));
+        let objects_dir = home.join("minecraft/assets/objects");
+        for (h, data) in [(&pano_hash, real_pano.as_slice()), (&pack_hash, pack_bytes)] {
+            let obj = objects_dir.join(&h[..2]).join(h);
+            fs::create_dir_all(obj.parent().unwrap()).unwrap();
+            fs::write(obj, data).unwrap();
+        }
+        let asset_index = json!({
+            "objects": {
+                "minecraft/textures/gui/title/background/panorama_0.png": {
+                    "hash": pano_hash,
+                    "size": 8192
+                },
+                "pack.mcmeta": {
+                    "hash": pack_hash,
+                    "size": pack_bytes.len()
+                }
+            }
+        });
+
+        prepare_mojang_on_device(
+            &home,
+            "26.3",
+            "release",
+            &jar_path,
+            &asset_index,
+            &objects_dir,
+        )
+        .expect("prepare 26.3");
+        let root_26_3 = home.join("versions/26.3/resources");
+        let pano_path =
+            root_26_3.join("assets/minecraft/textures/gui/title/background/panorama_0.png");
+        assert_eq!(fs::metadata(&pano_path).unwrap().len(), 8192);
+        assert!(root_26_3.join("assets/pack.mcmeta").is_file());
+        assert_eq!(version_id_for_root(&root_26_3), "26.3");
+
+        // Simulate a legacy `ios-build-5.1` install whose panorama_0.png was still 150 bytes:
+        write_unlinked(&pano_path, &[0u8; 150]).unwrap();
+        let _ = fs::remove_file(root_26_3.join("assets/pack.mcmeta"));
+        let _ = fs::remove_file(root_26_3.join(".horizon-assets-healed-v1"));
+        fs::write(
+            home.join("minecraft/versions/26.3/26.3.json"),
+            r#"{"assetIndex":{"id":"26.3"}}"#,
+        )
+        .unwrap();
+        let idx_dir = home.join("minecraft/assets/indexes");
+        fs::create_dir_all(&idx_dir).unwrap();
+        fs::write(
+            idx_dir.join("26.3.json"),
+            serde_json::to_vec(&asset_index).unwrap(),
+        )
+        .unwrap();
+
+        let healed = heal_placeholder_assets(&home, &root_26_3);
+        assert!(healed >= 2, "expected >= 2 healed assets, got {healed}");
+        assert_eq!(fs::metadata(&pano_path).unwrap().len(), 8192);
+        assert!(root_26_3.join("assets/pack.mcmeta").is_file());
+        assert_eq!(heal_placeholder_assets(&home, &root_26_3), 0);
+
+        // Verify `version_id_for_root` returns `"1.21.1"` for multi-version layered roots:
+        prepare_mojang_on_device(
+            &home,
+            "1.21.1",
+            "release",
+            &jar_path,
+            &asset_index,
+            &objects_dir,
+        )
+        .expect("prepare 1.21.1");
+        let root_1_21_1 = home.join("versions/1.21.1/resources");
+        assert_eq!(version_id_for_root(&root_1_21_1), "1.21.1");
+
         let _ = fs::remove_dir_all(&home);
     }
 }

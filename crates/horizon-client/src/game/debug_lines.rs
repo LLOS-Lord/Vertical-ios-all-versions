@@ -64,10 +64,10 @@ impl Game<'_> {
                     }
                 }
                 "fps" => self.debug_fps_line(d),
-                "game_version" => d.priority(format!(
-                    "Minecraft {v} ({v}/horizon)",
-                    v = horizon_client::save::VERSION_NAME
-                )),
+                "game_version" => {
+                    let v = horizon_client::versions::version_id_for_root(&self.vanilla_root());
+                    d.priority(format!("Minecraft {v} ({v}/horizon)"));
+                }
                 "gpu_utilization" => d.line(overlay::gpu_line(self.gpu_utilization)),
                 "heightmap" => self.debug_heightmap_lines(d, server.as_ref()),
                 "light_levels" => {

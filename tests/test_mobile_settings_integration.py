@@ -68,10 +68,10 @@ impl Packs{fn search_focused(&self)->bool{self.focused}fn search_rect(&self)->Op
 
 OPTIONS_TYPES = r'''
 #[derive(Clone,Copy,PartialEq,Default)]enum Page{PackOptions,
- #[default]Main,Language,Packs,Video,Controls,KeyBinds,ModBrowser,Graphics,GraphicsAdvanced,GraphicsHdr,Controller,PadBinds,Extras,ShaderPacks,ShaderOptions,ControllerRadialName,ControllerRadial,ControllerRadialPick,
+ #[default]Main,Language,Packs,Video,Controls,Touch,TouchLayout,TouchButton(u16),TouchOptions(bool),TouchLayouts,KeyBinds,ModBrowser,Graphics,GraphicsAdvanced,GraphicsHdr,Controller,PadBinds,Extras,ShaderPacks,ShaderOptions,ControllerRadialName,ControllerRadial,ControllerRadialPick,
 }
 #[derive(Default)]struct OptionsUi{
- stack:Vec<Page>,resource_error:Option<String>,settings_search:EditBox,language_search:EditBox,
+ stack:Vec<Page>,resource_error:Option<String>,settings_search:EditBox,language_search:EditBox,touch_name:EditBox,profile_name:EditBox,
  pack_options:shell::Ui,pack_screen:Option<Packs>,graphics:graphics_ui::Ui,controller:controller_ui::Ui,extras:shell::Ui,shader:shell::Ui,radial:shell::Ui,radial_pick:shell::Ui,
 }
 '''

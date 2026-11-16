@@ -67,10 +67,7 @@ fn send_emote(
         &mut kept,
         service,
         &session.name,
-        |id| {
-            join_server_managed(&session, id, cancellation.clone())
-                .map_err(|e| format!("{e:?}"))
-        },
+        |id| join_server_managed(&session, id, cancellation.clone()).map_err(|e| format!("{e:?}")),
         emote,
     )
 }
@@ -95,10 +92,7 @@ fn load_owned_emotes(
         &mut kept,
         service,
         &session.name,
-        |id| {
-            join_server_managed(session, id, cancellation.clone())
-                .map_err(|e| format!("{e:?}"))
-        },
+        |id| join_server_managed(session, id, cancellation.clone()).map_err(|e| format!("{e:?}")),
         |path| horizon_cosmetics::Transport::get(service, path),
     )
 }
@@ -145,8 +139,7 @@ fn check_owner(
         return Ok(false);
     };
     let owns = horizon_cosmetics::account::owns(service, &session.name, |id| {
-        join_server_managed(&session, id, cancellation.clone())
-            .map_err(|e| format!("{e:?}"))
+        join_server_managed(&session, id, cancellation.clone()).map_err(|e| format!("{e:?}"))
     })?;
     if let Err(e) = prefs::set_owned(&home, &uuid, owns) {
         log::warn!("Cosmetics: the ownership answer is not saved: {e}");
@@ -166,7 +159,9 @@ fn join_server_managed(
     horizon_client::auth::join_server_managed(
         session,
         server_hash,
-        Arc::new(horizon_cosmetics::transport::Connector::new(cancellation.clone())),
+        Arc::new(horizon_cosmetics::transport::Connector::new(
+            cancellation.clone(),
+        )),
         || cancellation.cancelled(),
     )
 }
@@ -252,10 +247,7 @@ fn send_listed(
     horizon_cosmetics::account::set_listed(
         service,
         &session.name,
-        |id| {
-            join_server_managed(&session, id, cancellation.clone())
-                .map_err(|e| format!("{e:?}"))
-        },
+        |id| join_server_managed(&session, id, cancellation.clone()).map_err(|e| format!("{e:?}")),
         listed,
     )
     .map(|_| ())
@@ -277,10 +269,7 @@ fn send_mine(
     let kept = horizon_cosmetics::account::set_visible(
         service,
         &session.name,
-        |id| {
-            join_server_managed(&session, id, cancellation.clone())
-                .map_err(|e| format!("{e:?}"))
-        },
+        |id| join_server_managed(&session, id, cancellation.clone()).map_err(|e| format!("{e:?}")),
         wish,
     )?;
     prefs::set_confirmed(&home, &uuid, kept).map_err(|e| e.to_string())

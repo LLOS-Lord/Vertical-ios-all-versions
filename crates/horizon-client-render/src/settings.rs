@@ -208,6 +208,13 @@ pub struct Settings {
     pub fullbright_held: bool,
     /// Controller settings (`horizon-controller.txt`, Horizon's own).
     pub controller: crate::gamepad::PadSettings,
+    /// Touch overlay settings (`horizon-touch.txt`, Horizon's own): the active layout.
+    pub touch: crate::touch::TouchSettings,
+    /// The other touch layouts (`touch-layouts/`, Horizon's own).
+    pub touch_profiles: crate::touch::TouchProfiles,
+    /// The menu pad's layout (`horizon-touch-menu.txt`, Horizon's own): a system layout for the
+    /// buttons menus draw, edited like the others but never a stick and never deleted.
+    pub touch_menu: crate::touch::TouchSettings,
     /// Horizon's optional extras (`horizon-extras.txt`), all off by default.
     pub extras: crate::extras::Extras,
     /// The Horizon mods turned on (`horizon-mods.txt`), all off by default.
@@ -298,6 +305,9 @@ impl Default for Settings {
             video_modes: Vec::new(),
             fullbright_held: false,
             controller: Default::default(),
+            touch: Default::default(),
+            touch_profiles: Default::default(),
+            touch_menu: crate::touch::TouchSettings::menu_default(),
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
@@ -368,6 +378,18 @@ impl Settings {
             .parent()
             .map(crate::gamepad::PadSettings::load)
             .unwrap_or_default();
+        let touch = path
+            .parent()
+            .map(crate::touch::TouchSettings::load)
+            .unwrap_or_default();
+        let touch_profiles = path
+            .parent()
+            .map(|dir| crate::touch::TouchProfiles::load(dir, &touch.profile))
+            .unwrap_or_default();
+        let touch_menu = path
+            .parent()
+            .map(crate::touch::TouchSettings::load_menu)
+            .unwrap_or_else(crate::touch::TouchSettings::menu_default);
         let extras_text = path
             .parent()
             .and_then(|dir| fs::read_to_string(dir.join(crate::extras::FILE)).ok())
@@ -392,6 +414,9 @@ impl Settings {
                 Self {
                     horizon,
                     controller,
+                    touch,
+                    touch_profiles,
+                    touch_menu,
                     extras,
                     mods,
                     ..Self::parse(&text)
@@ -400,6 +425,9 @@ impl Settings {
             Err(_) => Self {
                 horizon,
                 controller,
+                touch,
+                touch_profiles,
+                touch_menu,
                 extras,
                 mods,
                 ..Self::default()
@@ -520,6 +548,9 @@ impl Settings {
             video_modes: Vec::new(),
             fullbright_held: false,
             controller: Default::default(),
+            touch: Default::default(),
+            touch_profiles: Default::default(),
+            touch_menu: crate::touch::TouchSettings::menu_default(),
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
@@ -685,11 +716,19 @@ impl Settings {
         let mut next = Self {
             horizon: self.horizon.clone(),
             controller: self.controller.clone(),
+            touch: self.touch.clone(),
+            touch_profiles: self.touch_profiles.clone(),
+            touch_menu: self.touch_menu.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
             video_modes: self.video_modes.clone(),
             ..Self::from_file(file)
         };
+        // Options.applyGraphicsPreset: a new preset's own options are applied
+        // at once, as the options screen's slider does (options_ui::set_slider).
+        if key == "graphicsPreset" && next.graphics_preset != self.graphics_preset {
+            crate::options_ui::apply_preset(&mut next);
+        }
         // Horizon's own bindings aren't in options.txt.
         next.keys.set("key.emote", self.keys.get("key.emote"));
         Ok(next)
@@ -706,12 +745,105 @@ impl Settings {
         if let Some(dir) = path.parent() {
             self.horizon.save(dir);
             self.controller.save(dir);
+            self.touch.save(dir);
+            self.touch_profiles.save(dir, &self.touch);
+            self.touch_menu.save_menu(dir);
             let mut extras = self.extras.clone();
             extras.emote_key = self.keys.get("key.emote").to_owned();
             extras.save(dir);
             horizon_hooks::settings::engine::save_own(dir, &[crate::extras::FILE]);
             self.mods.save(&crate::logging::shared_dir(dir));
         }
+    }
+    /// The touch layouts a player can switch to: "Default", then the other names in order.
+    pub fn touch_layout_names(&self) -> Vec<String> {
+        let mut rest: Vec<String> = self
+            .touch_profiles
+            .layouts
+            .keys()
+            .filter(|name| !name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE))
+            .cloned()
+            .collect();
+        if !rest.contains(&self.touch.profile)
+            && !self
+                .touch
+                .profile
+                .eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
+        {
+            rest.push(self.touch.profile.clone());
+        }
+        rest.sort_by_key(|name| name.to_ascii_lowercase());
+        let mut names = vec![crate::touch::DEFAULT_PROFILE.to_owned()];
+        names.append(&mut rest);
+        names
+    }
+    /// The touch layout the editor works on: the one in use, or the menus' system layout.
+    pub fn edited_touch(&self, menus: bool) -> &crate::touch::TouchSettings {
+        if menus { &self.touch_menu } else { &self.touch }
+    }
+    /// The same, to change it.
+    pub fn edited_touch_mut(&mut self, menus: bool) -> &mut crate::touch::TouchSettings {
+        if menus {
+            &mut self.touch_menu
+        } else {
+            &mut self.touch
+        }
+    }
+    fn touch_layout_taken(&self, name: &str) -> bool {
+        // "Default" is the one every player has: a second one by that name would be a puzzle. The
+        // menus' system layout is not a profile either.
+        name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
+            || name.eq_ignore_ascii_case(crate::touch::MENU_PROFILE)
+            || name.eq_ignore_ascii_case(&self.touch.profile)
+            || self
+                .touch_profiles
+                .layouts
+                .keys()
+                .any(|used| used.eq_ignore_ascii_case(name))
+    }
+    /// A new touch layout, switched to: the default D-pad arrangement, not a copy of the current
+    /// one, with the one in use kept. `None` when the name is empty, unusable or taken.
+    pub fn create_touch_layout(&mut self, raw: &str) -> Option<String> {
+        let name = raw.trim();
+        if !crate::touch::valid_profile_name(name) || self.touch_layout_taken(name) {
+            return None;
+        }
+        let mut layout = crate::touch::TouchSettings::default();
+        layout.profile = name.to_owned();
+        let previous = std::mem::replace(&mut self.touch, layout);
+        self.touch_profiles
+            .layouts
+            .insert(previous.profile.clone(), previous);
+        Some(name.to_owned())
+    }
+    /// Switch to a kept layout, keeping the one in use; `false` when it is the active one already
+    /// or unknown.
+    pub fn switch_touch_layout(&mut self, name: &str) -> bool {
+        if name.eq_ignore_ascii_case(&self.touch.profile) {
+            return false;
+        }
+        let Some(mut next) = self.touch_profiles.layouts.remove(name).or_else(|| {
+            // A player who moved the active layout's file away still gets the stock one back.
+            name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
+                .then(crate::touch::TouchSettings::default)
+        }) else {
+            return false;
+        };
+        next.profile = name.to_owned();
+        let previous = std::mem::replace(&mut self.touch, next);
+        self.touch_profiles
+            .layouts
+            .insert(previous.profile.clone(), previous);
+        true
+    }
+    /// Forget a kept layout; the one in use and "Default" stay.
+    pub fn delete_touch_layout(&mut self, name: &str) -> bool {
+        if name.eq_ignore_ascii_case(&self.touch.profile)
+            || name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
+        {
+            return false;
+        }
+        self.touch_profiles.layouts.remove(name).is_some()
     }
     /// Volume of a sound source (master excluded).
     pub fn volume(&self, source: &str) -> f32 {
@@ -873,6 +1005,20 @@ pub enum Opt {
     /// A Nintendo pad's face buttons by place or by letter (`PadSettings::nintendo_letters`).
     PadNintendoButtons,
     PadKeyboard,
+    /// Horizon's touch overlay settings (`horizon-touch.txt`).
+    TouchOpacity,
+    TouchScale,
+    /// Whether a button of the touch overlay is shown.
+    TouchShow(crate::touch::Control),
+    /// The D-pad, or the analog stick that replaces it.
+    TouchStick,
+    /// The analog stick's own size and opacity.
+    TouchStickScale,
+    TouchStickOpacity,
+    /// Direct touch, or a pointer the finger moves over a menu.
+    TouchPointer,
+    /// Whether a tap on the world uses and a held finger mines, or the layout's buttons do it all.
+    TouchInteract,
     PadGameplayGuide,
     /// The radial menu's opener held or pressed once (`PadSettings::radial_mode`).
     PadRadialMode,

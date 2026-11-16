@@ -198,17 +198,15 @@ fn versions_snapshot(home: &std::path::Path) -> Value {
     })
 }
 
-fn handle_launcher_versions(
-    line: &str,
-    reply: &Sender<String>,
-) -> Result<Option<Option<Value>>> {
+fn handle_launcher_versions(line: &str, reply: &Sender<String>) -> Result<Option<Option<Value>>> {
     use horizon_client::versions;
     let raw = line
         .trim_start()
         .strip_prefix("launcher-versions")
         .map(str::trim)
         .unwrap_or("{}");
-    let args: Value = serde_json::from_str(raw).map_err(|e| format!("launcher-versions JSON: {e}"))?;
+    let args: Value =
+        serde_json::from_str(raw).map_err(|e| format!("launcher-versions JSON: {e}"))?;
     let home = horizon_client::import::home();
     let action = args["action"].as_str().unwrap_or("list");
 
@@ -321,10 +319,7 @@ fn handle_launcher_versions(
     Ok(Some(Some(sync_reply)))
 }
 
-fn handle_launcher_mods(
-    line: &str,
-    reply: &Sender<String>,
-) -> Result<Option<Option<Value>>> {
+fn handle_launcher_mods(line: &str, reply: &Sender<String>) -> Result<Option<Option<Value>>> {
     use horizon_client::launcher_mods;
     let raw = line
         .trim_start()

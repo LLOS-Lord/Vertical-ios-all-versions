@@ -151,6 +151,7 @@ pub mod test_instance_block;
 pub mod testgen;
 pub mod title_edition;
 pub mod touch;
+pub mod touch_draw;
 pub mod trims;
 pub mod ui;
 pub mod vault;

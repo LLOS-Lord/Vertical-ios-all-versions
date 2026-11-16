@@ -1,628 +1,2420 @@
-// Adapted from Starling (https://github.com/starling-client/starling, `android` branch at
-// 150a414b09a1, `crates/horizon-client-render/src/touch.rs`), written by Vasysik and the
-// Starling contributors. Copyright (c) 2026 Ludovic Marie and the Horizon contributors, under the
-// same MIT license as Horizon (LICENSE at the repository root).
-
-//! On-screen touch controls for touch-screen devices (Android first). Nothing
-//! here runs unless a touch surface is in use.
+//! Touch controls for phones and tablets (Horizon's own), after Minecraft: Pocket Edition's: a D-pad (or an
+//! analog stick) on the left, jump on the right, perspective, chat and pause at the top, and the hotbar and
+//! an inventory button along the bottom. A finger anywhere else turns the view; a short tap uses (or attacks
+//! the entity under the crosshair), and holding still mines. A button that is held keeps its keys down while
+//! the same finger drags, so one thumb can hold attack and turn the view (the D-pad and stick keep their own
+//! gestures).
 //!
-//! [`TouchControls`] turns fingers into the controller state the game already
-//! reads ([`PadState`]). Each finger gets a role when it lands (the joystick or
-//! D-pad, a button, or a look gesture on the world) and keeps it until it
-//! lifts, so moving, looking and pressing never take each other's fingers.
-pub mod aim;
-mod draw;
-pub mod layout;
-pub use aim::{
-    attack_indicator, camera_delta, hotbar_slot, item_places_entity_on_tap, item_uses_on_tap,
-    projectile_crosshair, screen_direction,
+//! This module is the layout and the fingers' state: positions in GUI pixels in, [`Out`]s for the game to act
+//! on out. game/touch.rs feeds it winit's touches and acts on what comes back.
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
 };
-pub use layout::{Control, Mode, Placement, Settings};
+use winit::{event::MouseButton, keyboard::KeyCode};
 
-use crate::gamepad::{Button, PadState};
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use crate::keybinds;
 
-/// A world touch held this long without dragging becomes a hold (mining, eating).
-const HOLD_DELAY: Duration = Duration::from_millis(350);
-/// How long the marker of a short world tap stays.
-const MARKER_TIME: Duration = Duration::from_millis(180);
-/// Two taps on the D-pad's sneak button closer than this toggle crouching.
-const DOUBLE_TAP: Duration = Duration::from_millis(300);
-/// A look finger that moves farther than this (a fraction of the surface
-/// height) is a camera drag, not a tap.
-const DRAG_SLOP: f32 = 0.018;
-/// The swap-hands action a [`Control::Offhand`] tap sends.
-const SWAP_HANDS: &str = "action:key.swapOffhand";
-
-/// What a finger does, decided when it lands.
-#[derive(Clone, Copy, Debug)]
-enum Role {
-    /// Drives the joystick or D-pad, measured from this anchor.
-    Move([f32; 2]),
-    /// Turns the camera; without a drag, a short tap or a long hold acts on
-    /// the world where it landed.
-    Look {
-        start: [f32; 2],
-        since: Instant,
-        /// Moved past [`DRAG_SLOP`]: a camera turn, not a tap.
-        dragged: bool,
-        /// Whether a hold uses the item (eat, draw a bow) instead of mining,
-        /// as [`TouchControls::hold_uses_item`] said when the finger landed.
-        held_use: bool,
-        /// Became a hold before it dragged; it keeps acting while it turns.
-        committed: bool,
-    },
-    /// Landed on a control that acted at once; nothing more until it lifts.
-    Ignore,
-    /// Holds the shield up.
-    Shield,
-    /// Holds a controller button.
-    Button(Button),
+/// A button of the layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Control {
+    Forward,
+    Back,
+    Left,
+    Right,
+    /// The D-pad's centre: sneaking, toggled.
+    Sneak,
+    Jump,
+    Perspective,
+    Chat,
+    Pause,
+    /// HUD on or off. Hidden with the HUD it hides, but still where it was: a remembered tap brings the
+    /// HUD back.
+    HideHud,
+    Inventory,
+    Hotbar(u8),
+    /// A button the player added, by its id in [`TouchSettings::buttons`].
+    Custom(u16),
+    /// The analog stick that replaces the D-pad: a finger on it moves at its own angle and speed.
+    Stick,
 }
 
-/// The on-screen controls' input state. The game feeds it touches with
-/// [`Self::update`] and reads [`Self::poll_state`] once a tick.
-#[derive(Default)]
-pub struct TouchControls {
-    pub settings: Settings,
-    /// The game needs the crosshair whatever the scheme.
-    pub force_crosshair: bool,
-    /// The held item is aimed along the crosshair ([`projectile_crosshair`]).
-    pub projectile_crosshair: bool,
-    /// The player has a shield, so the shield button may show.
-    pub shield_available: bool,
-    /// Only the shortcut buttons (chat, pause, settings, F3, F5): a keyboard
-    /// or controller moves the player.
-    pub auxiliary_only: bool,
-    /// The use button would act on what the crosshair points at (shown with
-    /// `contextual_interact` in the tap schemes).
-    pub context_use: bool,
-    /// Flying: jump and sneak move up and down.
-    pub vertical_movement: bool,
-    pub swimming: bool,
-    pub mounted: bool,
-    /// The player is sneaking: the sneak button shows held.
-    pub sneaking: bool,
-    /// How far the block under a world hold is broken (0..1), drawn in the
-    /// touch marker.
-    pub break_progress: f32,
-    /// A long hold on the world uses the held item instead of mining. Read when
-    /// a finger lands, so a change mid-hold (the last apple eaten) can't turn
-    /// eating into mining.
-    pub hold_uses_item: bool,
-    /// Where this tick's world action aims (0..1 of the surface), set by
-    /// [`Self::poll_state`].
-    pub aim: Option<[f32; 2]>,
-    /// A world hold is active this tick, and whether it uses the item.
-    pub holding: bool,
-    pub holding_use: bool,
-    /// A button was pressed; the game plays the click and clears it.
-    pub clicked: bool,
-    pub chat_requested: bool,
-    pub settings_requested: bool,
-    pub debug_requested: bool,
-    pub perspective_requested: bool,
-    fingers: BTreeMap<u64, (Role, [f32; 2])>,
-    /// Presses that must reach the game even if released before the next poll.
-    pending: PadState,
-    /// Key or action presses for the game's key bindings: (token, down).
-    key_events: Vec<(String, bool)>,
-    tap_aim: Option<[f32; 2]>,
-    /// A short world tap waiting for the game, with the finger's `held_use`.
-    pending_tap: Option<bool>,
-    last_marker: Option<([f32; 2], Instant)>,
-    last_sneak_tap: Option<Instant>,
-    sprint_latched: bool,
-    aspect: f32,
-}
-
-impl TouchControls {
-    /// Whether attack and use act on the crosshair rather than on a tap.
-    pub fn crosshair(&self) -> bool {
-        self.force_crosshair || self.settings.crosshair()
-    }
-
-    /// The surface size in pixels; controls stay square on any shape.
-    pub fn viewport(&mut self, width: u32, height: u32) {
-        self.aspect = width.max(1) as f32 / height.max(1) as f32;
-    }
-
-    fn aspect(&self) -> f32 {
-        if self.aspect > 0.0 {
-            self.aspect
-        } else {
-            16.0 / 9.0
-        }
-    }
-
-    /// Where a dynamic joystick may appear, as `[x, y, w, h]`: a strip
-    /// `dynamic_area_x` of the width wide on the joystick's side, and
-    /// `dynamic_area_y` of the height tall centred on it. Touches outside it
-    /// stay camera gestures.
-    pub fn dynamic_area(&self) -> [f32; 4] {
-        let home = self.placement(Control::Move);
-        let width = self.settings.dynamic_area_x.clamp(0.0, 1.0);
-        let height = self.settings.dynamic_area_y.clamp(0.0, 1.0);
-        let y = (home.center[1] - height / 2.0).clamp(0.0, 1.0 - height);
-        let x = if home.center[0] < 0.5 {
-            0.0
-        } else {
-            1.0 - width
-        };
-        [x, y, width, height]
-    }
-
-    fn dynamic_joystick(&self) -> bool {
-        self.settings.dynamic_joystick && self.settings.mode != Mode::Dpad
-    }
-
-    /// The shortcuts that stay with [`Self::auxiliary_only`].
-    fn auxiliary_control(c: Control) -> bool {
+impl Control {
+    /// The D-pad's directions, which a finger can slide between.
+    fn moves(self) -> bool {
         matches!(
-            c,
-            Control::Debug
-                | Control::Chat
-                | Control::Pause
-                | Control::Settings
-                | Control::Perspective
+            self,
+            Control::Forward | Control::Back | Control::Left | Control::Right
         )
     }
+}
 
-    /// Whether `point` is on a visible shortcut button.
-    pub fn auxiliary_at(&self, point: [f32; 2]) -> bool {
-        Control::ALL.into_iter().any(|c| {
-            Self::auxiliary_control(c)
-                && self.visible(c)
-                && layout::contains(self.placement(c).rect(self.aspect()), point)
-        })
+/// What a finger does over a menu: act where it touches, or move a pointer that a tap clicks with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointerMode {
+    /// The touch point is the mouse pointer: a tap clicks what is under the finger.
+    #[default]
+    Direct,
+    /// The finger moves a pointer that stays where it was left, and a tap clicks under it.
+    Cursor,
+}
+
+/// How the left thumb moves the player.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Movement {
+    /// Four directions slid between: the D-pad.
+    #[default]
+    DPad,
+    /// An analog stick: any direction, any speed up to full.
+    Stick,
+}
+
+/// `[x, y, width, height]` in GUI pixels.
+pub type Rect = [f32; 4];
+
+/// The D-pad's and jump's button size on a `h` GUI-pixel-high screen: about a seventh of the height, so a
+/// phone (GUI scale 4, 292 high) gets 40 GUI pixels, some 53 points, over Apple's 44-point minimum.
+pub fn button_size(h: f32) -> f32 {
+    (h * 0.14).clamp(26.0, 48.0)
+}
+/// The gap kept from the screen's edges.
+const MARGIN: f32 = 14.0;
+/// How far above the hotbar its slots still take a tap: a thumb lands high.
+const HOTBAR_REACH: f32 = 8.0;
+
+/// Whether a button is one of the menu pad's: the D-pad, Sneak and Jump.
+fn menu_control(control: Control) -> bool {
+    matches!(
+        control,
+        Control::Forward
+            | Control::Back
+            | Control::Left
+            | Control::Right
+            | Control::Sneak
+            | Control::Jump
+    )
+}
+
+/// Where every button is on a `w` x `h` GUI-pixel screen.
+pub fn layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
+    let s = button_size(h);
+    let small = (s * 0.65).round();
+    // The D-pad's centre cell, high enough that its bottom row clears the screen's edge.
+    let (cx, cy) = (MARGIN + s, h - MARGIN - 2.0 * s - 8.0);
+    let mut v = vec![
+        (Control::Forward, [cx, cy - s, s, s]),
+        (Control::Left, [cx - s, cy, s, s]),
+        (Control::Sneak, [cx, cy, s, s]),
+        (Control::Right, [cx + s, cy, s, s]),
+        (Control::Back, [cx, cy + s, s, s]),
+        (Control::Jump, [w - MARGIN - s, cy, s, s]),
+    ];
+    let top = [
+        Control::Perspective,
+        Control::Chat,
+        Control::Pause,
+        Control::HideHud,
+    ];
+    let x0 = (w - 4.0 * small - 12.0) / 2.0;
+    for (i, control) in top.into_iter().enumerate() {
+        v.push((control, [x0 + i as f32 * (small + 4.0), 2.0, small, small]));
     }
+    // Gui.extractItemHotbar's slots: the bar is 182 wide, centred, 22 high at the bottom.
+    let (hx, hy) = ((w / 2.0 - 91.0).floor(), h - 22.0);
+    for slot in 0..9u8 {
+        v.push((
+            Control::Hotbar(slot),
+            [
+                hx + 1.0 + 20.0 * f32::from(slot),
+                hy - HOTBAR_REACH,
+                20.0,
+                22.0 + HOTBAR_REACH,
+            ],
+        ));
+    }
+    v.push((
+        Control::Inventory,
+        [hx + 184.0, hy - HOTBAR_REACH, 30.0, 22.0 + HOTBAR_REACH],
+    ));
+    v
+}
 
-    /// The visible control under `point`, the last-drawn one first.
-    pub fn control_at(&self, point: [f32; 2]) -> Option<Control> {
-        Control::ALL.into_iter().rev().find(|&c| {
-            if !self.visible(c) {
-                return false;
+/// The close button over a screen that has none of its own (an inventory, chat, a sign): the top right.
+pub fn close_rect(w: f32, h: f32) -> Rect {
+    let s = (button_size(h) * 0.75).round();
+    [w - s - 4.0, 4.0, s, s]
+}
+
+/// The keyboard button, left of the close button: over a focused text field, it asks for the system's
+/// keyboard again.
+pub fn keyboard_rect(w: f32, h: f32) -> Rect {
+    let c = close_rect(w, h);
+    [c[0] - c[2] - 4.0, c[1], c[2], c[3]]
+}
+
+/// The point is inside the rectangle.
+pub fn hit_rect(r: Rect, at: (f32, f32)) -> bool {
+    contains(r, at)
+}
+
+fn contains(r: Rect, (x, y): (f32, f32)) -> bool {
+    x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
+}
+
+/// The button under a point.
+pub fn hit(layout: &[(Control, Rect)], at: (f32, f32)) -> Option<Control> {
+    layout
+        .iter()
+        .find(|(_, r)| contains(*r, at))
+        .map(|(c, _)| *c)
+}
+
+/// Horizon's touch overlay settings (`horizon-touch.txt`).
+pub const FILE: &str = "horizon-touch.txt";
+/// The menu pad's layout (`horizon-touch-menu.txt`): a system layout, not a profile.
+pub const MENU_FILE: &str = "horizon-touch-menu.txt";
+/// The layouts other than the active one: one file each, by name.
+pub const LAYOUTS_DIR: &str = "touch-layouts";
+/// The layout every player starts with.
+pub const DEFAULT_PROFILE: &str = "Default";
+/// The name the menus' system layout goes by.
+pub const MENU_PROFILE: &str = "Interaction";
+pub const MAX_PROFILE_NAME: usize = 16;
+
+/// A layout profile's name, which is also its file's stem (so it shows in the Files app): letters,
+/// digits, spaces, `_` and `-`, 1 to [`MAX_PROFILE_NAME`] of them.
+pub fn valid_profile_name(name: &str) -> bool {
+    let name = name.trim();
+    (1..=MAX_PROFILE_NAME).contains(&name.chars().count())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
+}
+
+/// A button moved by the player: its top-left corner as fractions of the space it can move in (the
+/// screen minus the button), so a layout survives a rotation, a resize or a change of the button's size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A button the player added: what it sends and how it looks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomButton {
+    /// What the button shows; empty until the player names it ("NEW").
+    pub name: String,
+    /// The keys it sends, in order; empty slots are skipped. Pressed in order, released in reverse.
+    pub keys: [Option<String>; MAX_KEYS],
+    /// Its top-left corner as fractions of the screen, as [`Placement`].
+    pub placement: Placement,
+    /// Its width and height, `MIN_SIZE`..=`MAX_SIZE`, multiplied by the overlay's scale.
+    pub width: f32,
+    pub height: f32,
+    /// Its own background opacity, `MIN_OPACITY`..=1.0, multiplied by the overlay's.
+    pub opacity: f32,
+    /// One tap holds the keys down, the next lets go.
+    pub toggle: bool,
+    /// The keys are held only while the finger stays on the button: sliding off lets go, sliding back
+    /// presses again. Off, a press keeps its keys until the finger lifts.
+    pub swipe: bool,
+    /// A solid background color in place of vanilla's button sprite, and the stroke around it.
+    pub background: Option<u32>,
+    pub stroke: Option<u32>,
+}
+
+/// How many keys one button sends.
+pub const MAX_KEYS: usize = 4;
+/// The most characters a button's name takes.
+pub const MAX_NAME: usize = 32;
+
+impl Default for CustomButton {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            keys: [None, None, None, None],
+            placement: Placement { x: 0.5, y: 0.5 },
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            toggle: false,
+            swipe: false,
+            background: None,
+            stroke: None,
+        }
+    }
+}
+
+/// A key or mouse button a player's button sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomKey {
+    Key(KeyCode),
+    Mouse(MouseButton),
+}
+
+impl CustomKey {
+    /// The `key.keyboard.*` or `key.mouse.*` name as a key, if it is one.
+    pub fn of(name: &str) -> Option<Self> {
+        if let Some(button) = keybinds::mouse_button(name) {
+            return Some(Self::Mouse(button));
+        }
+        keybinds::key_code(name).map(Self::Key)
+    }
+}
+
+/// A mapping's name as the button and the options page show it: "LMB"/"RMB" for a mouse button,
+/// else the key's display name.
+pub fn key_label(name: &str) -> String {
+    match keybinds::mouse_button(name) {
+        Some(MouseButton::Left) => "LMB".to_owned(),
+        Some(MouseButton::Right) => "RMB".to_owned(),
+        Some(MouseButton::Middle) => "MMB".to_owned(),
+        _ => keybinds::display_name(name).plain(),
+    }
+}
+
+/// How see-through the button backgrounds may become.
+pub const MIN_OPACITY: f32 = 0.2;
+/// How small and how large the buttons may grow.
+pub const MIN_SCALE: f32 = 0.75;
+pub const MAX_SCALE: f32 = 1.5;
+/// How small and how large a button may be drawn, on either side.
+pub const MIN_SIZE: f32 = 0.5;
+pub const MAX_SIZE: f32 = 3.0;
+
+/// A built-in button's own width, height and opacity. Each button keeps its own, so resizing one never
+/// moves or fades another.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ButtonStyle {
+    /// Multipliers of the button's own size, `MIN_SIZE`..=`MAX_SIZE`.
+    pub width: f32,
+    pub height: f32,
+    /// `MIN_OPACITY`..=1.0, multiplied by the overlay's.
+    pub opacity: f32,
+}
+
+impl Default for ButtonStyle {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+        }
+    }
+}
+
+/// Whether a control takes a style of its own: the built-in buttons, but not the stick (the Touch
+/// Controls page sizes it), the hotbar (the HUD places it) or a player's buttons (they carry their own).
+pub fn styled(control: Control) -> bool {
+    matches!(
+        control,
+        Control::Forward
+            | Control::Back
+            | Control::Left
+            | Control::Right
+            | Control::Sneak
+            | Control::Jump
+            | Control::Perspective
+            | Control::Chat
+            | Control::Pause
+            | Control::HideHud
+            | Control::Inventory
+    )
+}
+
+/// Whether the player may turn a button off: the pause button is a phone's way back, and the hide-HUD
+/// button is how the HUD comes back.
+pub fn can_hide(control: Control) -> bool {
+    matches!(
+        control,
+        Control::Forward
+            | Control::Back
+            | Control::Left
+            | Control::Right
+            | Control::Sneak
+            | Control::Jump
+            | Control::Perspective
+            | Control::Chat
+            | Control::Inventory
+    )
+}
+
+/// Whether the editor's long press opens the button's own popup: everything but the hotbar (the HUD
+/// places it) and the stick (sized on the Touch Controls page).
+pub fn editable(control: Control) -> bool {
+    !matches!(control, Control::Hotbar(_) | Control::Stick)
+}
+
+/// The colors a button's background and stroke can take, with the names the options page shows. Packed as
+/// `hud::rgba` packs them: alpha in the top byte, then blue, green, red.
+pub const COLORS: [(&str, u32); 9] = [
+    ("White", 0xFFF0F0F0),
+    ("Gray", 0xFF6E6E6E),
+    ("Black", 0xFF1E1E1E),
+    ("Red", 0xFF2C34D8),
+    ("Orange", 0xFF1C84E8),
+    ("Yellow", 0xFF28C8E6),
+    ("Green", 0xFF46AA3C),
+    ("Blue", 0xFFDC7832),
+    ("Purple", 0xFFD25096),
+];
+
+/// The next color after `current`: the palette follows "Default".
+pub fn cycle_color(current: Option<u32>) -> Option<u32> {
+    let index = current.and_then(|c| COLORS.iter().position(|(_, v)| *v == c));
+    match index {
+        None => Some(COLORS[0].1),
+        Some(i) => COLORS.get(i + 1).map(|(_, v)| *v),
+    }
+}
+
+/// The color's name, "Default" for none.
+pub fn color_name(color: Option<u32>) -> &'static str {
+    match color {
+        None => "Default",
+        Some(c) => COLORS
+            .iter()
+            .find(|(_, v)| *v == c)
+            .map_or("Custom", |(name, _)| *name),
+    }
+}
+
+/// The mouse buttons a custom button can send, by the names [`keybinds::mouse_button`] reads. The
+/// middle one picks the targeted block, as it does on a mouse.
+pub const MOUSE_KEYS: [&str; 3] = ["key.mouse.left", "key.mouse.right", "key.mouse.middle"];
+
+/// The control's name in `horizon-touch.txt`; the hotbar stays where the HUD puts it.
+pub fn control_name(control: Control) -> Option<&'static str> {
+    Some(match control {
+        Control::Forward => "forward",
+        Control::Back => "back",
+        Control::Left => "left",
+        Control::Right => "right",
+        Control::Sneak => "sneak",
+        Control::Jump => "jump",
+        Control::Perspective => "perspective",
+        Control::Chat => "chat",
+        Control::Pause => "pause",
+        Control::HideHud => "hide_hud",
+        Control::Inventory => "inventory",
+        Control::Stick => "stick",
+        Control::Hotbar(_) | Control::Custom(_) => return None,
+    })
+}
+
+pub fn control_from_name(name: &str) -> Option<Control> {
+    Some(match name {
+        "forward" => Control::Forward,
+        "back" => Control::Back,
+        "left" => Control::Left,
+        "right" => Control::Right,
+        "sneak" => Control::Sneak,
+        "jump" => Control::Jump,
+        "perspective" => Control::Perspective,
+        "chat" => Control::Chat,
+        "pause" => Control::Pause,
+        "hide_hud" => Control::HideHud,
+        "inventory" => Control::Inventory,
+        "stick" => Control::Stick,
+        _ => return None,
+    })
+}
+
+/// The lang key naming a button on the settings page.
+pub fn control_caption(control: Control) -> &'static str {
+    match control {
+        Control::Forward => "horizon.options.touch.forward",
+        Control::Back => "horizon.options.touch.back",
+        Control::Left => "horizon.options.touch.left",
+        Control::Right => "horizon.options.touch.right",
+        Control::Sneak => "horizon.options.touch.sneak",
+        Control::Jump => "horizon.options.touch.jump",
+        Control::Perspective => "horizon.options.touch.perspective",
+        Control::Chat => "horizon.options.touch.chat",
+        Control::Pause => "horizon.options.touch.pause",
+        Control::HideHud => "horizon.options.touch.hide_hud",
+        Control::Inventory => "horizon.options.touch.inventory",
+        Control::Hotbar(_) => "horizon.options.touch.hotbar",
+        Control::Custom(_) => "horizon.options.touch.custom",
+        Control::Stick => "horizon.options.touch.stick",
+    }
+}
+
+/// The touch overlay as the player arranged it (`horizon-touch.txt`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TouchSettings {
+    /// The name of the layout profile this is; the active one lives in `horizon-touch.txt`.
+    pub profile: String,
+    /// The overlay-wide opacity older builds had. Each button keeps its own now: a file's value is
+    /// handed to every button on load (`migrate_global_style`) and this returns to 1.
+    pub opacity: f32,
+    /// The overlay-wide size older builds had, carried into every button the same way.
+    pub scale: f32,
+    /// Buttons the player moved, by name: where their top-left corner sits.
+    pub placements: BTreeMap<Control, Placement>,
+    /// Buttons the player turned off. The pause button is never hidden: a phone needs a way back.
+    pub hidden: BTreeSet<Control>,
+    /// Each built-in button's own width, height and opacity.
+    pub styles: BTreeMap<Control, ButtonStyle>,
+    /// The player's own buttons, by id.
+    pub buttons: BTreeMap<u16, CustomButton>,
+    /// The D-pad, or the analog stick in its place.
+    pub movement: Movement,
+    /// The stick's own size, `MIN_SCALE`..=`MAX_SCALE`, multiplied by the overlay's scale.
+    pub stick_scale: f32,
+    /// The stick's own opacity, `MIN_OPACITY`..=1.0, multiplied by the overlay's.
+    pub stick_opacity: f32,
+    /// How a finger acts over a menu.
+    pub pointer: PointerMode,
+    /// Whether a finger on the world itself taps to use and holds to mine. Turned off, touching the screen
+    /// only turns the view: a player whose layout maps the mouse buttons interacts through those.
+    pub interact: bool,
+}
+
+impl Default for TouchSettings {
+    fn default() -> Self {
+        Self {
+            profile: DEFAULT_PROFILE.to_owned(),
+            opacity: 1.0,
+            scale: 1.0,
+            placements: BTreeMap::new(),
+            hidden: BTreeSet::new(),
+            styles: BTreeMap::new(),
+            buttons: BTreeMap::new(),
+            movement: Movement::DPad,
+            stick_scale: 1.0,
+            stick_opacity: 1.0,
+            pointer: PointerMode::Direct,
+            interact: true,
+        }
+    }
+}
+
+fn clamp_unit(value: &str, default: f32, lo: f32, hi: f32) -> f32 {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map_or(default, |v| v.clamp(lo, hi))
+}
+
+/// A mapping as a button keeps it: a key or mouse button name, or `None` for an empty slot.
+fn parse_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    CustomKey::of(value).map(|_| value.to_owned())
+}
+
+/// `-` for no color, else eight hex digits.
+fn parse_color(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if value.is_empty() || value == "-" {
+        return None;
+    }
+    u32::from_str_radix(value, 16).ok()
+}
+
+fn write_color(color: Option<u32>) -> String {
+    color.map_or_else(|| "-".to_owned(), |c| format!("{c:08X}"))
+}
+
+/// A name keeps its characters but not the file's own separators.
+fn escape_name(name: &str) -> String {
+    name.replace('%', "%25").replace(':', "%3A")
+}
+fn unescape_name(name: &str) -> String {
+    name.replace("%3A", ":").replace("%25", "%")
+}
+
+/// `button:`'s value: the id and the button, in either the old five-field format or the current one.
+fn parse_button(value: &str) -> Option<(u16, CustomButton)> {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 5 && parts.len() != 14 {
+        return None;
+    }
+    let id = parts[0].trim().parse::<u16>().ok()?;
+    let (x, y) = parts[1].split_once(',')?;
+    let default = Placement { x: 0.5, y: 0.5 };
+    let placement = Placement {
+        x: clamp_unit(x.trim(), default.x, 0.0, 1.0),
+        y: clamp_unit(y.trim(), default.y, 0.0, 1.0),
+    };
+    if parts.len() == 5 {
+        // `<scale>:<opacity>:<key>`, a square button. The button showed its key's label, so that
+        // becomes its name rather than every older button turning into "NEW".
+        let scale = clamp_unit(parts[2], 1.0, MIN_SCALE, MAX_SCALE);
+        let key = parse_key(parts[4]);
+        return Some((
+            id,
+            CustomButton {
+                name: key
+                    .as_deref()
+                    .map(key_label)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(MAX_NAME)
+                    .collect(),
+                placement,
+                width: scale,
+                height: scale,
+                opacity: clamp_unit(parts[3], 1.0, MIN_OPACITY, 1.0),
+                keys: [key, None, None, None],
+                ..CustomButton::default()
+            },
+        ));
+    }
+    Some((
+        id,
+        CustomButton {
+            name: unescape_name(parts[5].trim())
+                .chars()
+                .take(MAX_NAME)
+                .collect(),
+            keys: std::array::from_fn(|i| parse_key(parts[10 + i])),
+            placement,
+            width: clamp_unit(parts[2], 1.0, MIN_SIZE, MAX_SIZE),
+            height: clamp_unit(parts[3], 1.0, MIN_SIZE, MAX_SIZE),
+            opacity: clamp_unit(parts[4], 1.0, MIN_OPACITY, 1.0),
+            toggle: parts[6].trim() == "1",
+            swipe: parts[7].trim() == "1",
+            background: parse_color(parts[8]),
+            stroke: parse_color(parts[9]),
+        },
+    ))
+}
+
+impl TouchSettings {
+    pub fn load(dir: &Path) -> Self {
+        match fs::read_to_string(dir.join(FILE)) {
+            Ok(text) => {
+                let mut s = Self::parse(&text);
+                s.spread_stacked_buttons();
+                s
             }
-            if c == Control::Move && self.dynamic_joystick() {
-                let area = self.dynamic_area();
-                return area[2] > 0.0
-                    && area[3] > 0.0
-                    && !self.moving()
-                    && layout::contains(area, point);
-            }
-            layout::contains(self.placement(c).rect(self.aspect()), point)
-        })
-    }
-
-    fn moving(&self) -> bool {
-        self.fingers
-            .values()
-            .any(|(r, _)| matches!(r, Role::Move(_)))
-    }
-
-    /// Whether this finger belongs to the touch controls.
-    pub fn owns_pointer(&self, id: u64) -> bool {
-        self.fingers.contains_key(&id)
-    }
-
-    /// Hands a finger to something else (a menu) until it lifts.
-    pub fn ignore(&mut self, id: u64) {
-        self.fingers.insert(id, (Role::Ignore, [0.0; 2]));
-    }
-
-    /// Presses `button` for one poll.
-    pub fn tap(&mut self, button: Button) {
-        self.pending.set(button, true);
-    }
-
-    fn visible(&self, c: Control) -> bool {
-        let visibility = self.settings.button_visibility[c as usize];
-        if c == Control::Shield
-            && (!self.shield_available
-                || (self.force_crosshair
-                    && visibility == layout::FOLLOW_SCHEME
-                    && self.settings.button_visibility[Control::Use as usize]
-                        == layout::FOLLOW_SCHEME))
-        {
-            // A forced crosshair brings back the use button, which raises the shield too.
-            return false;
+            Err(_) => Self::default(),
         }
-        if self.auxiliary_only && !Self::auxiliary_control(c) {
-            return false;
-        }
-        if self.force_crosshair
-            && matches!(c, Control::Attack | Control::Use)
-            && visibility == layout::FOLLOW_SCHEME
-        {
-            return true;
-        }
-        self.settings.visible(c)
-            || (c == Control::Use
-                && visibility != layout::HIDDEN
-                && self.settings.contextual_interact
-                && (self.context_use
-                    || self
-                        .fingers
-                        .values()
-                        .any(|(r, _)| matches!(r, Role::Button(Button::LeftTrigger)))))
     }
-
-    /// Where a control is on this surface: the saved placement, scaled by
-    /// `button_scale` and kept on screen.
-    fn placement(&self, c: Control) -> Placement {
-        let aspect = self.aspect();
-        let mut p = self.settings.placement(c);
-        let factory_swap = c == Control::Offhand
-            && self.settings.layouts[self.settings.mode.index()][c as usize].center == [0.80, 0.96]
-            && p.size == 0.075;
-        // On tall surfaces the factory top row would overlap: spread it out.
-        // Moved buttons and every landscape layout stay where they were saved.
-        if aspect < 1.0 && p.center[1] == 0.055 && p.size == 0.075 {
-            let mirror = |x: f32| {
-                if self.settings.left_handed {
-                    1.0 - x
-                } else {
-                    x
+    /// The menu pad's own layout: the default D-pad arrangement under [`MENU_PROFILE`].
+    pub fn menu_default() -> Self {
+        Self {
+            profile: MENU_PROFILE.to_owned(),
+            ..Self::default()
+        }
+    }
+    /// [`TouchSettings::load`] for the menu pad's system layout (`horizon-touch-menu.txt`). Menus step
+    /// between targets, so this layout is the D-pad's whatever its file says: it never has a stick.
+    pub fn load_menu(dir: &Path) -> Self {
+        let mut s = fs::read_to_string(dir.join(MENU_FILE))
+            .map_or_else(|_| Self::menu_default(), |text| Self::parse(&text));
+        s.profile = MENU_PROFILE.to_owned();
+        s.movement = Movement::DPad;
+        s
+    }
+    /// [`TouchSettings::save`] for the menu pad's layout: written once it differs from its defaults.
+    pub fn save_menu(&self, dir: &Path) {
+        let path = dir.join(MENU_FILE);
+        if *self != Self::menu_default() || path.exists() {
+            let _ = fs::write(path, self.serialize());
+        }
+    }
+    /// Written once something differs from the defaults, so players who never touch the overlay get no new
+    /// file.
+    pub fn save(&self, dir: &Path) {
+        let path = dir.join(FILE);
+        if *self != Self::default() || path.exists() {
+            let _ = fs::write(path, self.serialize());
+        }
+    }
+    pub fn parse(text: &str) -> Self {
+        let mut s = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "profile" => {
+                    let name = unescape_name(value).trim().to_owned();
+                    if valid_profile_name(&name) {
+                        s.profile = name;
+                    }
                 }
-            };
-            let top = match c {
-                Control::Debug => Some((0.42, 0.18)),
-                Control::Chat => Some((0.46, 0.34)),
-                Control::Pause => Some((0.50, 0.50)),
-                Control::Settings => Some((0.54, 0.66)),
-                Control::Perspective => Some((0.58, 0.82)),
-                _ => None,
-            };
-            if let Some((old, new)) = top
-                && (p.center[0] - mirror(old)).abs() < 0.0001
-            {
-                p.center[0] = mirror(new);
-                p.size = p.size.min(aspect * 0.12);
+                "opacity" => s.opacity = clamp_unit(value, s.opacity, MIN_OPACITY, 1.0),
+                "scale" => s.scale = clamp_unit(value, s.scale, MIN_SCALE, MAX_SCALE),
+                "movement" => {
+                    if value == "stick" {
+                        s.movement = Movement::Stick;
+                    }
+                }
+                // `pointer:cursor`; direct touch is the default and has no line.
+                "pointer" => {
+                    if value == "cursor" {
+                        s.pointer = PointerMode::Cursor;
+                    }
+                }
+                // `interact:off`; the screen interacts by default and has no line.
+                "interact" => {
+                    if value == "off" {
+                        s.interact = false;
+                    }
+                }
+                // `stick:<scale>:<opacity>`, as `serialize` writes it.
+                "stick" => {
+                    if let Some((scale, opacity)) = value.split_once(':') {
+                        s.stick_scale =
+                            clamp_unit(scale.trim(), s.stick_scale, MIN_SCALE, MAX_SCALE);
+                        s.stick_opacity =
+                            clamp_unit(opacity.trim(), s.stick_opacity, MIN_OPACITY, 1.0);
+                    }
+                }
+                "hidden" => {
+                    if let Some(control) = control_from_name(value) {
+                        s.set_hidden(control, true);
+                    }
+                }
+                // `place:<name>:x,y`, as `serialize` writes it.
+                "place" => {
+                    if let Some((name, xy)) = value.split_once(':')
+                        && let Some(control) = control_from_name(name.trim())
+                        && let Some((x, y)) = xy.split_once(',')
+                    {
+                        let default = Placement { x: 0.0, y: 0.0 };
+                        let placement = Placement {
+                            x: clamp_unit(x.trim(), default.x, 0.0, 1.0),
+                            y: clamp_unit(y.trim(), default.y, 0.0, 1.0),
+                        };
+                        s.placements.insert(control, placement);
+                    }
+                }
+                // `size:<name>:<width>:<height>:<opacity>`, as `serialize` writes it.
+                "size" => {
+                    if let Some((name, sides)) = value.split_once(':')
+                        && let Some(control) = control_from_name(name.trim())
+                    {
+                        let mut sides = sides.split(':');
+                        let mut next = |default: f32, lo: f32, hi: f32| {
+                            clamp_unit(sides.next().unwrap_or(""), default, lo, hi)
+                        };
+                        let style = ButtonStyle {
+                            width: next(1.0, MIN_SIZE, MAX_SIZE),
+                            height: next(1.0, MIN_SIZE, MAX_SIZE),
+                            opacity: next(1.0, MIN_OPACITY, 1.0),
+                        };
+                        s.set_style(control, style);
+                    }
+                }
+                // `button:<id>:x,y:width:height:opacity:name:toggle:swipe:bg:stroke:k0:k1:k2:k3`, as
+                // `serialize` writes it; an older five-field line
+                // (`button:<id>:x,y:scale:opacity:key`) still reads.
+                "button" => {
+                    if let Some((id, button)) = parse_button(value) {
+                        s.buttons.insert(id, button);
+                    }
+                }
+                _ => {}
             }
         }
-        let mut p = self.fit(p);
-        if factory_swap {
-            // The factory swap button sits beside inventory, in button sizes,
-            // so it never covers the jump, sneak or sprint buttons.
-            let inventory = self.placement(Control::Inventory);
-            let side = if self.settings.left_handed { -1.0 } else { 1.0 };
-            let half = p.size / aspect / 2.0;
-            p.center[0] = (inventory.center[0]
-                + side * ((inventory.size + p.size) / 2.0 + 0.015) / aspect)
-                .clamp(half, 1.0 - half);
+        s.migrate_global_style();
+        s
+    }
+    /// Older builds had one size and opacity for every button; each button carries its own now. A file
+    /// from then hands those values to every built-in (and to the stick, which keeps its own sliders), so
+    /// the overlay looks the same after the update, then stops linking the buttons together.
+    fn migrate_global_style(&mut self) {
+        let (opacity, scale) = (self.opacity, self.scale);
+        if opacity < 1.0 || scale != 1.0 {
+            for control in [
+                Control::Forward,
+                Control::Back,
+                Control::Left,
+                Control::Right,
+                Control::Sneak,
+                Control::Jump,
+                Control::Perspective,
+                Control::Chat,
+                Control::Pause,
+                Control::HideHud,
+                Control::Inventory,
+            ] {
+                let mut style = self.style(control);
+                style.width *= scale;
+                style.height *= scale;
+                style.opacity *= opacity;
+                self.set_style(control, style);
+            }
+            self.stick_scale = (self.stick_scale * scale).clamp(MIN_SCALE, MAX_SCALE);
+            self.stick_opacity = (self.stick_opacity * opacity).clamp(MIN_OPACITY, 1.0);
         }
-        p
+        self.opacity = 1.0;
+        self.scale = 1.0;
     }
-
-    /// Scales a placement by `button_scale` and keeps it inside the surface.
-    fn fit(&self, mut p: Placement) -> Placement {
-        let aspect = self.aspect();
-        p.size = (p.size * self.settings.button_scale).min(aspect).min(1.0);
-        let half = [p.size / aspect / 2.0, p.size / 2.0];
-        for (c, half) in p.center.iter_mut().zip(half) {
-            *c = c.clamp(half, 1.0 - half);
+    pub fn serialize(&self) -> String {
+        let mut text = String::new();
+        // Older builds skip the line: the file stays a plain layout to them.
+        if self.profile != DEFAULT_PROFILE {
+            text.push_str(&format!("profile:{}\n", escape_name(&self.profile)));
         }
-        p
-    }
-
-    /// The controller button a control holds, if it holds one.
-    fn button(c: Control) -> Option<Button> {
-        Some(match c {
-            Control::Sprint => Button::LeftStick,
-            Control::Jump => Button::South,
-            Control::Sneak => Button::RightStick,
-            Control::Attack => Button::RightTrigger,
-            Control::Use | Control::Shield => Button::LeftTrigger,
-            Control::Pause => Button::Start,
-            Control::Inventory => Button::North,
-            _ => return None,
-        })
-    }
-
-    /// Whether a finger holds the shield button.
-    pub fn shield_held(&self) -> bool {
-        self.settings.shield_button
-            && self.shield_available
-            && self
-                .fingers
-                .values()
-                .any(|(r, _)| matches!(r, Role::Shield))
-    }
-
-    /// Where the touch marker goes in the tap schemes: under a look finger, or
-    /// briefly where a short tap landed.
-    pub fn pointer(&self) -> Option<[f32; 2]> {
-        if self.crosshair() {
-            return None;
+        text.push_str(&format!("opacity:{}\nscale:{}\n", self.opacity, self.scale));
+        if self.movement == Movement::Stick {
+            text.push_str("movement:stick\n");
         }
-        self.fingers
-            .values()
-            .find_map(|(r, point)| matches!(r, Role::Look { .. }).then_some(*point))
-            .or_else(|| {
-                self.last_marker
-                    .filter(|(_, t)| t.elapsed() < MARKER_TIME)
-                    .map(|(p, _)| p)
-            })
+        if self.pointer == PointerMode::Cursor {
+            text.push_str("pointer:cursor\n");
+        }
+        if !self.interact {
+            text.push_str("interact:off\n");
+        }
+        if self.stick_scale != 1.0 || self.stick_opacity != 1.0 {
+            text.push_str(&format!(
+                "stick:{}:{}\n",
+                self.stick_scale, self.stick_opacity
+            ));
+        }
+        for (control, placement) in &self.placements {
+            if let Some(name) = control_name(*control) {
+                text.push_str(&format!("place:{name}:{},{}\n", placement.x, placement.y));
+            }
+        }
+        for control in &self.hidden {
+            if let Some(name) = control_name(*control) {
+                text.push_str(&format!("hidden:{name}\n"));
+            }
+        }
+        for (control, style) in &self.styles {
+            if let Some(name) = control_name(*control)
+                && *style != ButtonStyle::default()
+            {
+                text.push_str(&format!(
+                    "size:{name}:{}:{}:{}\n",
+                    style.width, style.height, style.opacity
+                ));
+            }
+        }
+        for (id, button) in &self.buttons {
+            let key = |slot: usize| button.keys[slot].as_deref().unwrap_or("");
+            text.push_str(&format!(
+                "button:{id}:{},{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
+                button.placement.x,
+                button.placement.y,
+                button.width,
+                button.height,
+                button.opacity,
+                escape_name(&button.name),
+                u8::from(button.toggle),
+                u8::from(button.swipe),
+                write_color(button.background),
+                write_color(button.stroke),
+                key(0),
+                key(1),
+                key(2),
+                key(3),
+            ));
+        }
+        text
     }
-
-    /// The aim point of a world action: the crosshair, or where the finger is.
-    fn aim_at(&self, point: [f32; 2]) -> [f32; 2] {
-        if self.settings.crosshair() || self.projectile_crosshair {
-            [0.5, 0.5]
+    /// Default positions, resized and moved; the hotbar follows the HUD and is never hidden.
+    pub fn layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
+        self.layout_at(w, h, false)
+    }
+    /// The same, with the buttons the player turned off still in place: the editor shows them faintly so
+    /// a long press can turn them back on.
+    pub fn editor_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
+        self.layout_at(w, h, true)
+    }
+    /// The buttons that drive a screen's pointer (game/touch.rs): the D-pad, Sneak and Jump, where the
+    /// player put them and at their sizes, and any buttons the player added to this layout. They come
+    /// from the D-pad template whatever this layout's movement is: a screen steps from slot to slot and
+    /// button to button rather than steering, so a menu never gets a stick.
+    pub fn menu_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
+        let mut v = layout(w, h);
+        v.retain(|(control, _)| menu_control(*control) && self.visible(*control));
+        self.styled_at(&mut v, w, h);
+        self.custom_at(w, h, &mut v);
+        v
+    }
+    /// [`TouchSettings::menu_layout`] with the buttons the player turned off still in place: the menu
+    /// layout's editor shows them faintly so a long press can turn them back on.
+    pub fn menu_editor_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
+        let mut v = layout(w, h);
+        v.retain(|(control, _)| menu_control(*control));
+        self.styled_at(&mut v, w, h);
+        self.custom_at(w, h, &mut v);
+        v
+    }
+    /// The player's own buttons at their placements, each its own size, added after the built-in ones.
+    fn custom_at(&self, w: f32, h: f32, v: &mut Vec<(Control, Rect)>) {
+        let base = button_size(h);
+        for (id, button) in &self.buttons {
+            let side = |v: f32| (base * v.clamp(MIN_SIZE, MAX_SIZE)).round().max(1.0);
+            let (bw, bh) = (side(button.width), side(button.height));
+            let x = button.placement.x * (w - bw).max(0.0);
+            let y = button.placement.y * (h - bh).max(0.0);
+            v.push((
+                Control::Custom(*id),
+                [
+                    x.clamp(0.0, (w - bw).max(0.0)),
+                    y.clamp(0.0, (h - bh).max(0.0)),
+                    bw,
+                    bh,
+                ],
+            ));
+        }
+    }
+    fn layout_at(&self, w: f32, h: f32, hidden_too: bool) -> Vec<(Control, Rect)> {
+        let mut v = layout(w, h);
+        if self.movement == Movement::Stick {
+            // The stick takes the D-pad's 3×3 box, and sneak moves to the left of jump.
+            v.retain(|(control, _)| {
+                !matches!(
+                    control,
+                    Control::Forward | Control::Back | Control::Left | Control::Right
+                )
+            });
+            let s = button_size(h);
+            let (cx, cy) = (MARGIN + s, h - MARGIN - 2.0 * s - 8.0);
+            v.push((Control::Stick, [cx - s, cy - s, 3.0 * s, 3.0 * s]));
+            if let Some((_, sneak)) = v.iter_mut().find(|(c, _)| *c == Control::Sneak) {
+                *sneak = [w - MARGIN - 2.0 * s - 8.0, cy, s, s];
+            }
+        }
+        if !hidden_too {
+            v.retain(|(control, _)| self.visible(*control));
+        }
+        self.styled_at(&mut v, w, h);
+        self.custom_at(w, h, &mut v);
+        v
+    }
+    /// A built-in button's own size and the player's placement, applied in place. The hotbar follows the
+    /// HUD and keeps the size it is drawn at.
+    fn styled_at(&self, v: &mut [(Control, Rect)], w: f32, h: f32) {
+        for (control, r) in v.iter_mut() {
+            if matches!(control, Control::Hotbar(_)) {
+                continue;
+            }
+            let own = if *control == Control::Stick {
+                self.stick_scale.clamp(MIN_SCALE, MAX_SCALE)
+            } else {
+                1.0
+            };
+            let style = self.style(*control);
+            let (bw, bh) = (r[2] * own * style.width, r[3] * own * style.height);
+            let (mut x, mut y) = (r[0] + (r[2] - bw) / 2.0, r[1] + (r[3] - bh) / 2.0);
+            if let Some(placement) = self.placements.get(control) {
+                x = placement.x * (w - bw).max(0.0);
+                y = placement.y * (h - bh).max(0.0);
+            }
+            *r = [
+                x.clamp(0.0, (w - bw).max(0.0)),
+                y.clamp(0.0, (h - bh).max(0.0)),
+                bw,
+                bh,
+            ];
+        }
+    }
+    pub fn visible(&self, control: Control) -> bool {
+        matches!(
+            control,
+            Control::Hotbar(_)
+                | Control::Pause
+                | Control::HideHud
+                | Control::Custom(_)
+                | Control::Stick
+        ) || !self.hidden.contains(&control)
+    }
+    pub fn set_hidden(&mut self, control: Control, hidden: bool) {
+        if matches!(
+            control,
+            Control::Hotbar(_)
+                | Control::Pause
+                | Control::HideHud
+                | Control::Custom(_)
+                | Control::Stick
+        ) {
+            return;
+        }
+        if hidden {
+            self.hidden.insert(control);
         } else {
-            point
+            self.hidden.remove(&control);
         }
     }
-
-    fn world_gestures(&self) -> bool {
-        !self.crosshair() || self.settings.crosshair_gestures
+    /// A built-in button's own size and opacity, or the defaults.
+    pub fn style(&self, control: Control) -> ButtonStyle {
+        self.styles.get(&control).copied().unwrap_or_default()
     }
-
-    /// One touch event: finger `id` at `point` (0..1 of the surface), as it
-    /// lands (`started`), moves, or lifts (`ended`). Returns how far the
-    /// camera should turn, in surface fractions (see [`camera_delta`]).
-    pub fn update(&mut self, id: u64, point: [f32; 2], started: bool, ended: bool) -> [f32; 2] {
-        if ended {
-            self.lift(id);
-            return [0.0; 2];
+    /// Stores a built-in button's style; a default one is forgotten, so the file stays small.
+    pub fn set_style(&mut self, control: Control, style: ButtonStyle) {
+        if !styled(control) {
+            return;
         }
-        if started {
-            self.land(id, point);
-            return [0.0; 2];
-        }
-        let aspect = self.aspect();
-        let attack_look = self.settings.attack_button_look && self.crosshair();
-        let Some((role, previous)) = self.fingers.get_mut(&id) else {
-            return [0.0; 2];
+        let style = ButtonStyle {
+            width: style.width.clamp(MIN_SIZE, MAX_SIZE),
+            height: style.height.clamp(MIN_SIZE, MAX_SIZE),
+            opacity: style.opacity.clamp(MIN_OPACITY, 1.0),
         };
-        let turns = match role {
-            Role::Look {
-                start,
-                since,
-                dragged,
-                committed,
+        if style == ButtonStyle::default() {
+            self.styles.remove(&control);
+        } else {
+            self.styles.insert(control, style);
+        }
+    }
+    pub fn set_style_size(&mut self, control: Control, width: f32, height: f32) {
+        let mut style = self.style(control);
+        style.width = width;
+        style.height = height;
+        self.set_style(control, style);
+    }
+    pub fn set_style_opacity(&mut self, control: Control, opacity: f32) {
+        let mut style = self.style(control);
+        style.opacity = opacity;
+        self.set_style(control, style);
+    }
+    /// Where a button's top-left corner goes, as fractions of the space it can move in.
+    pub fn set_placement(&mut self, control: Control, x: f32, y: f32) {
+        let placement = Placement {
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+        };
+        match control {
+            Control::Hotbar(_) => {}
+            Control::Custom(id) => {
+                if let Some(button) = self.buttons.get_mut(&id) {
+                    button.placement = placement;
+                }
+            }
+            _ => {
+                self.placements.insert(control, placement);
+            }
+        }
+    }
+    /// A new button at the middle of the screen, showing "NEW" until it is named. Each further one steps
+    /// away from the last instead of piling up on it.
+    pub fn add_button(&mut self, w: f32, h: f32) -> u16 {
+        let id = self
+            .buttons
+            .keys()
+            .next_back()
+            .copied()
+            .map_or(0, |id| id.saturating_add(1));
+        let size = button_size(h).round();
+        let free = ((w - size).max(1.0), (h - size).max(1.0));
+        let step = (size * 0.45).max(8.0) * self.buttons.len() as f32;
+        let x = ((w - size) / 2.0 + step).rem_euclid(free.0);
+        let y = ((h - size) / 2.0 + step).rem_euclid(free.1);
+        self.buttons.insert(
+            id,
+            CustomButton {
+                placement: Placement {
+                    x: x / free.0,
+                    y: y / free.1,
+                },
+                ..CustomButton::default()
+            },
+        );
+        id
+    }
+    pub fn remove_button(&mut self, id: u16) {
+        self.buttons.remove(&id);
+    }
+    pub fn button(&self, id: u16) -> Option<&CustomButton> {
+        self.buttons.get(&id)
+    }
+    /// The name the player gave it; the button shows "NEW" while it is empty.
+    pub fn set_button_name(&mut self, id: u16, name: String) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            button.name = name.chars().filter(|c| *c != '\n').take(MAX_NAME).collect();
+        }
+    }
+    pub fn set_button_key(&mut self, id: u16, slot: usize, key: Option<String>) {
+        if let Some(button) = self.buttons.get_mut(&id)
+            && slot < MAX_KEYS
+        {
+            button.keys[slot] = key;
+        }
+    }
+    pub fn clear_button_keys(&mut self, id: u16) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            button.keys = std::array::from_fn(|_| None);
+        }
+    }
+    pub fn set_button_size(&mut self, id: u16, width: f32, height: f32) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            button.width = width.clamp(MIN_SIZE, MAX_SIZE);
+            button.height = height.clamp(MIN_SIZE, MAX_SIZE);
+        }
+    }
+    pub fn set_button_opacity(&mut self, id: u16, opacity: f32) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            button.opacity = opacity.clamp(MIN_OPACITY, 1.0);
+        }
+    }
+    pub fn set_button_toggle(&mut self, id: u16, toggle: bool) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            button.toggle = toggle;
+        }
+    }
+    pub fn set_button_swipe(&mut self, id: u16, swipe: bool) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            button.swipe = swipe;
+        }
+    }
+    /// The background (`stroke` false) or stroke color, `None` for vanilla's look.
+    pub fn set_button_color(&mut self, id: u16, stroke: bool, color: Option<u32>) {
+        if let Some(button) = self.buttons.get_mut(&id) {
+            if stroke {
+                button.stroke = color;
+            } else {
+                button.background = color;
+            }
+        }
+    }
+    /// The mapping in `slot`, if one is set.
+    pub fn button_key_name(&self, id: u16, slot: usize) -> Option<&str> {
+        self.button(id)?.keys.get(slot)?.as_deref()
+    }
+    /// Every mapping the button sends, in order.
+    pub fn button_mappings(&self, id: u16) -> Vec<CustomKey> {
+        let Some(button) = self.button(id) else {
+            return Vec::new();
+        };
+        button
+            .keys
+            .iter()
+            .flatten()
+            .filter_map(|name| CustomKey::of(name))
+            .collect()
+    }
+    /// The buttons that let go as soon as the finger leaves them.
+    pub fn swipes(&self) -> BTreeSet<Control> {
+        self.buttons
+            .iter()
+            .filter(|(_, button)| button.swipe)
+            .map(|(id, _)| Control::Custom(*id))
+            .collect()
+    }
+    /// What the button shows: the name the player gave it, or "NEW".
+    pub fn button_label(&self, id: u16) -> String {
+        match self.button(id) {
+            Some(button) if !button.name.is_empty() => button.name.clone(),
+            _ => "NEW".to_owned(),
+        }
+    }
+    /// The default layout: positions, sizes, opacities, the buttons turned off and the player's own
+    /// buttons all start over. The movement mode and the stick's own size and opacity stay.
+    pub fn reset_layout(&mut self) {
+        self.opacity = 1.0;
+        self.scale = 1.0;
+        self.placements.clear();
+        self.hidden.clear();
+        self.styles.clear();
+        self.buttons.clear();
+    }
+    /// Older builds put every new button on the same spot; a file from then steps the duplicates apart
+    /// instead of showing them piled on one another.
+    fn spread_stacked_buttons(&mut self) {
+        let mut taken: Vec<Placement> = Vec::new();
+        for button in self.buttons.values_mut() {
+            let mut placement = button.placement;
+            while taken
+                .iter()
+                .any(|p| (p.x - placement.x).abs() < 1e-4 && (p.y - placement.y).abs() < 1e-4)
+            {
+                if placement.x >= 1.0 && placement.y >= 1.0 {
+                    break;
+                }
+                placement.x = (placement.x + 0.05).min(1.0);
+                placement.y = (placement.y + 0.05).min(1.0);
+            }
+            button.placement = placement;
+            taken.push(placement);
+        }
+    }
+}
+
+/// The touch layouts besides the active one: one `touch-layouts/<name>.txt` each. The active layout
+/// is [`TouchSettings`] itself (as `horizon-touch.txt` keeps it), so an older build still starts
+/// with the layout the player last used.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TouchProfiles {
+    /// The inactive layouts, by name.
+    pub layouts: BTreeMap<String, TouchSettings>,
+}
+
+impl TouchProfiles {
+    pub fn load(dir: &Path, active: &str) -> Self {
+        let mut layouts = BTreeMap::new();
+        let Ok(entries) = fs::read_dir(dir.join(LAYOUTS_DIR)) else {
+            return Self::default();
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // The active one is `horizon-touch.txt`, whatever a file here is called.
+            if !valid_profile_name(name) || name.eq_ignore_ascii_case(active) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut layout = TouchSettings::parse(&text);
+            layout.spread_stacked_buttons();
+            layout.profile = name.to_owned();
+            layouts.insert(name.to_owned(), layout);
+        }
+        Self { layouts }
+    }
+    /// Writes every layout and drops the files of layouts no longer listed (or of the active one).
+    /// The folder exists only while another layout does.
+    pub fn save(&self, dir: &Path, active: &TouchSettings) {
+        let folder = dir.join(LAYOUTS_DIR);
+        if let Ok(entries) = fs::read_dir(&folder) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                    continue;
+                }
+                let stale = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_none_or(|name| {
+                        !self.layouts.contains_key(name)
+                            || name.eq_ignore_ascii_case(&active.profile)
+                    });
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        if self.layouts.is_empty() {
+            let _ = fs::remove_dir(&folder);
+            return;
+        }
+        if fs::create_dir_all(&folder).is_err() {
+            return;
+        }
+        for (name, layout) in &self.layouts {
+            let _ = fs::write(folder.join(format!("{name}.txt")), layout.serialize());
+        }
+    }
+}
+
+/// What the game does with the fingers' changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Out {
+    Press(Control),
+    Release(Control),
+    /// Turn the view by this much, in GUI pixels dragged.
+    Look(f32, f32),
+    /// A short tap away from the buttons: use, or attack what the crosshair is on.
+    Tap,
+    /// A finger held still away from the buttons: mining starts, and stops when it lifts.
+    MineStart,
+    MineEnd,
+    /// The analog stick's position: `[left, forward]`, each -1..=1.
+    Move(f32, f32),
+}
+
+/// How far a finger moves (GUI pixels) before a touch is a drag and not a tap.
+const SLOP: f32 = 8.0;
+/// How long a finger stays still (seconds) before it mines.
+const HOLD: f64 = 0.35;
+/// How far from the stick's centre (as a share of its radius) a finger moves nothing.
+const STICK_DEADZONE: f32 = 0.15;
+
+/// The stick's `[left, forward]` for a finger at `at`: zero in the middle, full at the ring and beyond.
+fn stick_vector(r: Rect, at: (f32, f32)) -> (f32, f32) {
+    let radius = (r[2].min(r[3]) / 2.0).max(1.0);
+    let dx = (at.0 - (r[0] + r[2] / 2.0)) / radius;
+    let dy = (at.1 - (r[1] + r[3] / 2.0)) / radius;
+    let len = dx.hypot(dy);
+    if len <= STICK_DEADZONE {
+        return (0.0, 0.0);
+    }
+    let mag = ((len - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).min(1.0);
+    // Screen right is strafing right, screen down is walking back.
+    (-dx / len * mag, -dy / len * mag)
+}
+
+fn stick_rect(layout: &[(Control, Rect)]) -> Option<Rect> {
+    layout
+        .iter()
+        .find(|(c, _)| *c == Control::Stick)
+        .map(|(_, r)| *r)
+}
+
+#[derive(Clone, Debug)]
+enum Kind {
+    Button(Control),
+    World {
+        dragged: bool,
+        mining: bool,
+        /// A swipeable button the finger is gliding over, held until it leaves.
+        swiping: Option<Control>,
+    },
+    /// A player's swipeable button: its keys follow the finger in and out of the button.
+    Swipe {
+        control: Control,
+        pressed: bool,
+    },
+    /// The analog stick, wherever its rect is now (the layout may change under the finger).
+    Stick,
+}
+
+#[derive(Clone, Debug)]
+struct Finger {
+    id: u64,
+    kind: Kind,
+    start: (f32, f32),
+    last: (f32, f32),
+    since: f64,
+}
+
+/// The fingers on the screen while playing.
+#[derive(Clone, Debug, Default)]
+pub struct Touches {
+    fingers: Vec<Finger>,
+}
+
+impl Touches {
+    /// A finger went down at `at`, `now` seconds into some clock. `swipes` are the buttons whose keys let
+    /// go when the finger slides off them.
+    pub fn start(
+        &mut self,
+        id: u64,
+        at: (f32, f32),
+        now: f64,
+        layout: &[(Control, Rect)],
+        swipes: &BTreeSet<Control>,
+    ) -> Vec<Out> {
+        let mut out = self.end(id);
+        let kind = match hit(layout, at) {
+            Some(Control::Stick) => {
+                if let Some(r) = stick_rect(layout) {
+                    let (left, forward) = stick_vector(r, at);
+                    out.push(Out::Move(left, forward));
+                }
+                Kind::Stick
+            }
+            Some(control) if swipes.contains(&control) => {
+                out.push(Out::Press(control));
+                Kind::Swipe {
+                    control,
+                    pressed: true,
+                }
+            }
+            Some(control) => {
+                out.push(Out::Press(control));
+                Kind::Button(control)
+            }
+            None => Kind::World {
+                dragged: false,
+                mining: false,
+                swiping: None,
+            },
+        };
+        self.fingers.push(Finger {
+            id,
+            kind,
+            start: at,
+            last: at,
+            since: now,
+        });
+        out
+    }
+
+    /// A finger moved: the D-pad follows it from direction to direction, a finger on the world turns the
+    /// view and presses any swipeable button it glides over, and a swipeable button's keys follow the
+    /// finger in and out.
+    pub fn moved(
+        &mut self,
+        id: u64,
+        at: (f32, f32),
+        layout: &[(Control, Rect)],
+        swipes: &BTreeSet<Control>,
+    ) -> Vec<Out> {
+        let Some(f) = self.fingers.iter_mut().find(|f| f.id == id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match &mut f.kind {
+            Kind::Stick => {
+                if let Some(r) = stick_rect(layout) {
+                    let (left, forward) = stick_vector(r, at);
+                    out.push(Out::Move(left, forward));
+                }
+            }
+            Kind::Button(control) if control.moves() => {
+                if let Some(next) = hit(layout, at).filter(|c| c.moves() && c != control) {
+                    out.push(Out::Release(*control));
+                    out.push(Out::Press(next));
+                    *control = next;
+                }
+            }
+            Kind::Button(_) => {
+                // The held key stays down; dragging the same finger turns the view, so a
+                // button bound to attack can aim with one thumb.
+                let (dx, dy) = (at.0 - f.start.0, at.1 - f.start.1);
+                if dx.hypot(dy) > SLOP {
+                    out.push(Out::Look(at.0 - f.last.0, at.1 - f.last.1));
+                }
+            }
+            Kind::Swipe { control, pressed } => {
+                let inside = layout
+                    .iter()
+                    .find(|(c, _)| c == control)
+                    .is_some_and(|(_, r)| contains(*r, at));
+                if inside != *pressed {
+                    *pressed = inside;
+                    out.push(if inside {
+                        Out::Press(*control)
+                    } else {
+                        Out::Release(*control)
+                    });
+                }
+            }
+            Kind::World {
+                dragged, swiping, ..
+            } => {
+                let (dx, dy) = (at.0 - f.start.0, at.1 - f.start.1);
+                if !*dragged && dx.hypot(dy) > SLOP {
+                    *dragged = true;
+                }
+                if *dragged {
+                    out.push(Out::Look(at.0 - f.last.0, at.1 - f.last.1));
+                }
+                // Gliding over a swipeable button presses it without stopping the view.
+                let over = hit(layout, at).filter(|c| swipes.contains(c));
+                if over != *swiping {
+                    if let Some(old) = swiping.take() {
+                        out.push(Out::Release(old));
+                    }
+                    if let Some(next) = over {
+                        out.push(Out::Press(next));
+                    }
+                    *swiping = over;
+                }
+            }
+        }
+        f.last = at;
+        out
+    }
+
+    /// A finger lifted.
+    pub fn end(&mut self, id: u64) -> Vec<Out> {
+        let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
+            return Vec::new();
+        };
+        match self.fingers.remove(i).kind {
+            Kind::Stick => vec![Out::Move(0.0, 0.0)],
+            Kind::Button(control) => vec![Out::Release(control)],
+            Kind::Swipe {
+                control,
+                pressed: true,
+            } => vec![Out::Release(control)],
+            Kind::Swipe { .. } => Vec::new(),
+            Kind::World {
+                mining: true,
+                swiping,
                 ..
             } => {
-                if !*dragged && since.elapsed() >= HOLD_DELAY {
-                    *committed = true;
-                }
-                *dragged |= ((point[0] - start[0]) * aspect).hypot(point[1] - start[1]) > DRAG_SLOP;
-                *dragged
+                let mut out: Vec<Out> = swiping.into_iter().map(Out::Release).collect();
+                out.push(Out::MineEnd);
+                out
             }
-            // In the crosshair schemes the attack button can steer while it mines.
-            Role::Button(Button::RightTrigger) => attack_look,
-            _ => false,
-        };
-        let delta = [point[0] - previous[0], point[1] - previous[1]];
-        *previous = point;
-        if turns { delta } else { [0.0; 2] }
-    }
-
-    fn lift(&mut self, id: u64) {
-        let Some((
-            Role::Look {
-                start,
-                since,
-                dragged,
-                held_use,
+            Kind::World {
+                swiping: Some(control),
                 ..
-            },
-            _,
-        )) = self.fingers.remove(&id)
-        else {
-            return;
-        };
-        if self.world_gestures() && !dragged && since.elapsed() < HOLD_DELAY {
-            self.tap_aim = Some(self.aim_at(start));
-            self.last_marker = Some((start, Instant::now()));
-            self.pending_tap = Some(held_use);
+            } => vec![Out::Release(control)],
+            Kind::World { dragged: false, .. } => vec![Out::Tap],
+            Kind::World { .. } => Vec::new(),
         }
     }
 
-    fn land(&mut self, id: u64, point: [f32; 2]) {
-        let role = match self.control_at(point) {
-            Some(Control::Move) if !self.moving() => Role::Move(if self.dynamic_joystick() {
-                point
-            } else {
-                self.placement(Control::Move).center
-            }),
-            Some(Control::Shield) => {
-                self.clicked = true;
-                self.pending.triggers[0] = 1.0;
-                Role::Shield
+    /// UIKit cancelled a finger: release its holds without interpreting it as a tap.
+    pub fn cancel(&mut self, id: u64) -> Vec<Out> {
+        let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
+            return Vec::new();
+        };
+        match self.fingers.remove(i).kind {
+            Kind::Stick => vec![Out::Move(0.0, 0.0)],
+            Kind::Button(control) => vec![Out::Release(control)],
+            Kind::Swipe {
+                control,
+                pressed: true,
+            } => vec![Out::Release(control)],
+            Kind::World {
+                mining: true,
+                swiping,
+                ..
+            } => {
+                let mut out: Vec<Out> = swiping.into_iter().map(Out::Release).collect();
+                out.push(Out::MineEnd);
+                out
             }
-            Some(Control::Offhand) => {
-                self.clicked = true;
-                self.key_events.push((SWAP_HANDS.into(), true));
-                self.key_events.push((SWAP_HANDS.into(), false));
-                Role::Ignore
-            }
-            Some(Control::Chat) => {
-                self.chat_requested = true;
-                Role::Ignore
-            }
-            Some(Control::Settings) => {
-                self.settings_requested = true;
-                Role::Ignore
-            }
-            Some(Control::Debug) => {
-                self.debug_requested = true;
-                Role::Ignore
-            }
-            Some(Control::Perspective) => {
-                self.perspective_requested = true;
-                Role::Ignore
-            }
-            Some(Control::Sneak)
-                if self.settings.mode == Mode::Dpad
-                    && !self.vertical_movement
-                    && !self.swimming
-                    && !self.mounted =>
-            {
-                // The D-pad's centre crouches on a double tap.
-                let now = Instant::now();
-                if self
-                    .last_sneak_tap
-                    .take()
-                    .is_some_and(|t| now.duration_since(t) < DOUBLE_TAP)
-                {
-                    Role::Button(Button::RightStick)
-                } else {
-                    self.last_sneak_tap = Some(now);
-                    Role::Ignore
-                }
-            }
-            Some(Control::Sprint) if self.settings.sprint_toggle => {
-                self.sprint_latched = !self.sprint_latched;
-                Role::Ignore
-            }
-            Some(c) => Self::button(c).map_or(Role::Ignore, Role::Button),
-            None => Role::Look {
-                start: point,
-                since: Instant::now(),
+            Kind::World {
+                swiping: Some(control),
+                ..
+            } => vec![Out::Release(control)],
+            Kind::World { .. } | Kind::Swipe { .. } => Vec::new(),
+        }
+    }
+
+    /// Once a frame: a finger on the world that has stayed still long enough starts mining.
+    pub fn frame(&mut self, now: f64) -> Vec<Out> {
+        let mut out = Vec::new();
+        for f in &mut self.fingers {
+            if let Kind::World {
                 dragged: false,
-                held_use: self.hold_uses_item,
-                committed: false,
-            },
-        };
-        self.fingers.insert(id, (role, point));
-        // Latch the press so a tap shorter than a tick still reaches the game.
-        match role {
-            Role::Button(Button::LeftTrigger) => self.pending.triggers[0] = 1.0,
-            Role::Button(Button::RightTrigger) => self.pending.triggers[1] = 1.0,
-            Role::Button(button) => self.pending.set(button, true),
-            _ => {}
-        }
-    }
-
-    /// Lets go of everything: fingers, latched presses, requests.
-    pub fn clear(&mut self) {
-        self.fingers.clear();
-        self.last_sneak_tap = None;
-        self.sprint_latched = false;
-        self.pending = PadState::default();
-        self.aim = None;
-        self.tap_aim = None;
-        self.pending_tap = None;
-        self.last_marker = None;
-        self.holding_use = false;
-        self.holding = false;
-        self.chat_requested = false;
-        self.settings_requested = false;
-        self.debug_requested = false;
-        self.perspective_requested = false;
-    }
-
-    /// A short world tap since the last call, and whether it uses the item.
-    /// A tap never holds attack or use into the next tick: the game acts once
-    /// at [`Self::aim`].
-    pub fn take_tap(&mut self) -> Option<bool> {
-        self.pending_tap.take()
-    }
-
-    /// Key or action presses for the game's key bindings since the last call.
-    pub fn key_events(&mut self) -> Vec<(String, bool)> {
-        std::mem::take(&mut self.key_events)
-    }
-
-    /// This tick's controller state, with presses that already lifted, and
-    /// sets [`Self::aim`], [`Self::holding`] and [`Self::holding_use`].
-    pub fn poll_state(&mut self) -> PadState {
-        let mut state = self.state().merge(&std::mem::take(&mut self.pending));
-        self.aim = self.tap_aim.take();
-        self.holding_use = false;
-        self.holding = false;
-        if !self.world_gestures() {
-            return state;
-        }
-        let mut hold = None;
-        for (role, point) in self.fingers.values_mut() {
-            if let Role::Look {
-                since,
-                dragged,
-                held_use,
-                committed,
-                ..
-            } = role
+                mining,
+                swiping: None,
+            } = &mut f.kind
+                && !*mining
+                && now - f.since >= HOLD
             {
-                if !*dragged && since.elapsed() >= HOLD_DELAY {
-                    *committed = true;
-                }
-                if !*dragged || *committed {
-                    hold = Some((*point, *committed, *held_use));
-                    if *committed {
-                        break;
-                    }
-                }
+                *mining = true;
+                out.push(Out::MineStart);
             }
         }
-        if let Some((point, committed, held_use)) = hold {
-            self.aim = Some(self.aim_at(point));
-            if committed {
-                self.holding = true;
-                self.holding_use = held_use;
-                state.triggers[usize::from(!held_use)] = 1.0;
-            }
-        }
-        state
+        out
     }
 
-    /// Keeps the current hold using the item, even after the last one was
-    /// eaten or the target changed.
-    pub fn latch_use(&mut self) {
-        if let Some((Role::Look { held_use, .. }, _)) = self.fingers.values_mut().find(|(r, _)| {
-            matches!(
-                r,
-                Role::Look {
-                    committed: true,
-                    ..
-                }
-            )
-        }) {
-            *held_use = true;
-        }
-        self.holding_use = true;
+    /// Every finger lifted at once (a screen opened over the game).
+    pub fn release_all(&mut self) -> Vec<Out> {
+        let ids: Vec<u64> = self.fingers.iter().map(|f| f.id).collect();
+        ids.into_iter().flat_map(|id| self.cancel(id)).collect()
     }
 
-    /// The controller state the fingers hold right now.
-    pub fn state(&self) -> PadState {
-        let mut state = PadState::default();
-        if self.settings.sprint_toggle && self.settings.sprint_button && self.sprint_latched {
-            state.set(Button::LeftStick, true);
-        }
-        for (role, point) in self.fingers.values() {
-            match role {
-                Role::Move(anchor) => {
-                    let radius = self.placement(Control::Move).size / 2.0;
-                    let mut left = [
-                        (point[0] - anchor[0]) * self.aspect() / radius,
-                        (anchor[1] - point[1]) / radius,
-                    ];
-                    if self.settings.mode == Mode::Dpad {
-                        left = left.map(|v| if v.abs() < 1.0 / 3.0 { 0.0 } else { v.signum() });
-                    }
-                    // Pushing forward past the joystick's rim sprints; coming
-                    // back inside stops.
-                    let sprint = left[1] > 1.0;
-                    let length = left[0].hypot(left[1]).max(1.0);
-                    state.left = left.map(|v| v / length);
-                    if sprint
-                        && self.settings.sprint_with_joystick
-                        && self.settings.mode != Mode::Dpad
-                    {
-                        state.set(Button::LeftStick, true);
-                    }
-                }
-                Role::Button(Button::LeftTrigger) | Role::Shield => state.triggers[0] = 1.0,
-                Role::Button(Button::RightTrigger) => state.triggers[1] = 1.0,
-                Role::Button(b) => state.set(*b, true),
-                Role::Look { .. } | Role::Ignore => {}
-            }
-        }
-        state
+    /// A finger holds this button down (drawn pressed).
+    pub fn held(&self, control: Control) -> bool {
+        self.fingers.iter().any(|f| match f.kind {
+            Kind::Button(c) => c == control,
+            Kind::Swipe {
+                control: c,
+                pressed,
+            } => pressed && c == control,
+            Kind::Stick => control == Control::Stick,
+            Kind::World {
+                swiping: Some(c), ..
+            } => c == control,
+            Kind::World { .. } => false,
+        })
     }
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    fn at(layout: &[(Control, Rect)], control: Control) -> (f32, f32) {
+        let r = layout.iter().find(|(c, _)| *c == control).unwrap().1;
+        (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
+    }
+
+    const NO_SWIPES: &BTreeSet<Control> = &BTreeSet::new();
+
+    #[test]
+    fn buttons_do_not_overlap_and_fit_the_screen() {
+        for (w, h) in [(633.0, 292.0), (427.0, 240.0), (480.0, 270.0)] {
+            let l = layout(w, h);
+            for (i, (a, ra)) in l.iter().enumerate() {
+                assert!(
+                    ra[0] >= 0.0 && ra[1] >= 0.0 && ra[0] + ra[2] <= w && ra[1] + ra[3] <= h,
+                    "{a:?} off screen"
+                );
+                for (b, rb) in &l[i + 1..] {
+                    let apart = ra[0] + ra[2] <= rb[0]
+                        || rb[0] + rb[2] <= ra[0]
+                        || ra[1] + ra[3] <= rb[1]
+                        || rb[1] + rb[3] <= ra[1];
+                    assert!(apart, "{a:?} overlaps {b:?} at {w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_dpad_follows_a_sliding_finger() {
+        let l = layout(633.0, 292.0);
+        let mut t = Touches::default();
+        assert_eq!(
+            t.start(1, at(&l, Control::Forward), 0.0, &l, NO_SWIPES),
+            [Out::Press(Control::Forward)]
+        );
+        assert!(t.held(Control::Forward));
+        assert_eq!(
+            t.moved(1, at(&l, Control::Right), &l, NO_SWIPES),
+            [Out::Release(Control::Forward), Out::Press(Control::Right)]
+        );
+        // Off the pad, the last direction stays held, as in Pocket Edition.
+        assert_eq!(t.moved(1, (300.0, 100.0), &l, NO_SWIPES), []);
+        assert_eq!(t.end(1), [Out::Release(Control::Right)]);
+        assert!(!t.held(Control::Right));
+    }
+
+    #[test]
+    fn a_quick_still_touch_taps_and_a_held_one_mines() {
+        let l = layout(633.0, 292.0);
+        let mut t = Touches::default();
+        assert_eq!(t.start(1, (300.0, 100.0), 0.0, &l, NO_SWIPES), []);
+        assert_eq!(t.frame(0.1), []);
+        assert_eq!(t.end(1), [Out::Tap]);
+
+        t.start(2, (300.0, 100.0), 1.0, &l, NO_SWIPES);
+        assert_eq!(t.frame(1.3), []);
+        assert_eq!(t.frame(1.4), [Out::MineStart]);
+        assert_eq!(t.frame(1.5), []);
+        assert_eq!(t.end(2), [Out::MineEnd]);
+    }
+
+    #[test]
+    fn a_dragging_finger_turns_the_view_and_does_not_tap() {
+        let l = layout(633.0, 292.0);
+        let mut t = Touches::default();
+        t.start(1, (300.0, 100.0), 0.0, &l, NO_SWIPES);
+        // Within the slop (a thumb's wobble): no look yet, and still a tap candidate.
+        assert_eq!(t.moved(1, (305.0, 100.0), &l, NO_SWIPES), []);
+        assert_eq!(
+            t.moved(1, (313.0, 104.0), &l, NO_SWIPES),
+            [Out::Look(8.0, 4.0)]
+        );
+        assert_eq!(t.frame(5.0), []);
+        assert_eq!(t.end(1), []);
+    }
+
+    #[test]
+    fn a_held_button_holds_its_keys_while_the_same_finger_turns_the_view() {
+        let l = layout(633.0, 292.0);
+        let mut t = Touches::default();
+        // A point on the Jump button, well inside it.
+        assert_eq!(
+            t.start(1, (600.0, 200.0), 0.0, &l, NO_SWIPES),
+            [Out::Press(Control::Jump)]
+        );
+        // A thumb's wobble is not a drag.
+        assert_eq!(t.moved(1, (604.0, 200.0), &l, NO_SWIPES), []);
+        // Past the slop the view follows the finger, and the key stays held.
+        assert_eq!(
+            t.moved(1, (630.0, 200.0), &l, NO_SWIPES),
+            [Out::Look(26.0, 0.0)]
+        );
+        assert_eq!(
+            t.moved(1, (630.0, 188.0), &l, NO_SWIPES),
+            [Out::Look(0.0, -12.0)]
+        );
+        assert!(t.held(Control::Jump));
+        assert_eq!(t.end(1), [Out::Release(Control::Jump)]);
+    }
+
+    #[test]
+    fn the_dpad_and_the_stick_do_not_look_while_their_finger_moves() {
+        let l = layout(633.0, 292.0);
+        let mut t = Touches::default();
+        let left = at(&l, Control::Left);
+        t.start(1, left, 0.0, &l, NO_SWIPES);
+        // The D-pad slides between directions instead.
+        let out = t.moved(1, (left.0 + 30.0, left.1), &l, NO_SWIPES);
+        assert!(out.iter().all(|o| !matches!(o, Out::Look(..))));
+
+        let stick = stick_settings().layout(633.0, 292.0);
+        let r = placed(&stick, Control::Stick);
+        let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        t.start(2, centre, 0.0, &stick, NO_SWIPES);
+        let out = t.moved(2, (centre.0 + 40.0, centre.1), &stick, NO_SWIPES);
+        assert!(out.iter().all(|o| !matches!(o, Out::Look(..))));
+    }
+
+    #[test]
+    fn two_fingers_move_and_look_at_once() {
+        let l = layout(633.0, 292.0);
+        let mut t = Touches::default();
+        t.start(1, at(&l, Control::Forward), 0.0, &l, NO_SWIPES);
+        t.start(2, (400.0, 100.0), 0.0, &l, NO_SWIPES);
+        assert_eq!(
+            t.moved(2, (420.0, 100.0), &l, NO_SWIPES),
+            [Out::Look(20.0, 0.0)]
+        );
+        assert!(t.held(Control::Forward));
+        let mut all = t.release_all();
+        all.sort_by_key(|o| format!("{o:?}"));
+        assert_eq!(all, [Out::Release(Control::Forward)]);
+    }
+
+    fn placed(l: &[(Control, Rect)], control: Control) -> Rect {
+        l.iter().find(|(c, _)| *c == control).unwrap().1
+    }
+
+    #[test]
+    fn touch_settings_survive_a_round_trip() {
+        let mut s = TouchSettings::default();
+        s.set_placement(Control::Jump, 0.25, 0.6);
+        s.set_hidden(Control::Chat, true);
+        s.set_style_size(Control::Jump, 1.2, 0.9);
+        s.set_style_opacity(Control::Jump, 0.4);
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        let line = s.serialize();
+        let line = line.lines().find(|l| l.starts_with("size:jump:")).unwrap();
+        assert_eq!(line.split(':').count(), 5);
+        // Defaults write no size lines at all.
+        assert!(!TouchSettings::default().serialize().contains("size:"));
+    }
+
+    #[test]
+    fn a_layout_keeps_its_profile_name() {
+        let mut s = TouchSettings::default();
+        assert_eq!(s.profile, DEFAULT_PROFILE);
+        assert!(!s.serialize().contains("profile:"));
+        s.profile = "pvp".to_owned();
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        assert!(s.serialize().starts_with("profile:pvp\n"));
+        // A file from before profiles, or an unusable name, starts as Default.
+        assert_eq!(TouchSettings::parse("opacity:1\n").profile, DEFAULT_PROFILE);
+        assert_eq!(
+            TouchSettings::parse("profile:bad/name\n").profile,
+            DEFAULT_PROFILE
+        );
+        // Resetting the arrangement keeps the profile.
+        s.set_placement(Control::Jump, 0.5, 0.5);
+        s.reset_layout();
+        assert_eq!(s.profile, "pvp");
+    }
+
+    #[test]
+    fn profile_names_are_file_stems() {
+        assert!(valid_profile_name("pvp"));
+        assert!(valid_profile_name("PvP 1v1"));
+        assert!(valid_profile_name("a"));
+        assert!(!valid_profile_name(""));
+        assert!(!valid_profile_name("   "));
+        assert!(!valid_profile_name("bad/name"));
+        assert!(!valid_profile_name("dots.dots"));
+        assert!(!valid_profile_name(&"x".repeat(MAX_PROFILE_NAME + 1)));
+    }
+
+    #[test]
+    fn layouts_round_trip_through_their_folder() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-touch-layouts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut active = TouchSettings::default();
+        active.profile = "pvp".to_owned();
+        let mut profiles = TouchProfiles::default();
+        // A layout equal to the default is still a layout: its file is what remembers it.
+        profiles
+            .layouts
+            .insert("Default".to_owned(), TouchSettings::default());
+        let mut building = TouchSettings::default();
+        building.profile = "building".to_owned();
+        building.set_placement(Control::Jump, 0.25, 0.6);
+        profiles.layouts.insert("building".to_owned(), building);
+        profiles.save(&dir, &active);
+        assert_eq!(TouchProfiles::load(&dir, &active.profile), profiles);
+        // The active layout is `horizon-touch.txt`, not one of the folder's files.
+        assert!(!dir.join(LAYOUTS_DIR).join("pvp.txt").exists());
+        // Deleting one drops its file; deleting every one drops the folder.
+        profiles.layouts.remove("building");
+        profiles.save(&dir, &active);
+        assert!(!dir.join(LAYOUTS_DIR).join("building.txt").exists());
+        profiles.layouts.clear();
+        profiles.save(&dir, &active);
+        assert!(!dir.join(LAYOUTS_DIR).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hotbar_pause_and_hide_hud_stay_on_and_in_place() {
+        let mut s = TouchSettings::default();
+        s.set_hidden(Control::Pause, true);
+        s.set_hidden(Control::HideHud, true);
+        s.set_hidden(Control::Hotbar(3), true);
+        assert!(s.visible(Control::Pause));
+        assert!(s.visible(Control::HideHud));
+        assert!(s.visible(Control::Hotbar(3)));
+        let l = s.layout(633.0, 292.0);
+        assert!(l.iter().any(|(c, _)| *c == Control::Pause));
+        assert!(l.iter().any(|(c, _)| *c == Control::HideHud));
+        assert!(l.iter().any(|(c, _)| *c == Control::Hotbar(3)));
+        // A file naming it is read but still leaves it on.
+        let old = TouchSettings::parse("hidden:hide_hud\n");
+        assert!(old.visible(Control::HideHud));
+        assert_eq!(control_from_name("hide_hud"), Some(Control::HideHud));
+    }
+
+    #[test]
+    fn interacting_is_on_until_the_file_says_otherwise() {
+        assert!(TouchSettings::default().interact);
+        let off = TouchSettings::parse("interact:off\n");
+        assert!(!off.interact);
+        assert!(off.serialize().contains("interact:off\n"));
+        assert_eq!(TouchSettings::parse(&off.serialize()), off);
+        // A file that never turned it off says nothing about it.
+        assert!(!TouchSettings::default().serialize().contains("interact"));
+    }
+
+    #[test]
+    fn the_hide_hud_button_sits_in_the_top_row_after_pause() {
+        let l = layout(633.0, 292.0);
+        let (pause, hud) = (placed(&l, Control::Pause), placed(&l, Control::HideHud));
+        assert!(hud[0] > pause[0]);
+        assert!((hud[1] - pause[1]).abs() < 0.01);
+        assert!((hud[2] - pause[2]).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_swipe_button_holds_its_keys_only_while_the_finger_is_on_it() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(633.0, 292.0);
+        s.set_button_swipe(id, true);
+        assert_eq!(s.swipes(), BTreeSet::from([Control::Custom(id)]));
+        let l = s.layout(633.0, 292.0);
+        let r = placed(&l, Control::Custom(id));
+        let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        let outside = (r[0] + r[2] + 40.0, centre.1);
+        let swipes = s.swipes();
+        let mut t = Touches::default();
+        // A finger on it presses its keys...
+        assert_eq!(
+            t.start(1, centre, 0.0, &l, &swipes),
+            [Out::Press(Control::Custom(id))]
+        );
+        assert!(t.held(Control::Custom(id)));
+        // ...lets go as soon as it slides off...
+        assert_eq!(
+            t.moved(1, outside, &l, &swipes),
+            [Out::Release(Control::Custom(id))]
+        );
+        assert!(!t.held(Control::Custom(id)));
+        // ...and presses again on coming back.
+        assert_eq!(
+            t.moved(1, centre, &l, &swipes),
+            [Out::Press(Control::Custom(id))]
+        );
+        // Lifting inside releases; a finger that already slid off releases nothing.
+        assert_eq!(t.end(1), [Out::Release(Control::Custom(id))]);
+        t.start(2, centre, 1.0, &l, &swipes);
+        t.moved(2, outside, &l, &swipes);
+        assert_eq!(t.end(2), []);
+        // A cancelled finger lets go of what it held.
+        t.start(3, centre, 2.0, &l, &swipes);
+        assert_eq!(t.cancel(3), [Out::Release(Control::Custom(id))]);
+        // A button that is not swipeable keeps its keys held even as the finger slides off.
+        t.start(4, centre, 3.0, &l, NO_SWIPES);
+        assert_eq!(t.moved(4, outside, &l, NO_SWIPES), []);
+        assert!(t.held(Control::Custom(id)));
+        assert_eq!(t.end(4), [Out::Release(Control::Custom(id))]);
+    }
+
+    #[test]
+    fn a_finger_gliding_over_a_swipe_button_presses_it_and_still_turns_the_view() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(633.0, 292.0);
+        s.set_button_swipe(id, true);
+        let l = s.layout(633.0, 292.0);
+        let r = placed(&l, Control::Custom(id));
+        let y = r[1] + r[3] / 2.0;
+        let start = (r[0] - 60.0, y);
+        let inside = (r[0] + 10.0, y);
+        let past = (r[0] + r[2] + 10.0, y);
+        let swipes = s.swipes();
+        let mut t = Touches::default();
+        // A finger that starts away from the buttons turns the view...
+        assert_eq!(t.start(1, start, 0.0, &l, &swipes), []);
+        // ...and presses a swipeable button as it glides onto it, still turning.
+        assert_eq!(
+            t.moved(1, inside, &l, &swipes),
+            [
+                Out::Look(inside.0 - start.0, 0.0),
+                Out::Press(Control::Custom(id))
+            ]
+        );
+        assert!(t.held(Control::Custom(id)));
+        // Gliding off lets go and keeps turning; lifting afterwards is not a tap.
+        assert_eq!(
+            t.moved(1, past, &l, &swipes),
+            [
+                Out::Look(past.0 - inside.0, 0.0),
+                Out::Release(Control::Custom(id))
+            ]
+        );
+        assert!(!t.held(Control::Custom(id)));
+        assert_eq!(t.end(1), []);
+    }
+
+    #[test]
+    fn colors_cycle_through_the_palette_and_back_to_default() {
+        let mut color = None;
+        for (name, value) in COLORS {
+            color = cycle_color(color);
+            assert_eq!(color, Some(value));
+            assert_eq!(color_name(color), name);
+        }
+        assert_eq!(cycle_color(color), None);
+        assert_eq!(color_name(None), "Default");
+    }
+
+    #[test]
+    fn a_hidden_button_leaves_the_layout() {
+        let mut s = TouchSettings::default();
+        s.set_hidden(Control::Chat, true);
+        let l = s.layout(633.0, 292.0);
+        assert!(!l.iter().any(|(c, _)| *c == Control::Chat));
+        assert_eq!(l.len(), layout(633.0, 292.0).len() - 1);
+    }
+
+    #[test]
+    fn a_placement_moves_a_button_and_keeps_it_on_screen() {
+        let mut s = TouchSettings::default();
+        s.set_placement(Control::Jump, 0.1, 0.2);
+        let r = placed(&s.layout(600.0, 300.0), Control::Jump);
+        // Fractions of the space the button can move in, so a resize keeps the layout's shape.
+        assert!((r[0] - 0.1 * (600.0 - r[2])).abs() < 0.01);
+        assert!((r[1] - 0.2 * (300.0 - r[3])).abs() < 0.01);
+        // Far over the edge: the button is pulled back onto the screen.
+        s.set_placement(Control::Jump, 5.0, 5.0);
+        let r = placed(&s.layout(600.0, 300.0), Control::Jump);
+        assert!(r[0] >= 0.0 && r[1] >= 0.0);
+        assert!(r[0] + r[2] <= 600.0 && r[1] + r[3] <= 300.0);
+    }
+
+    #[test]
+    fn an_old_global_size_and_opacity_become_each_buttons_own() {
+        let s = TouchSettings::parse("opacity:0.5\nscale:1.25\n");
+        // The globals are gone; every built-in carries them, and the stick keeps its own sliders.
+        assert_eq!((s.opacity, s.scale), (1.0, 1.0));
+        let style = s.style(Control::Jump);
+        assert!((style.width - 1.25).abs() < 0.001);
+        assert!((style.height - 1.25).abs() < 0.001);
+        assert!((style.opacity - 0.5).abs() < 0.001);
+        assert!((s.stick_scale - 1.25).abs() < 0.001);
+        assert!((s.stick_opacity - 0.5).abs() < 0.001);
+        let base = layout(600.0, 300.0);
+        let l = s.layout(600.0, 300.0);
+        let (b, j) = (placed(&base, Control::Jump), placed(&l, Control::Jump));
+        assert!((j[2] - b[2] * 1.25).abs() < 0.01);
+        // The hotbar follows the HUD and never takes a style.
+        assert_eq!(
+            placed(&l, Control::Hotbar(0)),
+            placed(&base, Control::Hotbar(0))
+        );
+        // Saved back, the file carries per-button sizes, not the old globals.
+        let text = s.serialize();
+        assert!(text.contains("size:jump:"));
+        assert!(text.contains("opacity:1\nscale:1\n"));
+        assert_eq!(TouchSettings::parse(&text), s);
+    }
+
+    #[test]
+    fn custom_buttons_survive_a_round_trip() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(633.0, 292.0);
+        s.set_button_name(id, "Fly".into());
+        s.set_button_key(id, 0, Some("key.keyboard.f3".into()));
+        s.set_button_key(id, 2, Some("key.mouse.left".into()));
+        s.set_button_size(id, 1.25, 0.75);
+        s.set_button_opacity(id, 0.5);
+        s.set_button_toggle(id, true);
+        s.set_button_swipe(id, true);
+        s.set_button_color(id, false, Some(COLORS[3].1));
+        s.set_button_color(id, true, Some(COLORS[6].1));
+        s.set_placement(Control::Custom(id), 0.1, 0.7);
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        // The keys press in order; empty slots are skipped.
+        assert_eq!(
+            s.button_mappings(id),
+            [
+                CustomKey::Key(winit::keyboard::KeyCode::F3),
+                CustomKey::Mouse(winit::event::MouseButton::Left)
+            ]
+        );
+        // A name keeps even the file's own separators.
+        s.set_button_name(id, "a:b%c".into());
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        assert_eq!(s.button_label(id), "a:b%c");
+    }
+
+    #[test]
+    fn old_button_lines_still_load_and_new_ones_are_written() {
+        let s = TouchSettings::parse("button:7:0.25,0.5:1.5:0.5:key.keyboard.g\n");
+        let b = s.button(7).unwrap();
+        assert_eq!((b.width, b.height), (1.5, 1.5));
+        assert_eq!(b.opacity, 0.5);
+        assert_eq!(b.keys[0].as_deref(), Some("key.keyboard.g"));
+        // The old button showed its key's label, so that label becomes its name: updating the app must
+        // not turn every button into "NEW".
+        assert_eq!(b.name, key_label("key.keyboard.g"));
+        assert!(!b.toggle && !b.swipe);
+        assert_eq!(b.background, None);
+        // Saved back, the button keeps its shape in the current format.
+        let again = TouchSettings::parse(&s.serialize());
+        assert_eq!(again, s);
+        assert!(s.serialize().contains("button:7:"));
+        let line = s.serialize();
+        let line = line.lines().find(|l| l.starts_with("button:")).unwrap();
+        assert_eq!(line.split(':').count(), 15);
+    }
+
+    #[test]
+    fn a_custom_button_can_send_a_mouse_click() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(600.0, 300.0);
+        s.set_button_key(id, 0, Some("key.mouse.left".into()));
+        assert_eq!(key_label("key.mouse.left"), "LMB");
+        assert_eq!(
+            s.button_mappings(id),
+            [CustomKey::Mouse(winit::event::MouseButton::Left)]
+        );
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        s.set_button_key(id, 0, Some("key.mouse.right".into()));
+        assert_eq!(key_label("key.mouse.right"), "RMB");
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        s.set_button_key(id, 0, Some("key.mouse.middle".into()));
+        assert_eq!(key_label("key.mouse.middle"), "MMB");
+        assert_eq!(
+            s.button_mappings(id),
+            [CustomKey::Mouse(winit::event::MouseButton::Middle)]
+        );
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        // A name that is neither a key nor a mouse button is still refused.
+        let bad = TouchSettings::parse("button:1:0.5,0.5:1:1:1::0:0:-:-:key.mouse.nope:::\n");
+        assert!(bad.button_mappings(1).is_empty());
+    }
+
+    #[test]
+    fn a_new_button_is_centred_and_labelled_new() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(600.0, 300.0);
+        assert_eq!(s.button_label(id), "NEW");
+        assert!(s.button_mappings(id).is_empty());
+        let r = placed(&s.layout(600.0, 300.0), Control::Custom(id));
+        let size = r[2];
+        assert!((r[0] - (600.0 - size) / 2.0).abs() < 0.01);
+        assert!((r[1] - (300.0 - size) / 2.0).abs() < 0.01);
+        // Naming it replaces "NEW"; clearing the name brings it back.
+        s.set_button_name(id, "Sprint".into());
+        assert_eq!(s.button_label(id), "Sprint");
+        s.set_button_name(id, String::new());
+        assert_eq!(s.button_label(id), "NEW");
+    }
+
+    #[test]
+    fn custom_buttons_get_unique_ids_and_can_be_removed() {
+        let mut s = TouchSettings::default();
+        let a = s.add_button(640.0, 360.0);
+        let b = s.add_button(640.0, 360.0);
+        assert_ne!(a, b);
+        s.remove_button(a);
+        assert!(s.button(a).is_none());
+        assert!(
+            s.layout(640.0, 360.0)
+                .iter()
+                .any(|(c, _)| *c == Control::Custom(b))
+        );
+    }
+
+    #[test]
+    fn resetting_the_layout_clears_positions_styles_and_custom_buttons() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(600.0, 300.0);
+        s.set_button_key(id, 0, Some("key.keyboard.f3".into()));
+        s.set_placement(Control::Jump, 0.25, 0.6);
+        s.set_hidden(Control::Chat, true);
+        s.set_style_size(Control::Jump, 1.5, 0.5);
+        s.set_style_opacity(Control::Jump, 0.3);
+        s.opacity = 0.5;
+        s.scale = 1.25;
+        s.reset_layout();
+        assert!(s.buttons.is_empty());
+        assert!(s.placements.is_empty());
+        assert!(s.hidden.is_empty());
+        assert!(s.styles.is_empty());
+        assert_eq!((s.opacity, s.scale), (1.0, 1.0));
+        assert_eq!(s, TouchSettings::default());
+    }
+
+    #[test]
+    fn each_built_in_keeps_its_own_size_and_opacity() {
+        let mut s = TouchSettings::default();
+        let base = s.layout(600.0, 300.0);
+        s.set_style_size(Control::Jump, 1.5, 0.5);
+        s.set_style_opacity(Control::Jump, 0.4);
+        let l = s.layout(600.0, 300.0);
+        let (jump, before) = (placed(&l, Control::Jump), placed(&base, Control::Jump));
+        assert!((jump[2] - before[2] * 1.5).abs() < 0.01);
+        assert!((jump[3] - before[3] * 0.5).abs() < 0.01);
+        assert_eq!(s.style(Control::Jump).opacity, 0.4);
+        // Every other button stays exactly where and how it was.
+        for control in [Control::Forward, Control::Chat, Control::Perspective] {
+            assert_eq!(placed(&l, control), placed(&base, control));
+            assert_eq!(s.style(control), ButtonStyle::default());
+        }
+        // Only styled controls take a style; the hotbar and the stick keep their own pages.
+        s.set_style_size(Control::Hotbar(0), 2.0, 2.0);
+        s.set_style_size(Control::Stick, 2.0, 2.0);
+        assert_eq!(
+            s.styles,
+            BTreeMap::from([(Control::Jump, s.style(Control::Jump))])
+        );
+        // A style back at the default is forgotten.
+        s.set_style_size(Control::Jump, 1.0, 1.0);
+        s.set_style_opacity(Control::Jump, 1.0);
+        assert!(s.styles.is_empty());
+    }
+
+    #[test]
+    fn the_editor_shows_buttons_the_player_turned_off() {
+        let mut s = TouchSettings::default();
+        s.set_hidden(Control::Chat, true);
+        assert!(
+            !s.layout(600.0, 300.0)
+                .iter()
+                .any(|(c, _)| *c == Control::Chat)
+        );
+        let editor = s.editor_layout(600.0, 300.0);
+        assert!(editor.iter().any(|(c, _)| *c == Control::Chat));
+        // The hidden button keeps its default place, so it can be turned back on where it was.
+        assert_eq!(
+            placed(&editor, Control::Chat),
+            placed(&layout(600.0, 300.0), Control::Chat)
+        );
+    }
+
+    #[test]
+    fn a_menu_gets_only_the_dpad_sneak_and_jump() {
+        let mut s = TouchSettings::default();
+        let controls = |s: &TouchSettings| -> Vec<Control> {
+            s.menu_layout(600.0, 300.0)
+                .into_iter()
+                .map(|(c, _)| c)
+                .collect()
+        };
+        let mut expected = vec![
+            Control::Forward,
+            Control::Left,
+            Control::Sneak,
+            Control::Right,
+            Control::Back,
+            Control::Jump,
+        ];
+        assert_eq!(controls(&s), expected);
+        // Where the player put a button is where the menu gets it.
+        s.set_placement(Control::Jump, 0.1, 0.2);
+        assert_eq!(
+            placed(&s.menu_layout(600.0, 300.0), Control::Jump),
+            placed(&s.layout(600.0, 300.0), Control::Jump)
+        );
+        // A stick layout still gets the D-pad: a menu steps rather than steers. A hidden button stays away.
+        s.movement = Movement::Stick;
+        s.set_hidden(Control::Sneak, true);
+        expected.retain(|c| *c != Control::Sneak);
+        assert_eq!(controls(&s), expected);
+        // The player's own buttons are part of the menus' layout too, where the player put them and
+        // at their sizes.
+        let id = s.add_button(600.0, 300.0);
+        s.set_placement(Control::Custom(id), 0.25, 0.75);
+        let menu = s.menu_layout(600.0, 300.0);
+        assert!(menu.iter().any(|(c, _)| *c == Control::Custom(id)));
+        assert_eq!(
+            placed(&menu, Control::Custom(id)),
+            placed(&s.layout(600.0, 300.0), Control::Custom(id))
+        );
+    }
+
+    #[test]
+    fn the_menu_editor_shows_the_six_buttons_never_a_stick() {
+        let mut s = TouchSettings::menu_default();
+        assert_eq!(s.profile, MENU_PROFILE);
+        assert_eq!(s.movement, Movement::DPad);
+        let menu: Vec<Control> = s
+            .menu_editor_layout(600.0, 300.0)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(menu.len(), 6);
+        assert!(!menu.contains(&Control::Stick));
+        // A hidden button stays in the editor so it can be turned back on.
+        s.set_hidden(Control::Jump, true);
+        let menu: Vec<Control> = s
+            .menu_editor_layout(600.0, 300.0)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert!(menu.contains(&Control::Jump));
+        // A file that says "stick" still gets the D-pad: menus never steer.
+        let dir = std::env::temp_dir().join(format!("horizon-touch-menu-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join(MENU_FILE), "profile:Interaction\nmovement:stick\n").unwrap();
+        let loaded = TouchSettings::load_menu(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.movement, Movement::DPad);
+        assert_eq!(loaded.profile, MENU_PROFILE);
+        // Buttons the player adds are the layout's own: the editor shows them, and they survive a save.
+        let mut s = TouchSettings::menu_default();
+        let id = s.add_button(600.0, 300.0);
+        s.set_button_key(id, 0, Some("key.keyboard.t".to_owned()));
+        s.set_button_name(id, "Chat".to_owned());
+        assert!(
+            s.menu_editor_layout(600.0, 300.0)
+                .iter()
+                .any(|(c, _)| *c == Control::Custom(id))
+        );
+        let dir =
+            std::env::temp_dir().join(format!("horizon-touch-menu-buttons-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        s.save_menu(&dir);
+        let loaded = TouchSettings::load_menu(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.button(id), s.button(id));
+        assert_eq!(loaded.button_key_name(id, 0), Some("key.keyboard.t"));
+    }
+
+    #[test]
+    fn new_buttons_step_away_from_the_last() {
+        let mut s = TouchSettings::default();
+        let ids: Vec<u16> = (0..3).map(|_| s.add_button(600.0, 300.0)).collect();
+        let spots: Vec<(f32, f32)> = ids
+            .iter()
+            .map(|id| {
+                let p = s.button(*id).unwrap().placement;
+                (p.x, p.y)
+            })
+            .collect();
+        for (i, a) in spots.iter().enumerate() {
+            for b in &spots[i + 1..] {
+                assert!((a.0 - b.0).abs() > 1e-3 || (a.1 - b.1).abs() > 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_buttons_from_an_older_file_are_spread_on_load() {
+        let mut s = TouchSettings::parse(
+            "button:1:0.5,0.5:1:1:1\n\
+             button:2:0.5,0.5:1:1:1\n\
+             button:3:0.5,0.5:1:1:1\n",
+        );
+        let stacked = |s: &TouchSettings| {
+            let p: Vec<Placement> = s.buttons.values().map(|b| b.placement).collect();
+            (p[0] == p[1]) || (p[1] == p[2]) || (p[0] == p[2])
+        };
+        assert!(stacked(&s));
+        s.spread_stacked_buttons();
+        assert!(!stacked(&s));
+    }
+
+    #[test]
+    fn only_some_buttons_may_be_hidden_or_styled() {
+        for control in [
+            Control::Forward,
+            Control::Jump,
+            Control::Chat,
+            Control::Inventory,
+        ] {
+            assert!(can_hide(control) && styled(control));
+        }
+        // Pause is a phone's way back and the hide-HUD button brings the HUD back: neither can be
+        // turned off, though both can be resized and faded.
+        for control in [Control::Pause, Control::HideHud] {
+            assert!(!can_hide(control) && styled(control));
+        }
+        // The hotbar follows the HUD and the stick has the Touch Controls page for its own size.
+        for control in [Control::Hotbar(0), Control::Stick] {
+            assert!(!can_hide(control) && !styled(control) && !editable(control));
+        }
+        assert!(editable(Control::Forward) && editable(Control::Custom(0)));
+    }
+
+    #[test]
+    fn a_custom_button_uses_its_own_width_height_and_opacity() {
+        let mut s = TouchSettings::default();
+        let id = s.add_button(600.0, 300.0);
+        let base = placed(&s.layout(600.0, 300.0), Control::Custom(id));
+        s.set_button_size(id, 1.5, 0.5);
+        s.set_button_opacity(id, 0.1);
+        let bigger = placed(&s.layout(600.0, 300.0), Control::Custom(id));
+        assert!((bigger[2] - base[2] * 1.5).abs() < 0.01);
+        assert!((bigger[3] - base[3] * 0.5).abs() < 0.01);
+        let button = s.button(id).unwrap();
+        assert_eq!(button.opacity, MIN_OPACITY);
+        // Far past either end, the sides stay in bounds.
+        s.set_button_size(id, 9.0, 0.0);
+        let button = s.button(id).unwrap();
+        assert_eq!((button.width, button.height), (MAX_SIZE, MIN_SIZE));
+    }
+
+    #[test]
+    fn bad_button_lines_are_skipped_or_clamped() {
+        let s = TouchSettings::parse(
+            "button:x:0,0:1:1:key.keyboard.f3\n\
+             button:2:2,-1:9:nope:\n\
+             button:3:0.5,0.5:1.25:0.5:key.keyboard.a\n\
+             button:4:0,0:1:1:key.keyboard.nope\n\
+             button:5:0.5,0.5:1:1:1::0:0:-:-::::\n",
+        );
+        assert!(s.button(1).is_none());
+        let two = s.button(2).unwrap();
+        assert_eq!(two.placement, Placement { x: 1.0, y: 0.0 });
+        assert_eq!((two.width, two.height), (MAX_SCALE, MAX_SCALE));
+        assert_eq!(two.opacity, 1.0);
+        assert!(two.keys.iter().all(Option::is_none));
+        let three = s.button(3).unwrap();
+        assert_eq!(three.keys[0].as_deref(), Some("key.keyboard.a"));
+        // An unknown key name leaves the slot empty.
+        assert!(s.button(4).unwrap().keys.iter().all(Option::is_none));
+        // A new-format line with every slot empty still parses.
+        assert_eq!(s.button(5).unwrap().keys, [None, None, None, None]);
+        // Too few or too many parts are not a button.
+        assert!(TouchSettings::parse("button:6:0,0:1\n").button(6).is_none());
+    }
+
+    #[test]
+    fn bad_values_fall_back_to_the_defaults() {
+        let s = TouchSettings::parse("opacity:9\nscale:nope\nhidden:pause\nplace:jump:2,-1\n");
+        assert_eq!(s.opacity, 1.0);
+        assert_eq!(s.scale, 1.0);
+        assert!(s.visible(Control::Pause));
+        assert_eq!(
+            s.placements.get(&Control::Jump),
+            Some(&Placement { x: 1.0, y: 0.0 })
+        );
+    }
+
+    fn stick_settings() -> TouchSettings {
+        TouchSettings {
+            movement: Movement::Stick,
+            ..TouchSettings::default()
+        }
+    }
+
+    #[test]
+    fn stick_mode_replaces_the_dpad_and_moves_sneak_left_of_jump() {
+        let s = stick_settings();
+        let l = s.layout(633.0, 292.0);
+        assert!(l.iter().all(|(c, _)| !c.moves()));
+        let stick = placed(&l, Control::Stick);
+        let s_size = button_size(292.0);
+        assert!((stick[2] - 3.0 * s_size).abs() < 0.01);
+        assert!((stick[3] - 3.0 * s_size).abs() < 0.01);
+        let (sneak, jump) = (placed(&l, Control::Sneak), placed(&l, Control::Jump));
+        assert!((sneak[0] + sneak[2] + 8.0 - jump[0]).abs() < 0.01);
+        assert!((sneak[1] - jump[1]).abs() < 0.01);
+        // The D-pad mode still has its four buttons and no stick.
+        let d = TouchSettings::default().layout(633.0, 292.0);
+        assert!(d.iter().any(|(c, _)| *c == Control::Forward));
+        assert!(d.iter().all(|(c, _)| *c != Control::Stick));
+    }
+
+    #[test]
+    fn stick_mode_buttons_do_not_overlap_and_fit_the_screen() {
+        for (w, h) in [(633.0, 292.0), (427.0, 240.0), (480.0, 270.0)] {
+            let l = stick_settings().layout(w, h);
+            for (i, (a, ra)) in l.iter().enumerate() {
+                assert!(
+                    ra[0] >= 0.0 && ra[1] >= 0.0 && ra[0] + ra[2] <= w && ra[1] + ra[3] <= h,
+                    "{a:?} off screen"
+                );
+                for (b, rb) in &l[i + 1..] {
+                    let apart = ra[0] + ra[2] <= rb[0]
+                        || rb[0] + rb[2] <= ra[0]
+                        || ra[1] + ra[3] <= rb[1]
+                        || rb[1] + rb[3] <= ra[1];
+                    assert!(apart, "{a:?} overlaps {b:?} at {w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_stick_is_dead_in_the_middle_and_full_past_the_ring() {
+        let s = stick_settings();
+        let r = placed(&s.layout(633.0, 292.0), Control::Stick);
+        let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        let radius = r[2] / 2.0;
+        assert_eq!(stick_vector(r, centre), (0.0, 0.0));
+        assert_eq!(
+            stick_vector(r, (centre.0 + 0.1 * radius, centre.1)),
+            (0.0, 0.0)
+        );
+        // Right strafes right, up walks forward.
+        let (left, forward) = stick_vector(r, (centre.0 + radius, centre.1));
+        assert!((left + 1.0).abs() < 0.001 && forward.abs() < 0.001);
+        let (left, forward) = stick_vector(r, (centre.0, centre.1 - radius));
+        assert!(left.abs() < 0.001 && (forward - 1.0).abs() < 0.001);
+        // Half way out: half speed once past the deadzone.
+        let (_, forward) = stick_vector(r, (centre.0, centre.1 + radius / 2.0));
+        assert!((forward + (0.5 - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).abs() < 0.001);
+        // Off the ring, the stick stays at full, and never past it.
+        let (left, forward) = stick_vector(r, (centre.0 - 2.0 * radius, centre.1 + 2.0 * radius));
+        assert!((left.hypot(forward) - 1.0).abs() < 0.001);
+        assert!(left > 0.0 && forward < 0.0);
+    }
+
+    #[test]
+    fn a_finger_on_the_stick_moves_and_a_lift_stops_it() {
+        let s = stick_settings();
+        let l = s.layout(633.0, 292.0);
+        let r = placed(&l, Control::Stick);
+        let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        let radius = r[2] / 2.0;
+        let mut t = Touches::default();
+        assert_eq!(
+            t.start(1, centre, 0.0, &l, NO_SWIPES),
+            [Out::Move(0.0, 0.0)]
+        );
+        assert!(t.held(Control::Stick));
+        assert_eq!(
+            t.moved(1, (centre.0 - radius, centre.1), &l, NO_SWIPES),
+            [Out::Move(1.0, 0.0)]
+        );
+        assert_eq!(t.end(1), [Out::Move(0.0, 0.0)]);
+        assert!(!t.held(Control::Stick));
+    }
+
+    #[test]
+    fn the_stick_moves_while_another_finger_looks() {
+        let s = stick_settings();
+        let l = s.layout(633.0, 292.0);
+        let r = placed(&l, Control::Stick);
+        let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        let mut t = Touches::default();
+        t.start(1, centre, 0.0, &l, NO_SWIPES);
+        t.start(2, (400.0, 100.0), 0.0, &l, NO_SWIPES);
+        assert_eq!(
+            t.moved(2, (420.0, 100.0), &l, NO_SWIPES),
+            [Out::Look(20.0, 0.0)]
+        );
+        assert!(t.held(Control::Stick));
+        assert_eq!(t.release_all(), [Out::Move(0.0, 0.0)]);
+    }
+
+    #[test]
+    fn stick_settings_survive_a_round_trip() {
+        let mut s = stick_settings();
+        s.stick_scale = 1.25;
+        s.stick_opacity = 0.5;
+        s.set_placement(Control::Stick, 0.1, 0.6);
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        // A file written before the stick existed has no such lines, and the default file gains none.
+        let old = TouchSettings::parse("opacity:1\nscale:1\n");
+        assert_eq!(old.movement, Movement::DPad);
+        let default = TouchSettings::default().serialize();
+        assert!(!default.contains("movement") && !default.contains("stick:"));
+        // Resetting the layout keeps the mode and the stick's own size and opacity.
+        s.reset_layout();
+        assert_eq!(s.movement, Movement::Stick);
+        assert_eq!((s.stick_scale, s.stick_opacity), (1.25, 0.5));
+        assert!(!s.placements.contains_key(&Control::Stick));
+    }
+
+    #[test]
+    fn bad_stick_values_fall_back_to_the_defaults() {
+        let s = TouchSettings::parse("movement:nope\nstick:9:nope\n");
+        assert_eq!(s.movement, Movement::DPad);
+        assert_eq!(s.stick_scale, MAX_SCALE);
+        assert_eq!(s.stick_opacity, 1.0);
+    }
+}

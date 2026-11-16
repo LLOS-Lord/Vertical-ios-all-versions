@@ -18,7 +18,10 @@ enum Bridge {
     @MainActor
     static func send(_ line: String) async -> [String: Any] {
         let verb = String(line.prefix(while: { !$0.isWhitespace }))
-        if verb != "launcher-state" {Diagnostics.record("Launcher request: \(verb)")}
+        let noisyPoll = verb == "launcher-state"
+            || verb == "download-state"
+            || (verb == "launcher-versions" && (line.contains("\"job\"") || line.contains("\"list\"")))
+        if !noisyPoll { Diagnostics.record("Launcher request: \(verb)") }
         guard let submit else {
             return ["error": "no game is running under the launcher"]
         }

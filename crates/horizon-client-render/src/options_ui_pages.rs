@@ -79,6 +79,9 @@ pub(super) fn horizon_page_tooltip(page: Page) -> Option<&'static str> {
         Page::Graphics => "horizon.pages.graphics.tooltip",
         Page::GraphicsAdvanced => "horizon.pages.graphics_advanced.tooltip",
         Page::Controller => "horizon.pages.controller.tooltip",
+        Page::Touch => {
+            "The touch overlay: where its buttons are, how big they are and how see-through."
+        }
         Page::Extras => "horizon.pages.extras.tooltip",
         Page::Pvp => "horizon.pages.pvp.tooltip",
         Page::Agent => "horizon.pages.agent.tooltip",

@@ -67,7 +67,11 @@ fn write_prepared_tree(root: &Path, mc_version: &str) {
     ] {
         fs::write(root.join(rel), b"{}").unwrap();
     }
-    fs::write(root.join("assets/pack.mcmeta"), br#"{"pack":{"pack_format":55}}"#).unwrap();
+    fs::write(
+        root.join("assets/pack.mcmeta"),
+        br#"{"pack":{"pack_format":55}}"#,
+    )
+    .unwrap();
     fs::write(root.join("assets/minecraft/sounds.json"), b"{}").unwrap();
     fs::write(root.join("assets/minecraft/lang/en_us.json"), b"{}").unwrap();
 }
@@ -105,10 +109,27 @@ fn end_to_end_multi_version_handoff_protocol_preference_and_documents_mod_scan()
     // 2. Activate 1.20.4 and verify dynamic launch root + protocol preference (V1_20_3 / 765).
     versions::select_version(&home, "1.20.4").expect("select 1.20.4");
     assert_eq!(versions::active_version_id(&home), "1.20.4");
+    assert_eq!(versions::version_id_for_root(&v1_20_4), "1.20.4");
+    assert_eq!(versions::version_id_for_root(&v26_3), "26.3");
     assert_eq!(
         import::resources_root(&v26_3, Some(&home)),
         Some(v1_20_4.clone())
     );
+    // Simulate iOS `/var` -> `/private/var` symlink disparity between `home` and `sibling`:
+    #[cfg(unix)]
+    {
+        let alias_parent = temp_home("ios-symlink-alias");
+        let symlink_home = alias_parent.join("var_documents");
+        std::os::unix::fs::symlink(&home, &symlink_home).unwrap();
+        let canonical_v26_3 = fs::canonicalize(&v26_3).unwrap();
+        let resolved = import::resources_root(&canonical_v26_3, Some(&symlink_home))
+            .expect("symlinked home still switches active version");
+        assert_eq!(
+            fs::canonicalize(resolved).unwrap(),
+            fs::canonicalize(&v1_20_4).unwrap()
+        );
+        let _ = fs::remove_dir_all(&alias_parent);
+    }
     let external = temp_home("external-resources");
     write_prepared_tree(&external, "26.3");
     assert_eq!(

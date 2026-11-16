@@ -390,6 +390,10 @@ pub(super) fn load_resources_with_access(
     // published at once so the title screen can appear while the world bundle
     // loads; the synchronous launch instead carries it in `Loaded`.
     let mut pack_error = None;
+    if !headless {
+        let home = horizon_client::import::home();
+        horizon_client::versions::heal_placeholder_assets(&home, vanilla_root);
+    }
     // A dedicated server builds only the font (UiResources::server), as the
     // integrated server's game does: the full atlas and panorama are 144 MB.
     let load_ui = |root: &std::path::Path| {

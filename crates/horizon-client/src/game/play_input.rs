@@ -100,7 +100,15 @@ impl Game<'_> {
     /// says nothing about which side is down, so one being up means both
     /// Shifts, or both Controls, are.
     pub(super) fn heal_hold_latches(&mut self) {
-        let (shift, control) = (self.modifiers.shift_key(), self.modifiers.control_key());
+        // A touch button mapped to Shift or Control is a held key too, even though no
+        // `ModifiersChanged` ever reports it: the overlay knows which keys it holds.
+        let touch = |key: KeyCode| self.touch.holds_key(key);
+        let (shift, control) = (
+            self.modifiers.shift_key() || touch(KeyCode::ShiftLeft) || touch(KeyCode::ShiftRight),
+            self.modifiers.control_key()
+                || touch(KeyCode::ControlLeft)
+                || touch(KeyCode::ControlRight),
+        );
         if !shift {
             for key in [KeyCode::ShiftLeft, KeyCode::ShiftRight] {
                 self.physical_keys.remove(&key);
@@ -169,15 +177,10 @@ impl Game<'_> {
         pressed: bool,
         repeat: bool,
     ) -> Result<()> {
-        let source = if self.touch_synthetic_input() {
-            Source::Touch
-        } else {
-            Source::Keyboard
-        };
         for mapped in self.settings.keys.translate_all(key) {
             match mapped {
                 Ok(k) => {
-                    self.mapped_key(k, pressed, repeat, key, source)?;
+                    self.mapped_key(k, pressed, repeat, key, Source::Keyboard)?;
                 }
                 Err(button) => {
                     let action = match (pressed, repeat) {
@@ -195,7 +198,7 @@ impl Game<'_> {
                     ) {
                         if self.shared_default_acts(button, horizon_client::keybinds::key_name(key))
                         {
-                            self.mouse_mapping(button, pressed, source)?;
+                            self.mouse_mapping(button, pressed, Source::Keyboard)?;
                         }
                     } else if container_key_clones(button, action) {
                         self.inventory_pick_key();
@@ -501,7 +504,7 @@ impl Game<'_> {
 impl Game<'_> {
     /// The analog move vector (`[left, forward]`, -1..1) while a device moves the player.
     pub(super) fn input_move(&self) -> Option<[f32; 2]> {
-        self.pad_move()
+        self.pad_move().or_else(|| self.touch_move())
     }
 
     /// Whether a device holds the key mapping named `mapping` (`key.use`).

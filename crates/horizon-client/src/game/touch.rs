@@ -1,97 +1,210 @@
-//! Native touch input: relative menu cursor or direct-touch menus, independent
-//! mouse buttons and D-pad/joystick keyboard emulation while playing. Layout
-//! geometry and finger ownership live in the reusable touch module.
-use super::event_loop::EventLoopCtl;
-use super::{Game, Screen};
+//! Touch screens (phones and tablets; Horizon's own): Pocket Edition's controls while playing, and a finger
+//! as the mouse over every screen. The layout and the fingers' state are the lib's `touch`; this file acts on
+//! what they say the way the keyboard and mouse would: the D-pad and buttons are their default keys, a tap is
+//! a click, holding still is a held left button, and a drag turns the view as the mouse does.
+use super::{Game, Screen, event_loop::EventLoopCtl};
 use horizon_client::{
     Result,
+    gamepad::Button,
     held::Source,
-    hud::{HudBatch, rgba},
-    touch::{self, Control, MenuAction, MenuGesture, MenuMode, Out, Touches},
+    hud::{HudAtlas, HudBatch},
+    keymapping::SNEAK,
+    touch::{self, Control, Out, Touches},
+    touch_draw,
 };
-use std::time::Instant;
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 use winit::{
     dpi::PhysicalPosition,
     event::{
-        DeviceId, ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+        DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase,
+        WindowEvent,
     },
     keyboard::KeyCode,
-    window::WindowId,
 };
+
+/// GUI pixels a finger drags over a menu for one line of scrolling.
+const SCROLL_LINE: f32 = 12.0;
+
+/// How soon after a tap lifts its next touch is still its second tap: one that stays down then holds the
+/// left button until it lifts, as PojavLauncher's touchpad does.
+const DOUBLE_TAP: Duration = Duration::from_millis(300);
+
+/// GUI pixels a cursor-mode finger may move and still be a tap: past it, the finger was dragging the
+/// pointer, which must not also click where it left it.
+const TAP_SLOP: f32 = 6.0;
+
+/// How long the second tap of a double tap has to stay still before it holds the left button: a touch that
+/// moves sooner is moving the arrow, and pressing where it started would click what the arrow is over.
+const HOLD_STILL: Duration = Duration::from_millis(120);
+
+/// A held direction on the touch buttons over a menu waits this long before it starts stepping, then steps
+/// this often: the controller's D-pad defaults, so both feel the same.
+const MENU_STEP_DELAY: Duration = Duration::from_millis(350);
+const MENU_STEP_REPEAT: Duration = Duration::from_millis(100);
+
+/// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
+/// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
+pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
+    static LAST: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match last.get(key) {
+        Some(at) if now.duration_since(*at) < interval => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct TouchInput {
-    #[cfg(target_os = "ios")]
-    cursor: touch::desktop::Cursor,
-    #[cfg(target_os = "ios")]
-    cursor_screen: Option<u64>,
-    #[cfg(target_os = "ios")]
-    cursor_pending: Vec<CursorEdge>,
     fingers: Touches,
-    more: bool,
-    hidden: bool,
-    toggle_keys: Vec<KeyCode>,
-    /// A pointer event derived from a finger; the trace records the original
-    /// touch once, not this translation a second time.
-    synthetic: bool,
     /// A touch has been seen: the controls are drawn (from the start on iPhone and iPad).
     seen: bool,
     /// The last input device controls only the visibility of touch overlays.
     hardware: super::input_mode::InputMode,
     /// The finger that is the pointer over a menu.
     menu: Option<MenuFinger>,
+    /// The finger that is a mouse on Studio's bars while a replay plays.
+    studio: Option<StudioFinger>,
+    /// Where the menu pointer was left in cursor mode (`touch::PointerMode::Cursor`), in GUI pixels: a
+    /// finger drags it like a touchpad's pointer, and it is drawn on every menu screen.
+    cursor: Option<(f32, f32)>,
+    /// When the last menu tap lifted: a touch soon after it is its second tap, and halts the pointer.
+    last_tap: Option<Instant>,
     /// Clicks to release once a tick has passed: vanilla samples buttons once a tick, so a tap released in
     /// the same frame would be lost (the pad holds its short presses back the same way).
     late: Vec<(MouseButton, u64)>,
     /// The button a finger held still on the world is holding down: attack to mine, or use to eat, drink or
     /// draw a bow.
     holding: Option<MouseButton>,
-    #[cfg(target_os = "ios")]
-    cursor_down: [bool; 3],
-    #[cfg(target_os = "ios")]
-    cursor_cancelled: [bool; 3],
-    #[cfg(target_os = "ios")]
-    cursor_delivery: Option<ClickContext>,
-    #[cfg(target_os = "ios")]
-    cursor_drawn: Option<(u64, (f32, f32))>,
-    #[cfg(target_os = "ios")]
-    click_contexts: Vec<(u64, ClickContext)>,
-    #[cfg(target_os = "ios")]
-    native_surface: Option<(u64, (f32, f32))>,
-    #[cfg(target_os = "ios")]
-    cursor_keys: Vec<Control>,
-    #[cfg(target_os = "ios")]
-    native_pending: Vec<(touch::desktop::Physical, f64, u64)>,
-    #[cfg(target_os = "ios")]
-    native_keys: Vec<KeyCode>,
-    #[cfg(target_os = "ios")]
-    native_mouse: [bool; 3],
-    #[cfg(target_os = "ios")]
-    custom_keys: Vec<KeyCode>,
-    #[cfg(target_os = "ios")]
-    custom_mouse: [bool; 3],
-    #[cfg(target_os = "ios")]
-    native_screen: Option<u64>,
+    /// The keys and mouse buttons each custom button sent while it is held, in the order they were
+    /// pressed, so its release sends the same ones in reverse even if the mapping changed meanwhile.
+    custom_keys: std::collections::BTreeMap<u16, Vec<touch::CustomKey>>,
+    /// The toggle buttons that are holding their keys down.
+    toggled: BTreeSet<u16>,
+    /// The keys and mouse buttons the menus' layout's buttons are holding: a separate set, so a
+    /// button of the Interaction layout and one of the playing layout that share an id never
+    /// release each other's keys.
+    menu_custom_keys: std::collections::BTreeMap<u16, Vec<touch::CustomKey>>,
+    /// The menus' layout's toggle buttons that are holding their keys down.
+    menu_toggled: BTreeSet<u16>,
+    /// Controls let go after the tick that last saw them: the game samples keys once a tick, so a
+    /// tap pressed and released in the same frame would otherwise be invisible to it (a double
+    /// tap of forward to sprint).
+    late_keys: Vec<(Control, u64)>,
+    /// When each held control went down, in ticks.
+    pressed_at: std::collections::BTreeMap<Control, u64>,
+    /// The hide-HUD button was tapped: the HUD and this overlay are not drawn, but the buttons stay
+    /// where they were, so a finger that remembers them can bring the HUD back.
+    pub(super) hud_hidden: bool,
+    /// The analog stick's `[left, forward]` while a finger holds it.
+    analog: Option<[f32; 2]>,
+    /// Fingers on the D-pad, Sneak and Jump drawn over a screen (`touch_menu_pad_shown`): they step the
+    /// pointer from slot to slot and button to button instead of steering the player.
+    menu_pads: Vec<MenuPad>,
+    /// Sneak tapped over a screen: the Shift a shift-click (quick move) needs, which a finger cannot hold
+    /// on the keyboard at the same time.
+    menu_shift: bool,
     clock: Option<Instant>,
 }
 
-#[cfg(target_os = "ios")]
-#[derive(Clone, Debug, PartialEq)]
-struct ClickContext {
-    at: (f32, f32),
-    screen_at: (f32, f32),
-    size: (f32, f32),
-    screen: u64,
-    modifiers: winit::keyboard::ModifiersState,
-    touch_shift: bool,
-    guard: horizon_client::widgets::PointerGuard,
-    surface: Option<(u64, (f32, f32))>,
+/// A finger on Studio's top bar or timeline while a replay plays: those bars are mouse UI, so the
+/// finger moves the pointer and clicks (and drags, on the timeline) where a mouse would.
+struct StudioFinger {
+    id: u64,
+    pressed: bool,
 }
-#[cfg(target_os = "ios")]
-struct CursorEdge {
-    button: Option<(MouseButton, bool)>,
-    due: u64,
-    context: ClickContext,
+
+/// A finger on a screen's touch buttons: which button it holds and when it last stepped.
+struct MenuPad {
+    id: u64,
+    control: Control,
+    /// When the direction last stepped, or since when it is held.
+    stepped: Instant,
+    /// The held direction has repeated once, so it steps at the shorter interval.
+    repeating: bool,
+    /// Jump's left button is down (`touch_button`): its release lifts it.
+    pressed: bool,
+    /// Jump's finger lifted: the left button is let go once a frame has drawn its press, so a quick tap
+    /// still clicks (a press and release within one frame would not).
+    lifted: bool,
+}
+
+impl TouchInput {
+    /// Whether a finger-held button (or one toggled on) is holding `key` down.
+    pub(super) fn holds_key(&self, key: KeyCode) -> bool {
+        self.custom_keys
+            .values()
+            .chain(self.menu_custom_keys.values())
+            .flatten()
+            .any(|k| matches!(k, touch::CustomKey::Key(k) if *k == key))
+    }
+
+    /// Whether a finger holds what `button` stands for (attack or use), so another device's release
+    /// must not end it.
+    fn holds_mouse_mapping(&self, button: MouseButton) -> bool {
+        self.holding == Some(button)
+            || self.late.iter().any(|(held, _)| *held == button)
+            || self
+                .custom_keys
+                .values()
+                .flatten()
+                .any(|k| matches!(k, touch::CustomKey::Mouse(b) if *b == button))
+    }
+}
+
+impl Game<'_> {
+    /// Whether touch is holding sneak, for the live Shift word screens sample instead of the key set.
+    pub(super) fn touch_shift_held(&self) -> bool {
+        self.touch.menu_shift
+            || self.touch.fingers.held(Control::Sneak)
+            || self.touch.holds_key(KeyCode::ShiftLeft)
+            || self.touch.holds_key(KeyCode::ShiftRight)
+    }
+
+    /// Whether a finger holds what `button` stands for (attack or use), so another device's release
+    /// must not end it.
+    pub(super) fn touch_holds_mouse_mapping(&self, button: MouseButton) -> bool {
+        self.touch.holds_mouse_mapping(button)
+    }
+
+    /// Touch input never comes in as the platform's made-up window events (a finger is not a key the
+    /// OS invented), so the input log leaves nothing out for it.
+    pub(super) fn touch_synthetic_input(&self) -> bool {
+        false
+    }
+
+    /// Drop pending fingers and deferred presses where the screen or the world is replaced: that
+    /// boundary has already let go of gameplay holds and the screen's drag state.
+    pub(super) fn cancel_touch_for_reload(&mut self) {
+        self.touch.fingers.release_all();
+        self.touch.menu = None;
+        self.touch.studio = None;
+        self.touch.late.clear();
+        self.touch.holding = None;
+        self.touch.late_keys.clear();
+        self.touch.custom_keys.clear();
+        self.touch.toggled.clear();
+        self.touch.menu_custom_keys.clear();
+        self.touch.menu_toggled.clear();
+        self.touch.analog = None;
+        self.touch.menu_pads.clear();
+        self.touch.menu_shift = false;
+        self.keys.release_source(Source::Touch);
+    }
 }
 
 /// A finger over a menu. Its press waits for a frame drawn with the pointer under it, and its release for a
@@ -99,17 +212,41 @@ struct CursorEdge {
 /// pressed in one go would press whatever was under the old position (or nothing).
 struct MenuFinger {
     id: u64,
-    gesture: MenuGesture,
-    target: MenuTarget,
-    at: (f32, f32),
-    guard: Option<horizon_client::widgets::PointerGuard>,
+    /// Where the scrolling last caught up with the finger (GUI pixels); in cursor mode, where the
+    /// gesture went down, which tells a drag from a tap.
+    scrolled: (f32, f32),
+    /// Where the finger was last seen: in cursor mode it moves the pointer by its own movement.
+    from: (f32, f32),
+    /// Loop iterations since it went down.
+    frames: u8,
+    /// When it went down.
+    started: Instant,
+    pressed: bool,
+    /// A cursor-mode gesture: it drags the pointer while it moves and clicks under it when it lifts.
+    tap: bool,
+    /// The second tap of a double tap: once it stays still, it holds the left button until the finger lifts.
+    hold: bool,
+    /// In cursor mode the finger dragged the arrow past `TAP_SLOP`: it is aiming, not tapping, and must
+    /// never press.
+    moved: bool,
+    /// The second finger of a two-finger drag in cursor mode, which scrolls, and the y it last scrolled to
+    /// (GUI pixels).
+    second: Option<(u64, f32)>,
+    /// The gesture scrolled a list: it aimed, so it must not also click.
+    wheeled: bool,
+    lifted: bool,
+    /// A whole frame has been drawn with the click pressed: letting go now cannot be missed.
+    settled: bool,
+    /// It went down on the close button, which already acted: the rest of it is ignored.
+    closed: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MenuTarget {
-    Pointer,
-    Close,
-    Keyboard,
+/// A menu pointer kept on the screen: a finger can drag past an edge without losing it.
+fn clamp_point(point: (f32, f32), batch: Option<HudBatch>) -> (f32, f32) {
+    match batch {
+        Some(b) => (point.0.clamp(0.0, b.width), point.1.clamp(0.0, b.height)),
+        None => point,
+    }
 }
 
 /// The key a button stands for: the vanilla default of its mapping.
@@ -120,19 +257,26 @@ fn key_of(control: Control) -> Option<KeyCode> {
         Control::Left => KeyCode::KeyA,
         Control::Right => KeyCode::KeyD,
         Control::Jump => KeyCode::Space,
-        Control::Sneak => KeyCode::ShiftLeft,
         Control::Perspective => KeyCode::F5,
         Control::Chat => KeyCode::KeyT,
         Control::Pause => KeyCode::Escape,
         Control::Inventory => KeyCode::KeyE,
-        Control::Sprint => KeyCode::ControlLeft,
-        Control::Debug => KeyCode::F3,
-        Control::PlayerList => KeyCode::Tab,
-        Control::Runtime => KeyCode::Escape,
-        Control::More | Control::Hide | Control::MiddleClick => return None,
-        Control::Hotbar(_) | Control::LeftClick | Control::RightClick | Control::Joystick => {
-            return None;
-        }
+        Control::HideHud
+        | Control::Sneak
+        | Control::Hotbar(_)
+        | Control::Custom(_)
+        | Control::Stick => return None,
+    })
+}
+
+/// The D-pad direction a step control stands for; `None` for Sneak, Jump and the rest.
+fn menu_pad_step_of(control: Control) -> Option<Button> {
+    Some(match control {
+        Control::Forward => Button::DPadUp,
+        Control::Back => Button::DPadDown,
+        Control::Left => Button::DPadLeft,
+        Control::Right => Button::DPadRight,
+        _ => return None,
     })
 }
 
@@ -187,8 +331,7 @@ impl Game<'_> {
 
     /// The world is under the fingers, with no screen over it.
     pub(super) fn touch_playing(&self) -> bool {
-        !self.menu_input_blocked()
-            && self.title.is_none()
+        self.title.is_none()
             && self.screen == Screen::Playing
             && self.sign_edit.is_none()
             && self.book.is_none()
@@ -209,10 +352,6 @@ impl Game<'_> {
 
     pub(super) fn touch_keyboard_used(&mut self, event_loop: &dyn EventLoopCtl) {
         self.touch_release_menu(event_loop);
-        #[cfg(target_os = "ios")]
-        if !self.touch_playing() {
-            self.touch_native_handoff();
-        }
         if horizon_gamecontroller::keyboard_connected() {
             self.touch.hardware.keyboard();
         }
@@ -220,10 +359,6 @@ impl Game<'_> {
 
     pub(super) fn touch_mouse_used(&mut self, event_loop: &dyn EventLoopCtl) {
         self.touch_release_menu(event_loop);
-        #[cfg(target_os = "ios")]
-        if !self.touch_playing() {
-            self.touch_native_handoff();
-        }
         self.touch.hardware.mouse();
     }
 
@@ -236,66 +371,156 @@ impl Game<'_> {
                 || std::env::var_os("HORIZON_TOUCH").is_some_and(|v| v == "1"))
     }
 
+    /// Studio's bars are drawn over the world (its own draw test: the editor, the HUD shown, the world
+    /// playing, a replay open or the free camera flying).
+    fn studio_touch_shown(&self) -> bool {
+        super::studio::EDITOR
+            && self.screen == Screen::Playing
+            && !self.ui.hide_gui
+            && self.studio_up()
+    }
+
+    /// Whether a finger at `at` is on a bar a click would land on: the top bar (or its open dropdown,
+    /// whichever way it hangs), or the timeline when it shows.
+    fn studio_touch_bar(&self, at: (f32, f32), height: f32) -> bool {
+        self.studio.topbar.open_menu.is_some()
+            || at.1 <= self.studio.topbar.height
+            || (self.studio.timeline.visible && at.1 >= height - self.studio.timeline.height())
+    }
+
+    /// A finger on Studio's bars while a replay plays: the bars and their buttons are mouse UI
+    /// (`Game::studio_mouse_input`), which a touch never reaches otherwise, because the world under
+    /// them takes every finger as a gameplay gesture. True when this finger is Studio's.
+    fn touch_studio(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: u64,
+        phase: TouchPhase,
+        at: (f32, f32),
+    ) -> bool {
+        if !self.studio_touch_shown() {
+            // The bars went away under the finger (the replay closed): let go of its click.
+            if let Some(finger) = self.touch.studio.take()
+                && finger.pressed
+            {
+                self.touch_button(event_loop, false);
+            }
+            return false;
+        }
+        if phase == TouchPhase::Started {
+            let Some(batch) = self.touch_batch() else {
+                return false;
+            };
+            if !self.studio_touch_bar(at, batch.height) {
+                return false;
+            }
+            if let Some(finger) = self.touch.studio.take()
+                && finger.pressed
+            {
+                self.touch_button(event_loop, false);
+            }
+            // The pointer goes to the finger first, so the press is on the button drawn there.
+            self.touch.cursor = Some(at);
+            self.touch_pointer(event_loop, at);
+            self.touch_button(event_loop, true);
+            self.touch.studio = Some(StudioFinger { id, pressed: true });
+            log::info!(
+                "touch studio: finger {id} down at ({:.0}, {:.0}); click",
+                at.0,
+                at.1
+            );
+            return true;
+        }
+        let Some(pressed) = self
+            .touch
+            .studio
+            .as_ref()
+            .filter(|f| f.id == id)
+            .map(|f| f.pressed)
+        else {
+            return false;
+        };
+        match phase {
+            TouchPhase::Started => {}
+            TouchPhase::Moved => {
+                // The timeline's playhead and keyframes drag by pointer moves, which Studio samples
+                // from `CursorMoved`.
+                self.touch.cursor = Some(at);
+                self.touch_pointer(event_loop, at);
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.touch.studio = None;
+                self.touch.cursor = Some(at);
+                self.touch_pointer(event_loop, at);
+                if pressed {
+                    self.touch_button(event_loop, false);
+                }
+                log::info!(
+                    "touch studio: finger {id} {phase:?} at ({:.0}, {:.0})",
+                    at.0,
+                    at.1
+                );
+            }
+        }
+        true
+    }
+
     /// winit's `WindowEvent::Touch`.
     pub(super) fn touch_event(
         &mut self,
         event_loop: &dyn EventLoopCtl,
         touch: Touch,
     ) -> Result<()> {
-        if self.menu_input_blocked() {
-            self.cancel_touch_for_reload();
-            return Ok(());
-        }
         self.touch.seen = true;
         self.touch.hardware.touch();
         self.last_input = Instant::now();
         let Some(batch) = self.touch_batch() else {
+            // The finger reached the game but no screen is drawn to land on (loading, under the launcher's
+            // cover, or a dead surface): the tap is lost, and the log must say why rather than nothing.
+            if log_due("touch-no-screen", std::time::Duration::from_secs(5)) {
+                log::warn!(
+                    "touch {} {:?} at ({:.0}, {:.0}) has no screen to land on; the tap is lost",
+                    touch.id,
+                    touch.phase,
+                    touch.location.x,
+                    touch.location.y
+                );
+            }
             return Ok(());
         };
-        // A real finger owns input just as a hardware pointer does. Menu
-        // touches also pass through key_focus_mouse; world controls do not.
-        // Releases/cancellations only finish that finger's own actions.
-        if matches!(touch.phase, TouchPhase::Started | TouchPhase::Moved) {
-            self.pad_yield_input(event_loop);
-        }
         let at = (
             touch.location.x as f32 / batch.scale,
             touch.location.y as f32 / batch.scale,
         );
-        let playing = self.touch_playing();
-        #[cfg(target_os = "ios")]
-        if !playing && (touch::cursor_mode() || horizon_ios_launcher::native_gestures_available()) {
-            let auxiliary = self
-                .touch
-                .menu
-                .as_ref()
-                .is_some_and(|finger| finger.id == touch.id)
-                || (touch.phase == TouchPhase::Started
-                    && ((self.touch_close_shown()
-                        && touch::hit_rect(touch::close_rect(batch.width, batch.height), at))
-                        || (self.field_focused()
-                            && touch::hit_rect(
-                                touch::keyboard_rect(batch.width, batch.height),
-                                at,
-                            ))));
-            if auxiliary {
-                self.touch_menu(event_loop, touch.id, touch.phase, at);
-                return Ok(());
-            }
-            self.touch_cursor_event(
-                event_loop,
+        // Every start, lift and cancel, but a drag's moves only once a second: the log wants the shape of a
+        // gesture and the state the look gate reads, not a hundred lines a second.
+        if touch.phase != TouchPhase::Moved || log_due("touch", std::time::Duration::from_secs(1)) {
+            log::info!(
+                "touch {} {:?} at ({:.0}, {:.0}) GUI; playing={} focused={} captured={} agent_pointer={}",
                 touch.id,
                 touch.phase,
-                at,
-                (batch.width, batch.height),
+                at.0,
+                at.1,
+                self.touch_playing(),
+                self.focused,
+                self.captured,
+                self.agent_pointer
             );
-            return Ok(());
         }
+        let playing = self.touch_playing();
         if playing {
+            // Studio's bars are on top of the world and are mouse UI: a finger on one is its click,
+            // not a gameplay gesture.
+            if self.touch_studio(event_loop, touch.id, touch.phase, at) {
+                return Ok(());
+            }
             // Loading or keyboard navigation can consume a menu finger's release.
             // That old finger must not route a new world touch back into the menu.
             self.touch_release_menu(event_loop);
         } else {
+            if self.touch_menu_pad_touch(event_loop, touch.id, touch.phase, at, batch)? {
+                return Ok(());
+            }
             if touch.phase == TouchPhase::Cancelled {
                 if self.touch.menu.as_ref().is_some_and(|f| f.id == touch.id) {
                     self.touch_release_menu(event_loop);
@@ -305,105 +530,67 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        #[cfg(target_os = "ios")]
-        {
-            self.touch.fingers.direct_look = horizon_ios_launcher::native_gestures_available();
-            self.touch.fingers.capture_buttons = true;
-        }
-        let layout = self.visible_touch_layout(batch.width, batch.height);
-        self.touch.fingers.forward_lock = touch::forward_lock();
-        #[cfg(target_os = "ios")]
-        let layout: Vec<_> = layout
-            .into_iter()
-            .filter(|(control, _)| {
-                touch::hotbar_gestures() || !matches!(control, Control::Hotbar(_))
-            })
-            .map(|(control, rect)| {
-                if let Control::Hotbar(slot) = control {
-                    let physical = self.window.as_ref().map(|w| w.inner_size());
-                    let width =
-                        physical.map_or(batch.width * batch.scale, |size| size.width as f32);
-                    let height =
-                        physical.map_or(batch.height * batch.scale, |size| size.height as f32);
-                    let left =
-                        (width as i32 / 2 - (180.0 * batch.scale) as i32 / 2) as f32 / batch.scale;
-                    (
-                        control,
-                        [
-                            left + f32::from(slot) * 20.0,
-                            height / batch.scale - 20.0,
-                            20.0,
-                            20.0,
-                        ],
-                    )
-                } else {
-                    (control, rect)
-                }
-            })
-            .collect();
+        let layout = self.settings.touch.layout(batch.width, batch.height);
         let out = match touch.phase {
             TouchPhase::Started => {
                 let now = self.touch_now();
-                self.touch.fingers.start(touch.id, at, now, &layout)
+                self.touch
+                    .fingers
+                    .start(touch.id, at, now, &layout, &self.settings.touch.swipes())
             }
-            TouchPhase::Moved => self.touch.fingers.moved(touch.id, at, &layout),
+            TouchPhase::Moved => {
+                self.touch
+                    .fingers
+                    .moved(touch.id, at, &layout, &self.settings.touch.swipes())
+            }
             TouchPhase::Ended => self.touch.fingers.end(touch.id),
             TouchPhase::Cancelled => self.touch.fingers.cancel(touch.id),
         };
-        let result = self.touch_act(out, batch.scale);
-        #[cfg(target_os = "ios")]
-        self.touch_record_click_context();
-        result
-    }
-
-    /// Drop all pending fingers and deferred clicks at the reload boundary.
-    /// No release is routed through a possibly replaced screen; the boundary
-    /// already released gameplay holds and the screen's drag state.
-    pub(super) fn cancel_touch_for_reload(&mut self) {
-        #[cfg(target_os = "ios")]
-        {
-            self.touch_cursor_reset();
-            self.touch_native_reset();
-            horizon_ios_launcher::touch_gestures(0, 2, (0.0, 0.0), 1.0);
-        }
-        self.touch.menu = None;
-        self.touch.fingers.release_all();
-        self.touch.late.clear();
-        self.touch.holding = None;
-        self.keys.release_source(Source::Touch);
-        self.touch.toggle_keys.clear();
+        self.touch_act(event_loop, out, batch.scale)
     }
 
     /// Once a frame: a held finger starts mining, held-back clicks release, and a screen that opened over the
     /// game lets go of every finger on it.
     pub(super) fn touch_frame(&mut self, event_loop: &dyn EventLoopCtl) {
-        #[cfg(target_os = "ios")]
-        self.touch_cursor_flush(event_loop);
-        if self.menu_input_blocked() {
-            self.cancel_touch_for_reload();
-            return;
-        }
         self.touch.hardware.refresh(
             horizon_gamecontroller::keyboard_connected(),
             horizon_gamecontroller::mouse_connected(),
         );
-        if !self.touch_shown() {
-            #[cfg(target_os = "ios")]
+        // A button the player deleted (or Reset Layout removed) lets go of what it held.
+        if let Err(e) = self.touch_release_removed(event_loop) {
+            log::warn!("Horizon: touch: {e}");
+        }
+        // The bars went away under a finger (the replay closed, a screen opened): its click lifts even
+        // if no end event comes.
+        if self.touch.studio.is_some() && !(self.touch_playing() && self.studio_touch_shown()) {
+            if let Some(finger) = self.touch.studio.take()
+                && finger.pressed
             {
-                self.touch_native_reset();
-                horizon_ios_launcher::touch_gestures(0, 2, (0.0, 0.0), 1.0);
+                self.touch_button(event_loop, false);
             }
+        }
+        if !self.touch_shown() {
             return;
         }
-        #[cfg(target_os = "ios")]
-        self.touch_native_frame(event_loop);
         let playing = self.touch_playing();
-        #[cfg(target_os = "ios")]
-        self.touch_cursor_frame(event_loop, playing);
+        // A menu opened before the pointer was ever moved: show it in the middle, where a tap clicks,
+        // rather than nowhere.
+        if !playing
+            && self.settings.touch.pointer == touch::PointerMode::Cursor
+            && self.touch.cursor.is_none()
+            && let Some(b) = self.touch_batch()
+        {
+            self.touch.cursor = Some((b.width / 2.0, b.height / 2.0));
+        }
         if playing {
             self.touch_release_menu(event_loop);
         } else {
             self.touch_menu_frame(event_loop);
+            self.touch_menu_pad_frame(event_loop);
+            // A toggle left on must not keep its key held over a menu.
+            if let Err(e) = self.touch_release_toggles(event_loop) {
+                log::warn!("Horizon: touch: {e}");
+            }
         }
         let out = if playing {
             let now = self.touch_now();
@@ -411,21 +598,25 @@ impl Game<'_> {
         } else {
             self.touch.fingers.release_all()
         };
-        if !playing {
-            for key in std::mem::take(&mut self.touch.toggle_keys) {
-                let _ = self.mapped_key(key, false, false, key, Source::Touch);
-            }
-        }
         let ticks = self.ticks;
         let (due, keep) = std::mem::take(&mut self.touch.late)
             .into_iter()
             .partition(|(_, at)| ticks > *at || !playing);
         self.touch.late = keep;
+        let (keys_due, keys_keep) = std::mem::take(&mut self.touch.late_keys)
+            .into_iter()
+            .partition(|(_, at)| ticks > *at || !playing);
+        self.touch.late_keys = keys_keep;
         let scale = self.touch_batch().map_or(1.0, |b| b.scale);
         let result = due
             .into_iter()
-            .try_for_each(|(button, _)| self.mouse_mapping(button, false, Source::Touch))
-            .and_then(|()| self.touch_act(out, scale));
+            .try_for_each(|(button, _)| self.play_mouse(button, false))
+            .and_then(|()| {
+                keys_due
+                    .into_iter()
+                    .try_for_each(|(control, at)| self.touch_release_late(event_loop, control, at))
+            })
+            .and_then(|()| self.touch_act(event_loop, out, scale));
         if let Err(e) = result {
             log::warn!("Horizon: touch: {e}");
         }
@@ -436,70 +627,17 @@ impl Game<'_> {
     fn touch_grab(&mut self) {
         // Only when neither holds: a grab that fails (iOS has no pointer to grab) would otherwise be retried
         // on every drag, and each try makes the mouse drop its next move (`grabMouse`'s ignoreFirstMove).
-        if self.captured || self.agent_pointer {
-            return;
+        if !self.captured && !self.agent_pointer {
+            self.capture(true);
         }
-        self.capture(true);
-        if !self.captured {
-            self.agent_pointer = true;
-        }
-    }
-
-    pub(super) fn touch_effective_modifiers(&self) -> winit::keyboard::ModifiersState {
-        #[cfg(target_os = "ios")]
-        {
-            if let Some(context) = &self.touch.cursor_delivery {
-                return context.modifiers;
-            }
-            let mut modifiers =
-                self.modifiers | gesture_modifiers(horizon_ios_launcher::touch_modifiers());
-            if self.touch.fingers.held(Control::Sprint)
-                || self.touch.cursor_keys.contains(&Control::Sprint)
-            {
-                modifiers.insert(winit::keyboard::ModifiersState::CONTROL);
-            }
-            modifiers
-        }
-        #[cfg(not(target_os = "ios"))]
-        {
-            self.modifiers
-        }
-    }
-    pub(super) fn touch_shift_held(&self) -> bool {
-        #[cfg(target_os = "ios")]
-        {
-            self.touch.cursor_delivery.as_ref().map_or_else(
-                || {
-                    self.touch.fingers.held(Control::Sneak)
-                        || self.touch.cursor_keys.contains(&Control::Sneak)
-                },
-                |context| context.touch_shift,
-            )
-        }
-        #[cfg(not(target_os = "ios"))]
-        {
-            false
-        }
+        // The finger is the pointer whatever the platform says: a grab that reports itself as held while the
+        // window is (or is reported as) unfocused would otherwise swallow every drag. An agent's pointer
+        // counts in an inactive window, which is exactly what a touch screen needs.
+        self.agent_pointer = true;
     }
 
     /// The held item is used for as long as the button stays down: something eaten or drunk (its
     /// `consumable` component), or a bow, crossbow, trident, shield, spyglass, goat horn or brush.
-    /// Live touch sources for the shared attack/use mapping. Short taps remain
-    /// held until their delayed release; a long press lives in `holding`.
-    pub(super) fn touch_holds_mouse_mapping(&self, button: MouseButton) -> bool {
-        #[cfg(target_os = "ios")]
-        let explicit = self.touch_raw_holds_mouse_mapping(button);
-        #[cfg(not(target_os = "ios"))]
-        let explicit = match button {
-            MouseButton::Left => self.touch.fingers.held(Control::LeftClick),
-            MouseButton::Right => self.touch.fingers.held(Control::RightClick),
-            _ => false,
-        };
-        explicit
-            || self.touch.holding == Some(button)
-            || self.touch.late.iter().any(|(held, _)| *held == button)
-    }
-
     fn touch_holds_use(&self) -> bool {
         let Some(stack) = self.held() else {
             return false;
@@ -520,171 +658,112 @@ impl Game<'_> {
             .is_some_and(|info| info.consumable.is_some())
     }
 
-    #[cfg(target_os = "ios")]
-    fn touch_key_held(&self, key: KeyCode) -> bool {
-        (self.touch.native_keys.contains(&key) || self.touch.custom_keys.contains(&key))
-            || [
-                Control::Forward,
-                Control::Back,
-                Control::Left,
-                Control::Right,
-                Control::Jump,
-                Control::Sneak,
-                Control::Sprint,
-                Control::Perspective,
-                Control::Chat,
-                Control::Pause,
-                Control::Inventory,
-                Control::Debug,
-                Control::PlayerList,
-            ]
-            .into_iter()
-            .any(|c| {
-                key_of(c) == Some(key)
-                    && (self.touch.fingers.held(c) || self.touch.cursor_keys.contains(&c))
-            })
-    }
-    #[cfg(target_os = "ios")]
-    fn touch_raw_key(&mut self, key: KeyCode, pressed: bool) -> Result<()> {
-        if !pressed && self.touch_key_held(key) {
-            return Ok(());
-        }
-        // Virtual keys must pass the same debug-key state machine as hardware:
-        // F3 toggles its overlay on release, before ordinary key mappings.
-        let action = if pressed {
-            horizon_client::debug_keys::KeyAction::Press
-        } else {
-            horizon_client::debug_keys::KeyAction::Release
-        };
-        if self.debug_key(key, action) {
-            return Ok(());
-        }
-        for mapped in self.settings.keys.translate_all(key) {
-            match mapped {
-                Ok(mapped) => self.mapped_key(mapped, pressed, false, key, Source::Touch)?,
-                Err(button) if pressed || !self.touch_holds_mouse_mapping(button) => {
-                    self.mouse_mapping(button, pressed, Source::Touch)?
-                }
-                Err(_) => {}
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "ios")]
-    fn touch_raw_button(&mut self, button: MouseButton, pressed: bool) -> Result<()> {
-        let input = horizon_client::keybinds::mouse_name(button);
-        for mapped in self.settings.keys.translate_mouse_all(button) {
-            match mapped {
-                Err(mapped) if self.shared_default_acts(mapped, Some(input.as_str())) => {
-                    if pressed || !self.touch_holds_mouse_mapping(mapped) {
-                        self.mouse_mapping(mapped, pressed, Source::Touch)?;
-                    }
-                }
-                Err(_) => {}
-                Ok(key) => self.mapped_key(key, pressed, false, key, Source::Touch)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn touch_act(&mut self, out: Vec<Out>, scale: f32) -> Result<()> {
-        if self.menu_input_blocked() {
-            self.cancel_touch_for_reload();
-            return Ok(());
-        }
+    fn touch_act(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        out: Vec<Out>,
+        scale: f32,
+    ) -> Result<()> {
         for o in out {
-            // UIKit recognizes tap/long-press actions in a current bundle.
-            // Do not also dispatch the fallback Rust recognizer's outputs.
-            #[cfg(target_os = "ios")]
-            if horizon_ios_launcher::native_gestures_available()
-                && matches!(o, Out::Tap | Out::MineStart | Out::MineEnd)
-            {
-                continue;
+            // What the fingers' state machine decided, for the bug reports that cannot tell a tap from a
+            // drag from a hold: the drag and the stick move too often to log here.
+            match o {
+                Out::Tap => log::info!(
+                    "touch tap; interact={} entity_targeted={}",
+                    self.settings.touch.interact,
+                    self.entity_targeted()
+                ),
+                Out::MineStart => log::info!("touch hold: mining starts"),
+                Out::MineEnd => log::info!("touch hold: mining ends"),
+                Out::Press(control) => log::info!("touch press {control:?}"),
+                Out::Release(control) => log::info!("touch release {control:?}"),
+                Out::Look(..) | Out::Move(..) => {}
             }
             match o {
-                Out::Press(Control::More) => self.touch.more = !self.touch.more,
-                Out::Press(Control::Hide) => {
-                    self.touch.hidden = !self.touch.hidden;
-                    let released = self.touch.fingers.release_all();
-                    self.touch_act(released, scale)?;
-                    for key in std::mem::take(&mut self.touch.toggle_keys) {
-                        self.mapped_key(key, false, false, key, Source::Touch)?;
-                    }
-                }
-                #[cfg(target_os = "ios")]
-                Out::Press(Control::Hotbar(_))
-                    if horizon_ios_launcher::native_gestures_available() => {}
                 Out::Press(Control::Hotbar(slot)) => self.selected = usize::from(slot),
-                Out::Press(Control::LeftClick | Control::RightClick | Control::MiddleClick)
-                | Out::Release(Control::LeftClick | Control::RightClick | Control::MiddleClick) => {
-                    let (control, down) = match o {
-                        Out::Press(c) => (c, true),
-                        Out::Release(c) => (c, false),
-                        _ => unreachable!(),
-                    };
-                    if down {
-                        self.touch_grab();
-                    }
-                    #[cfg(target_os = "ios")]
-                    self.touch_raw_button(
-                        if control == Control::MiddleClick {
-                            MouseButton::Middle
-                        } else if control == Control::LeftClick {
-                            MouseButton::Left
-                        } else {
-                            MouseButton::Right
-                        },
-                        down,
-                    )?;
-                    #[cfg(not(target_os = "ios"))]
-                    self.mouse_mapping(
-                        if control == Control::MiddleClick {
-                            MouseButton::Middle
-                        } else if control == Control::LeftClick {
-                            MouseButton::Left
-                        } else {
-                            MouseButton::Right
-                        },
-                        down,
-                        Source::Touch,
-                    )?;
+                Out::Press(Control::Sneak) => {
+                    // A tap, not a held Shift: flip sneak the way the pad's toggle-sneak does.
+                    // A latch that no keyboard or pad holds is healed away each frame
+                    // (`heal_hold_latches`), so the held key the keyboard path leaves behind
+                    // would not survive.
+                    let screen_open = !super::gameplay_has_keyboard(
+                        self.screen,
+                        self.title.is_some(),
+                        self.dialog_open(),
+                    );
+                    self.toggles.pad_toggle(SNEAK, screen_open);
+                    self.sync_toggle(SNEAK);
+                    self.key_pressed(KeyCode::ShiftLeft, KeyCode::ShiftLeft)?;
+                }
+                Out::Press(Control::HideHud) => {
+                    self.touch.hud_hidden = !self.touch.hud_hidden;
                 }
                 Out::Press(control) | Out::Release(control) => {
-                    if let Some(key) = key_of(control) {
-                        #[cfg(target_os = "ios")]
-                        self.touch_raw_key(key, matches!(o, Out::Press(_)))?;
-                        #[cfg(not(target_os = "ios"))]
-                        self.mapped_key(
-                            key,
-                            matches!(o, Out::Press(_)),
-                            false,
-                            key,
-                            Source::Touch,
-                        )?;
+                    let pressed = matches!(o, Out::Press(_));
+                    if pressed {
+                        self.touch.pressed_at.insert(control, self.ticks);
+                    } else if self
+                        .touch
+                        .pressed_at
+                        .get(&control)
+                        .is_some_and(|&at| at == self.ticks)
+                    {
+                        // Down and up before a tick could sample it: let go after the next one.
+                        self.touch.late_keys.push((control, self.ticks));
+                        continue;
+                    } else {
+                        self.touch.pressed_at.remove(&control);
                     }
+                    match control {
+                        Control::Custom(id) => {
+                            self.touch_custom_key(event_loop, id, pressed)?;
+                        }
+                        _ => {
+                            if let Some(key) = key_of(control) {
+                                self.mapped_key(key, pressed, false, key, Source::Keyboard)?;
+                            }
+                        }
+                    }
+                }
+                Out::Move(left, forward) => {
+                    self.touch.analog = (left.hypot(forward) > 1e-4).then_some([left, forward]);
                 }
                 Out::Look(dx, dy) => {
                     self.touch_grab();
                     let (dx, dy) = (f64::from(dx * scale), f64::from(dy * scale));
                     // Relative motion, as an agent's `mouse-move` adds it: no pointer position to compare with.
+                    if log_due("look", std::time::Duration::from_secs(1)) {
+                        log::info!(
+                            "touch look {dx:.2}, {dy:.2}; captured={} agent_pointer={} focused={}",
+                            self.captured,
+                            self.agent_pointer,
+                            self.focused
+                        );
+                    }
                     self.mouse.add_motion(dx, dy);
                 }
                 // Pocket Edition: a tap hits the entity it is on, and uses the item or block otherwise.
+                // Turned off, the screen only turns the view: the layout's buttons click.
                 Out::Tap => {
+                    if !self.settings.touch.interact {
+                        continue;
+                    }
                     self.touch_grab();
                     let button = if self.entity_targeted() {
                         MouseButton::Left
                     } else {
                         MouseButton::Right
                     };
-                    self.mouse_mapping(button, true, Source::Touch)?;
+                    self.play_mouse(button, true)?;
                     self.touch.late.push((button, self.ticks));
                 }
                 // Holding still: what the hand holds decides, as in Pocket Edition. Food, potions and the items
                 // used for as long as they are held (a bow, a shield...) are used until the finger lifts;
                 // anything else mines.
                 Out::MineStart => {
+                    if !self.settings.touch.interact {
+                        continue;
+                    }
                     self.touch_grab();
                     let button = if self.touch_holds_use() {
                         MouseButton::Right
@@ -692,14 +771,251 @@ impl Game<'_> {
                         MouseButton::Left
                     };
                     self.touch.holding = Some(button);
-                    self.mouse_mapping(button, true, Source::Touch)?;
+                    self.play_mouse(button, true)?;
                 }
                 Out::MineEnd => {
-                    let button = self.touch.holding.take().unwrap_or(MouseButton::Left);
-                    self.mouse_mapping(button, false, Source::Touch)?;
+                    // Only what a finger started: an ended hold that never pressed must not let go of a
+                    // button the layout holds down.
+                    if let Some(button) = self.touch.holding.take() {
+                        self.play_mouse(button, false)?;
+                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A tap let go after the tick that first saw it (`late_keys`): a press and release in one
+    /// frame would otherwise leave the game's once-a-tick key sampling with nothing to see.
+    fn touch_release_late(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        control: Control,
+        at: u64,
+    ) -> Result<()> {
+        if self.touch.pressed_at.get(&control) != Some(&at) {
+            // Pressed again since: that press's own release lets go.
+            return Ok(());
+        }
+        self.touch.pressed_at.remove(&control);
+        match control {
+            // The same path as a live release: a toggle button ignores it.
+            Control::Custom(id) => self.touch_custom_key(event_loop, id, false),
+            _ => match key_of(control) {
+                Some(key) => self.mapped_key(key, false, false, key, Source::Keyboard),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// The analog stick's `[left, forward]`, `None` while no finger holds it.
+    pub(super) fn touch_move(&self) -> Option<[f32; 2]> {
+        self.touch.analog
+    }
+
+    /// A player's button: its mapped keys and mouse buttons, pressed in order and released in reverse.
+    /// A toggle button holds them down until its next tap.
+    fn touch_custom_key(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: u16,
+        pressed: bool,
+    ) -> Result<()> {
+        let toggle = self.settings.touch.button(id).is_some_and(|b| b.toggle);
+        if !pressed {
+            if toggle {
+                return Ok(());
+            }
+            return self.touch_release_custom(event_loop, id);
+        }
+        if toggle && self.touch.toggled.remove(&id) {
+            return self.touch_release_custom(event_loop, id);
+        }
+        // A second finger on the same button does not press its keys twice.
+        if self.touch.custom_keys.contains_key(&id) {
+            return Ok(());
+        }
+        if toggle {
+            self.touch.toggled.insert(id);
+        }
+        let keys = self.settings.touch.button_mappings(id);
+        self.touch.custom_keys.insert(id, keys.clone());
+        for key in keys {
+            self.touch_custom_event(event_loop, key, ElementState::Pressed)?;
+        }
+        Ok(())
+    }
+
+    /// Lets go of everything `id` pressed, in the reverse of the order it went down.
+    fn touch_release_custom(&mut self, event_loop: &dyn EventLoopCtl, id: u16) -> Result<()> {
+        let Some(keys) = self.touch.custom_keys.remove(&id) else {
+            return Ok(());
+        };
+        for key in keys.into_iter().rev() {
+            self.touch_custom_event(event_loop, key, ElementState::Released)?;
+        }
+        Ok(())
+    }
+
+    /// A button the player added to the menus' layout: the same keys and mouse buttons, read from
+    /// that layout, and its own toggle. A toggle button holds them until its next tap.
+    fn touch_menu_custom_key(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: u16,
+        pressed: bool,
+    ) -> Result<()> {
+        let (toggle, keys) = {
+            let layout = &self.settings.touch_menu;
+            (
+                layout.button(id).is_some_and(|b| b.toggle),
+                layout.button_mappings(id),
+            )
+        };
+        if !pressed {
+            if toggle {
+                return Ok(());
+            }
+            return self.touch_release_menu_custom(event_loop, id);
+        }
+        if toggle && self.touch.menu_toggled.remove(&id) {
+            return self.touch_release_menu_custom(event_loop, id);
+        }
+        if self.touch.menu_custom_keys.contains_key(&id) {
+            return Ok(());
+        }
+        if toggle {
+            self.touch.menu_toggled.insert(id);
+        }
+        self.touch.menu_custom_keys.insert(id, keys.clone());
+        for key in keys {
+            self.touch_custom_event(event_loop, key, ElementState::Pressed)?;
+        }
+        Ok(())
+    }
+
+    /// Lets go of everything a menus' layout button pressed, in the reverse of the order it went down.
+    fn touch_release_menu_custom(&mut self, event_loop: &dyn EventLoopCtl, id: u16) -> Result<()> {
+        let Some(keys) = self.touch.menu_custom_keys.remove(&id) else {
+            return Ok(());
+        };
+        for key in keys.into_iter().rev() {
+            self.touch_custom_event(event_loop, key, ElementState::Released)?;
+        }
+        Ok(())
+    }
+
+    /// Every menus' layout button lets go: the screen closed under the fingers.
+    fn touch_release_menu_customs(&mut self, event_loop: &dyn EventLoopCtl) -> Result<()> {
+        let toggled: Vec<u16> = std::mem::take(&mut self.touch.menu_toggled)
+            .into_iter()
+            .collect();
+        for id in toggled {
+            self.touch_release_menu_custom(event_loop, id)?;
+        }
+        let held: Vec<u16> = self.touch.menu_custom_keys.keys().copied().collect();
+        for id in held {
+            self.touch_release_menu_custom(event_loop, id)?;
+        }
+        Ok(())
+    }
+
+    /// Every toggle button lets go: a screen opened over the game, or the player left it.
+    fn touch_release_toggles(&mut self, event_loop: &dyn EventLoopCtl) -> Result<()> {
+        let ids: Vec<u16> = std::mem::take(&mut self.touch.toggled)
+            .into_iter()
+            .collect();
+        for id in ids {
+            self.touch_release_custom(event_loop, id)?;
+        }
+        Ok(())
+    }
+
+    /// Buttons that no longer exist (deleted, or cleared by Reset Layout) let go of their keys, so a
+    /// deletion never leaves a key stuck down.
+    fn touch_release_removed(&mut self, event_loop: &dyn EventLoopCtl) -> Result<()> {
+        let game = (&self.touch.custom_keys, &self.touch.toggled);
+        let gone: Vec<u16> = game
+            .0
+            .keys()
+            .copied()
+            .chain(game.1.iter().copied())
+            .filter(|id| self.settings.touch.button(*id).is_none())
+            .collect();
+        for id in gone {
+            self.touch.toggled.remove(&id);
+            self.touch_release_custom(event_loop, id)?;
+        }
+        let menus = (&self.touch.menu_custom_keys, &self.touch.menu_toggled);
+        let gone: Vec<u16> = menus
+            .0
+            .keys()
+            .copied()
+            .chain(menus.1.iter().copied())
+            .filter(|id| self.settings.touch_menu.button(*id).is_none())
+            .collect();
+        for id in gone {
+            self.touch.menu_toggled.remove(&id);
+            self.touch_release_menu_custom(event_loop, id)?;
+        }
+        Ok(())
+    }
+
+    fn touch_custom_event(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        key: touch::CustomKey,
+        state: ElementState,
+    ) -> Result<()> {
+        match key {
+            touch::CustomKey::Key(key) => self.synthetic_key(event_loop, key, state),
+            // Directly, as a tap does: a touch screen never captures the pointer, so a `MouseInput`
+            // event would be taken for a first click that only grabs and would act on nothing.
+            touch::CustomKey::Mouse(button) => {
+                let pressed = state == ElementState::Pressed;
+                if self.touch_menu_pad_shown() {
+                    // Over a screen the click is the screen's, under the pointer, as a tap's is.
+                    // Grabbing first would warp the pointer to the window's centre and leave the
+                    // screen without the click, so a second finger's drag lost what it carried.
+                    if pressed {
+                        let at = clamp_point(
+                            self.touch.cursor.unwrap_or(self.cursor),
+                            self.touch_batch(),
+                        );
+                        self.touch_pointer(event_loop, at);
+                        self.touch.cursor = Some(self.cursor);
+                    }
+                    self.touch_mouse(event_loop, button, pressed);
+                    return Ok(());
+                }
+                if pressed {
+                    self.touch_grab();
+                }
+                self.play_mouse(button, pressed)
+            }
+        }
+    }
+
+    /// A keyboard event the player's button stands for, through the same path as a real key.
+    fn synthetic_key(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        key: KeyCode,
+        state: ElementState,
+    ) -> Result<()> {
+        let Some(id) = self.window.as_ref().map(|w| w.id()) else {
+            return Ok(());
+        };
+        self.handle_window_event(
+            event_loop,
+            id,
+            WindowEvent::KeyboardInput {
+                device_id: DeviceId::dummy(),
+                event: KeyEvent::synthetic(key, state),
+                is_synthetic: true,
+            },
+            super::input_trace::InputOrigin::User,
+        );
         Ok(())
     }
 
@@ -718,6 +1034,217 @@ impl Game<'_> {
                 ))
     }
 
+    /// The touch buttons over a screen are shown: the pointer is the finger's (cursor mode), and the screen
+    /// is one the pointer drives (game/pad_menu.rs), so the D-pad steps from slot to slot. A text field
+    /// taking typing has the buttons out of its way.
+    fn touch_menu_pad_shown(&self) -> bool {
+        self.settings.touch.pointer == touch::PointerMode::Cursor
+            && self.touch_shown()
+            && !self.hardware_hides_touch()
+            && !self.touch_playing()
+            && !self.touch_on_phone()
+            && self.pad_pointer_screen()
+            && self.focused_field_rect().is_none()
+    }
+
+    /// Which of the screen's touch buttons is under `at`, in GUI pixels.
+    fn menu_pad_control(&self, w: f32, h: f32, at: (f32, f32)) -> Option<Control> {
+        self.settings
+            .touch_menu
+            .menu_layout(w, h)
+            .into_iter()
+            .find(|(_, r)| touch::hit_rect(*r, at))
+            .map(|(control, _)| control)
+    }
+
+    /// A finger on the screen's D-pad, Sneak, Jump or one of the layout's own buttons
+    /// (`touch_menu_pad_shown`). The pad's own state is put to work on the screen's pointer: directions
+    /// step between the targets the pad's crosshair reaches, Jump holds the left button (a direction
+    /// then spreads a stack across slots, and Jump's release drops it), Sneak latches the Shift a
+    /// shift-click needs, and a player's button sends its keys. Whether the touch went to a button;
+    /// the menu gesture never sees it.
+    fn touch_menu_pad_touch(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: u64,
+        phase: TouchPhase,
+        at: (f32, f32),
+        batch: HudBatch,
+    ) -> Result<bool> {
+        match phase {
+            TouchPhase::Started => {
+                if !self.touch_menu_pad_shown() {
+                    return Ok(false);
+                }
+                let Some(control) = self.menu_pad_control(batch.width, batch.height, at) else {
+                    return Ok(false);
+                };
+                let mut pad = MenuPad {
+                    id,
+                    control,
+                    stepped: Instant::now(),
+                    repeating: false,
+                    pressed: false,
+                    lifted: false,
+                };
+                log::info!("touch menu pad: finger {id} down on {control:?}");
+                match control {
+                    Control::Sneak => self.touch.menu_shift = !self.touch.menu_shift,
+                    Control::Jump => {
+                        self.touch_menu_pad_click(event_loop, true);
+                        pad.pressed = true;
+                    }
+                    // A button the player added to this layout sends its keys, over menus as it does
+                    // over the world.
+                    Control::Custom(id) => self.touch_menu_custom_key(event_loop, id, true)?,
+                    control => self.touch_menu_pad_step(event_loop, control),
+                }
+                self.touch.menu_pads.push(pad);
+                Ok(true)
+            }
+            TouchPhase::Moved => {
+                let Some(index) = self.touch.menu_pads.iter().position(|p| p.id == id) else {
+                    return Ok(false);
+                };
+                // Sliding from one direction onto another steps that way at once, as the D-pad does.
+                if self.touch_menu_pad_shown()
+                    && let Some(to) = self.menu_pad_control(batch.width, batch.height, at)
+                    && to != self.touch.menu_pads[index].control
+                    && menu_pad_step_of(self.touch.menu_pads[index].control).is_some()
+                    && menu_pad_step_of(to).is_some()
+                {
+                    let pad = &mut self.touch.menu_pads[index];
+                    pad.control = to;
+                    pad.stepped = Instant::now();
+                    pad.repeating = false;
+                    self.touch_menu_pad_step(event_loop, to);
+                }
+                Ok(true)
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let Some(index) = self.touch.menu_pads.iter().position(|p| p.id == id) else {
+                    return Ok(false);
+                };
+                let pad = &mut self.touch.menu_pads[index];
+                if pad.control == Control::Jump && pad.pressed {
+                    // Let go once a frame has drawn the press, as a menu tap does.
+                    pad.lifted = true;
+                } else {
+                    let control = pad.control;
+                    self.touch.menu_pads.remove(index);
+                    if let Control::Custom(id) = control {
+                        self.touch_menu_custom_key(event_loop, id, false)?;
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Jump over a screen: the left button, held until the finger lifts, so a direction drags what the
+    /// pointer carries from slot to slot and its release drops it.
+    fn touch_menu_pad_click(&mut self, event_loop: &dyn EventLoopCtl, pressed: bool) {
+        let mut at = clamp_point(self.touch.cursor.unwrap_or(self.cursor), self.touch_batch());
+        if pressed {
+            // Over a slot or button, the click lands on its centre: a direction held with it then drags
+            // from slot to slot, as a held A does for the pad.
+            if let Some(target) = self.pad_targets().into_iter().find(|t| {
+                let [x, y, w, h] = t.rect;
+                (x..x + w).contains(&at.0) && (y..y + h).contains(&at.1)
+            }) {
+                at = target.center();
+            }
+        }
+        self.touch_pointer(event_loop, at);
+        self.touch.cursor = Some(self.cursor);
+        self.touch_button(event_loop, pressed);
+    }
+
+    /// One step of a direction over a screen: the nearest target that way, the step the pad's D-pad makes
+    /// where the pointer drives the screen. It lands at once: the pad's glide runs in its own frame.
+    fn touch_menu_pad_step(&mut self, event_loop: &dyn EventLoopCtl, control: Control) {
+        let Some(button) = menu_pad_step_of(control) else {
+            return;
+        };
+        // The screen finds what is under the pointer while drawing: have it agree with the arrow first.
+        let at = clamp_point(self.touch.cursor.unwrap_or(self.cursor), self.touch_batch());
+        self.touch_pointer(event_loop, at);
+        // Jump held: the step drags what the pointer carries across the slots, as A does.
+        let dragging = self
+            .touch
+            .menu_pads
+            .iter()
+            .any(|pad| pad.control == Control::Jump && pad.pressed);
+        let held = std::mem::replace(&mut self.pad.menu.held[0], dragging);
+        self.pad.menu.pos = Some(self.cursor);
+        self.pad_pointer_step(event_loop, button);
+        self.pad.menu.held[0] = held;
+        if let Some((_, to, _)) = self.pad.menu.glide.take() {
+            self.pad_pointer_to(event_loop, to);
+        }
+        self.touch.cursor = Some(self.cursor);
+    }
+
+    /// Once a frame over a screen: a held direction steps again after its delay, then as often as the pad's
+    /// D-pad, and a screen that went away under a finger lets go of the left button.
+    fn touch_menu_pad_frame(&mut self, event_loop: &dyn EventLoopCtl) {
+        if self.touch.menu_pads.is_empty() {
+            return;
+        }
+        if !self.touch_menu_pad_shown() {
+            self.touch_release_menu_pad(event_loop);
+            return;
+        }
+        // A lifted Jump lets go now that a frame has drawn its press.
+        let mut lifted = false;
+        self.touch.menu_pads.retain(|pad| {
+            let lift = pad.lifted;
+            lifted |= lift;
+            !lift
+        });
+        if lifted {
+            self.touch_button(event_loop, false);
+        }
+        let now = Instant::now();
+        let mut next = None;
+        for pad in &mut self.touch.menu_pads {
+            if menu_pad_step_of(pad.control).is_none() {
+                continue;
+            }
+            let wait = if pad.repeating {
+                MENU_STEP_REPEAT
+            } else {
+                MENU_STEP_DELAY
+            };
+            if now.duration_since(pad.stepped) >= wait {
+                pad.stepped = now;
+                pad.repeating = true;
+                next = Some(pad.control);
+            }
+        }
+        if let Some(control) = next {
+            self.touch_menu_pad_step(event_loop, control);
+        }
+    }
+
+    /// Every finger on a screen's touch buttons lets go: its Jump lifts the left button it held.
+    fn touch_release_menu_pad(&mut self, event_loop: &dyn EventLoopCtl) {
+        let pressed = self
+            .touch
+            .menu_pads
+            .iter()
+            .any(|pad| pad.control == Control::Jump && pad.pressed);
+        self.touch.menu_pads.clear();
+        self.touch.menu_shift = false;
+        if pressed {
+            self.touch_button(event_loop, false);
+        }
+        // A finger that went away with the screen lets go of its button's keys.
+        if let Err(e) = self.touch_release_menu_customs(event_loop) {
+            log::warn!("Horizon: touch: {e}");
+        }
+    }
+
     fn touch_menu(
         &mut self,
         event_loop: &dyn EventLoopCtl,
@@ -725,22 +1252,55 @@ impl Game<'_> {
         phase: TouchPhase,
         at: (f32, f32),
     ) {
-        if !at.0.is_finite() || !at.1.is_finite() {
-            if self
-                .touch
-                .menu
-                .as_ref()
-                .is_some_and(|finger| finger.id == id)
-            {
-                self.touch_release_menu(event_loop);
-            }
-            return;
-        }
+        let cursor_mode = self.settings.touch.pointer == touch::PointerMode::Cursor;
         match phase {
             TouchPhase::Started => {
-                if self.touch.menu.is_some() {
-                    return;
+                let mut stale = None;
+                if let Some(finger) = self.touch.menu.as_mut() {
+                    if finger.id == id {
+                        return;
+                    }
+                    // A second finger over a cursor-mode gesture scrolls, as a touchpad's two fingers
+                    // would, while the first keeps the pointer where it is.
+                    if cursor_mode
+                        && finger.tap
+                        && !finger.closed
+                        && finger.second.is_none()
+                        && !(finger.hold && finger.pressed)
+                    {
+                        // A hold that has not pressed yet gives way: a second finger joining soon after a
+                        // click means a scroll, not an item held.
+                        finger.hold = false;
+                        finger.second = Some((id, at.1));
+                        // Two fingers scrolling is not a tap: the first must not click when it lifts.
+                        finger.wheeled = true;
+                        log::info!(
+                            "touch menu: second finger {id} down at ({:.0}, {:.0}); two-finger scroll",
+                            at.0,
+                            at.1
+                        );
+                        return;
+                    }
+                    if finger.second.is_some() {
+                        // A scroll owns its two fingers; a third one waits for it to end.
+                        return;
+                    }
+                    stale = Some(finger.id);
                 }
+                if let Some(stale) = stale {
+                    // The finger that is down never lifted: UIKit can swallow an end (a palm resting on
+                    // the glass, a touch cancelled as a screen changes), and until now every later tap
+                    // was ignored, so no button answered. Let that gesture go and take this finger.
+                    log::info!("touch menu: finger {stale} never lifted; {id} takes its place");
+                    self.touch_release_menu(event_loop);
+                }
+                // In cursor mode the finger drags the pointer a touchpad's mouse would, and a tap acts
+                // under it, so the gesture starts wherever the pointer was left.
+                let pointer = if cursor_mode {
+                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch())
+                } else {
+                    at
+                };
                 let on_close = self.touch_close_shown()
                     && self
                         .touch_batch()
@@ -751,21 +1311,19 @@ impl Game<'_> {
                     && self.touch_batch().is_some_and(|b| {
                         touch::hit_rect(touch::keyboard_rect(b.width, b.height), at)
                     });
-                let target = if on_close {
-                    MenuTarget::Close
+                if on_close {
+                    // What Escape does where the finger is (the pad's B).
+                    if let Err(e) = self.pad_back() {
+                        log::warn!("Horizon: touch close: {e}");
+                    }
                 } else if on_keyboard {
-                    MenuTarget::Keyboard
+                    self.toggle_system_keyboard();
                 } else {
-                    MenuTarget::Pointer
-                };
-                let mode = if target == MenuTarget::Pointer {
-                    self.touch_menu_mode(at)
-                } else {
-                    MenuMode::Tap
-                };
-                if target == MenuTarget::Pointer {
+                    // A finger outside the field the keyboard belongs to puts the system's keyboard away, as
+                    // it would on any phone (and one on the field brings it back after the button hid it);
+                    // the tap still does what it was on.
                     match self.focused_field_rect() {
-                        Some(rect) if touch::hit_rect(rect, self.screen_point(at)) => {
+                        Some(rect) if touch::hit_rect(rect, self.screen_point(pointer)) => {
                             if self.system_keyboard_hidden() {
                                 self.show_system_keyboard();
                             }
@@ -773,91 +1331,166 @@ impl Game<'_> {
                         Some(_) if self.system_keyboard_up() => self.hide_system_keyboard(),
                         _ => {}
                     }
-                    self.touch_pointer(event_loop, at);
-                }
-                self.touch.menu = Some(MenuFinger {
-                    id,
-                    gesture: MenuGesture::new(at, mode),
-                    target,
-                    at,
-                    guard: (mode == MenuMode::Tap)
-                        .then(|| horizon_client::widgets::capture_pointer(self.screen_point(at))),
-                });
-            }
-            TouchPhase::Moved | TouchPhase::Ended => {
-                let Some(finger) = self.touch.menu.as_mut().filter(|finger| finger.id == id) else {
-                    return;
-                };
-                let target = finger.target;
-                finger.at = at;
-                let action = if phase == TouchPhase::Ended {
-                    finger.gesture.end(at)
-                } else {
-                    finger.gesture.moved(at)
-                };
-                if target == MenuTarget::Pointer {
-                    self.touch_pointer(event_loop, at);
-                }
-                self.touch_menu_action(event_loop, target, action);
-            }
-            TouchPhase::Cancelled => {
-                if self
-                    .touch
-                    .menu
-                    .as_ref()
-                    .is_some_and(|finger| finger.id == id)
-                {
-                    self.touch_release_menu(event_loop);
-                }
-            }
-        }
-    }
-
-    /// The same drawn targets the controller uses distinguish direct manipulation
-    /// from a tap. Fields retain selection dragging; sliders and slots retain holds.
-    fn touch_menu_mode(&self, at: (f32, f32)) -> MenuMode {
-        if self.screen == Screen::Inventory
-            || self.hud_editor_drag_target(self.screen_point(at))
-            || horizon_client::widgets::last_targets()
-                .iter()
-                .rev()
-                .any(|target| {
-                    matches!(
-                        target.kind,
-                        horizon_client::widgets::Kind::Slider { .. }
-                            | horizon_client::widgets::Kind::Field
-                            | horizon_client::widgets::Kind::Slot
-                    ) && touch::hit_rect(target.rect, self.screen_point(at))
-                })
-        {
-            MenuMode::Drag
-        } else {
-            MenuMode::Tap
-        }
-    }
-
-    fn touch_menu_action(
-        &mut self,
-        event_loop: &dyn EventLoopCtl,
-        target: MenuTarget,
-        action: MenuAction,
-    ) {
-        if action.finished {
-            self.touch.menu = None;
-        }
-        if action.scroll != 0.0 && target == MenuTarget::Pointer {
-            self.touch_wheel(event_loop, action.scroll);
-        }
-        if let Some(pressed) = action.button {
-            match (target, pressed) {
-                (MenuTarget::Pointer, _) => self.touch_button(event_loop, pressed),
-                (MenuTarget::Close, true) => {
-                    if let Err(error) = self.pad_back() {
-                        log::warn!("Horizon: touch close: {error}");
+                    self.touch_pointer(event_loop, pointer);
+                    if cursor_mode {
+                        // Where the pointer now is, a finger aims rather than acts: the click comes when it
+                        // lifts, under the pointer (Ended), as a mouse's button would.
+                        self.touch.cursor = Some(pointer);
                     }
                 }
-                (MenuTarget::Keyboard, true) => self.toggle_system_keyboard(),
-                _ => {}
+                let tap = cursor_mode && !(on_close || on_keyboard);
+                // A touch soon after a tap lifted is its second tap: held down, it keeps the button down.
+                let last_tap = self.touch.last_tap.take();
+                let hold = tap && last_tap.is_some_and(|since| since.elapsed() <= DOUBLE_TAP);
+                log::info!(
+                    "touch menu: finger {id} down at ({:.0}, {:.0}) -> ({:.0}, {:.0}); cursor_mode={cursor_mode} tap={tap} hold={hold} on_close={on_close} on_keyboard={on_keyboard}",
+                    at.0,
+                    at.1,
+                    pointer.0,
+                    pointer.1
+                );
+                self.touch.menu = Some(MenuFinger {
+                    id,
+                    scrolled: at,
+                    from: at,
+                    frames: 0,
+                    started: Instant::now(),
+                    pressed: false,
+                    tap,
+                    hold,
+                    moved: false,
+                    second: None,
+                    wheeled: false,
+                    lifted: false,
+                    settled: false,
+                    closed: on_close || on_keyboard,
+                });
+            }
+            TouchPhase::Moved => {
+                let Some(finger) = self.touch.menu.as_ref().filter(|f| f.id == id && !f.closed)
+                else {
+                    return;
+                };
+                if let Some((second, last)) = finger.second
+                    && second == id
+                {
+                    // The second finger scrolls as the wheel would, the content following the fingers.
+                    let lines = ((at.1 - last) / SCROLL_LINE).trunc();
+                    let scrolls = self.screen != Screen::Inventory;
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        if let Some(second) = f.second.as_mut() {
+                            second.1 += lines * SCROLL_LINE;
+                        }
+                        f.wheeled = true;
+                    }
+                    if scrolls && lines != 0.0 {
+                        self.touch_wheel(event_loop, lines);
+                    }
+                    return;
+                }
+                // Two fingers down and scrolling move neither the arrow, as on a trackpad, and the first
+                // finger keeps its place for when the other lifts.
+                let (from, scrolling) = (finger.from, finger.second.is_some());
+                let last = finger.scrolled;
+                if scrolling {
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        f.from = at;
+                        f.scrolled = at;
+                    }
+                    return;
+                }
+                let pointer = if cursor_mode {
+                    let was = clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch());
+                    clamp_point(
+                        (was.0 + at.0 - from.0, was.1 + at.1 - from.1),
+                        self.touch_batch(),
+                    )
+                } else {
+                    at
+                };
+                if cursor_mode {
+                    // A finger only moves the pointer, a touchpad's: dragging it never scrolls the
+                    // list it crosses, which a second finger does.
+                    self.touch.cursor = Some(pointer);
+                    self.touch_pointer(event_loop, pointer);
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        let (dx, dy) = (at.0 - f.scrolled.0, at.1 - f.scrolled.1);
+                        f.moved |= dx * dx + dy * dy > TAP_SLOP * TAP_SLOP;
+                        f.from = at;
+                    }
+                    return;
+                }
+                // A drag scrolls lists as a wheel would, the content following the finger. Not in an
+                // inventory, where a drag carries the item it pressed on.
+                let lines = ((at.1 - last.1) / SCROLL_LINE).trunc();
+                let scrolls = self.screen != Screen::Inventory;
+                if let Some(f) = self.touch.menu.as_mut() {
+                    f.scrolled = (at.0, last.1 + lines * SCROLL_LINE);
+                    f.from = at;
+                    f.wheeled |= lines != 0.0;
+                }
+                self.touch_pointer(event_loop, pointer);
+                if scrolls && lines != 0.0 {
+                    self.touch_wheel(event_loop, lines);
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let click = phase == TouchPhase::Ended;
+                let Some(finger) = self.touch.menu.as_ref().filter(|f| f.id == id) else {
+                    return;
+                };
+                if finger.second.is_some_and(|(second, _)| second == id) {
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        f.second = None;
+                    }
+                    log::info!("touch menu: second finger {id} lifted; two-finger scroll ends");
+                    return;
+                }
+                // A finger that dragged the pointer was not a tap: it must not click where it left the
+                // arrow either.
+                let dragged = {
+                    let (dx, dy) = (at.0 - finger.scrolled.0, at.1 - finger.scrolled.1);
+                    cursor_mode && dx * dx + dy * dy > TAP_SLOP * TAP_SLOP
+                };
+                let (closed, tap, hold) = (
+                    finger.closed,
+                    finger.tap && !finger.wheeled && !dragged,
+                    finger.hold,
+                );
+                log::info!(
+                    "touch menu: finger {id} {phase:?} at ({:.0}, {:.0}); cursor_mode={cursor_mode} closed={closed} tap={tap} hold={hold} wheeled={} dragged={dragged} moved={}",
+                    at.0,
+                    at.1,
+                    finger.wheeled,
+                    finger.moved
+                );
+                // The tap acts under the pointer, wherever the finger is: it never brings the arrow to
+                // the finger, so the mouse stays where the player left it.
+                let pointer = if cursor_mode {
+                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch())
+                } else {
+                    at
+                };
+                if let Some(f) = self.touch.menu.as_mut() {
+                    // A drag whose moves all stayed under the slop still aimed rather than tapped.
+                    f.moved |= dragged;
+                    f.lifted = true;
+                }
+                if !closed {
+                    if cursor_mode {
+                        self.touch.cursor = Some(pointer);
+                    }
+                    self.touch_pointer(event_loop, pointer);
+                    if tap && click && !hold {
+                        // Pressed now and let go on a later frame (`touch_menu_frame`): a press and
+                        // release within one tick would leave the screen nothing to click on.
+                        self.touch_button(event_loop, true);
+                        if let Some(f) = self.touch.menu.as_mut() {
+                            f.pressed = true;
+                        }
+                        self.touch.last_tap = Some(Instant::now());
+                    }
+                }
             }
         }
     }
@@ -865,18 +1498,17 @@ impl Game<'_> {
     /// Abandon a menu gesture when another input device or the world takes over.
     /// A missing UIKit end event must neither latch all later fingers nor create a click.
     fn touch_release_menu(&mut self, event_loop: &dyn EventLoopCtl) {
-        #[cfg(target_os = "ios")]
-        if self.touch.cursor_screen.is_some() {
-            self.touch_cursor_reset();
-            self.touch_cursor_flush(event_loop);
-        }
-
-        if let Some(mut finger) = self.touch.menu.take()
-            && finger.gesture.cancel().button == Some(false)
-            && finger.target == MenuTarget::Pointer
+        if let Some(finger) = self.touch.menu.take()
+            && finger.pressed
+            && !finger.closed
         {
+            log::info!(
+                "touch menu: finger {} abandoned while pressed; its click is released",
+                finger.id
+            );
             self.touch_button(event_loop, false);
         }
+        self.touch_release_menu_pad(event_loop);
     }
 
     /// Advance the delayed menu press/release after drawing the pointer.
@@ -884,39 +1516,59 @@ impl Game<'_> {
         let Some(finger) = self.touch.menu.as_mut() else {
             return;
         };
-        let target = finger.target;
-        let at = finger.at;
-        let action = finger.gesture.frame();
-        if action.button == Some(true)
-            && self
-                .touch
-                .menu
-                .as_ref()
-                .and_then(|finger| finger.guard.as_ref())
-                .is_some_and(|guard| {
-                    *guard != horizon_client::widgets::capture_pointer(self.screen_point(at))
-                })
-        {
-            // No press was dispatched yet: suppress it without inventing a release.
+        finger.frames = finger.frames.saturating_add(1);
+        if finger.closed {
+            if finger.lifted {
+                self.touch.menu = None;
+            }
+        } else if finger.hold {
+            // A double tap held down: once it has stayed still a moment, press and keep holding until the
+            // finger lifts, so the drag that follows carries what it grabbed. A second touch that moves
+            // the arrow instead never presses: moving the pointer after a click is not another click.
+            if !finger.pressed {
+                if finger.moved {
+                    if finger.lifted {
+                        self.touch.menu = None;
+                    }
+                } else if finger.started.elapsed() >= HOLD_STILL {
+                    finger.pressed = true;
+                    self.touch_button(event_loop, true);
+                } else if finger.lifted {
+                    // Lifted before it stayed still: a second tap that was just a tap, clicked as one.
+                    finger.pressed = true;
+                    self.touch_button(event_loop, true);
+                }
+            } else if finger.lifted {
+                if !finger.settled {
+                    finger.settled = true;
+                } else {
+                    self.touch.menu = None;
+                    self.touch_button(event_loop, false);
+                }
+            }
+        } else if finger.tap {
+            // A cursor-mode click pressed when the finger lifted (`touch_menu`): let go only once a
+            // whole frame has drawn the pointer on what it pressed.
+            if finger.lifted {
+                if !finger.settled {
+                    finger.settled = true;
+                } else {
+                    let pressed = finger.pressed;
+                    self.touch.menu = None;
+                    if pressed {
+                        self.touch_button(event_loop, false);
+                    }
+                }
+            }
+        } else if !finger.pressed {
+            if finger.frames >= 2 {
+                finger.pressed = true;
+                self.touch_button(event_loop, true);
+            }
+        } else if finger.lifted {
             self.touch.menu = None;
-            return;
+            self.touch_button(event_loop, false);
         }
-        self.touch_menu_action(event_loop, target, action);
-    }
-
-    pub(super) fn touch_synthetic_input(&self) -> bool {
-        self.touch.synthetic
-    }
-
-    fn touch_window_event(
-        &mut self,
-        event_loop: &dyn EventLoopCtl,
-        id: WindowId,
-        event: WindowEvent,
-    ) {
-        let previous = std::mem::replace(&mut self.touch.synthetic, true);
-        self.handle_window_event(event_loop, id, event, super::input_trace::InputOrigin::Game);
-        self.touch.synthetic = previous;
     }
 
     fn touch_pointer(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
@@ -927,34 +1579,35 @@ impl Game<'_> {
         let at = self.screen_point(at);
         let position =
             PhysicalPosition::new(f64::from(at.0 * batch.scale), f64::from(at.1 * batch.scale));
-        self.touch_window_event(
+        self.handle_window_event(
             event_loop,
             id,
             WindowEvent::CursorMoved {
                 device_id: DeviceId::dummy(),
                 position,
             },
+            super::input_trace::InputOrigin::User,
         );
     }
 
     fn touch_button(&mut self, event_loop: &dyn EventLoopCtl, pressed: bool) {
-        self.touch_mouse_button(event_loop, MouseButton::Left, pressed);
+        self.touch_mouse(event_loop, MouseButton::Left, pressed);
     }
-    fn touch_mouse_button(
-        &mut self,
-        event_loop: &dyn EventLoopCtl,
-        button: MouseButton,
-        pressed: bool,
-    ) {
+
+    fn touch_mouse(&mut self, event_loop: &dyn EventLoopCtl, button: MouseButton, pressed: bool) {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
+        log::info!(
+            "touch menu click {button:?} {}",
+            if pressed { "down" } else { "up" }
+        );
         let state = if pressed {
             ElementState::Pressed
         } else {
             ElementState::Released
         };
-        self.touch_window_event(
+        self.handle_window_event(
             event_loop,
             id,
             WindowEvent::MouseInput {
@@ -962,34 +1615,82 @@ impl Game<'_> {
                 state,
                 button,
             },
+            super::input_trace::InputOrigin::User,
         );
     }
 
     fn touch_wheel(&mut self, event_loop: &dyn EventLoopCtl, lines: f32) {
-        self.touch_scroll(event_loop, 0.0, lines);
-    }
-    fn touch_scroll(&mut self, event_loop: &dyn EventLoopCtl, x: f32, y: f32) {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
-        self.touch_window_event(
+        // A slow swipe sends a line per frame: once a moment says the list is scrolling.
+        if log_due("touch-wheel", std::time::Duration::from_millis(200)) {
+            log::info!("touch menu scroll {lines:.0} lines");
+        }
+        self.handle_window_event(
             event_loop,
             id,
             WindowEvent::MouseWheel {
                 device_id: DeviceId::dummy(),
-                delta: MouseScrollDelta::LineDelta(x, y),
+                delta: MouseScrollDelta::LineDelta(0.0, lines),
                 phase: TouchPhase::Moved,
             },
+            super::input_trace::InputOrigin::User,
         );
     }
 
     // ---- drawing ----
 
+    /// The D-pad, Sneak and Jump over a screen in cursor mode, and any buttons the player added to the
+    /// menus' layout: the pointer steps from slot to slot and button to button, clicks, and
+    /// shift-clicks, without a finger reaching across the screen.
+    pub(super) fn draw_touch_menu_pad(&self, batch: &mut HudBatch) {
+        if !self.touch_menu_pad_shown() {
+            return;
+        }
+        let atlas = &self.gui.atlas;
+        for (control, r) in self
+            .settings
+            .touch_menu
+            .menu_layout(batch.width, batch.height)
+        {
+            let held = self
+                .touch
+                .menu_pads
+                .iter()
+                .any(|pad| pad.control == control)
+                || (control == Control::Sneak && self.touch.menu_shift);
+            if let Control::Custom(id) = control {
+                let Some(button) = self.settings.touch_menu.button(id) else {
+                    continue;
+                };
+                touch_draw::draw_custom(
+                    batch,
+                    atlas,
+                    &self.settings.touch_menu.button_label(id),
+                    r,
+                    held || self.touch.menu_toggled.contains(&id),
+                    button.opacity,
+                    button.background,
+                    button.stroke,
+                );
+                continue;
+            }
+            touch_draw::draw_control(
+                batch,
+                atlas,
+                control,
+                r,
+                held,
+                self.settings.touch_menu.style(control).opacity,
+            );
+        }
+    }
+
     /// The buttons over the HUD while playing: vanilla's button, a little see-through as Pocket Edition's
     /// were, lit while held, with white marks shadowed like Minecraft's text.
     pub(super) fn draw_touch_controls(&self, batch: &mut HudBatch) {
-        if !touch::controls_visible()
-            || !self.touch_shown()
+        if !self.touch_shown()
             || self.hardware_hides_touch()
             || !self.touch_playing()
             || self.touch_on_phone()
@@ -997,25 +1698,128 @@ impl Game<'_> {
             return;
         }
         let atlas = &self.gui.atlas;
-        for (control, r) in self.visible_touch_layout(batch.width, batch.height) {
+        for (control, r) in self.settings.touch.layout(batch.width, batch.height) {
             if matches!(control, Control::Hotbar(_)) {
                 continue;
             }
-            draw_amethyst_control(
+            if let Control::Custom(id) = control {
+                let Some(button) = self.settings.touch.button(id) else {
+                    continue;
+                };
+                touch_draw::draw_custom(
+                    batch,
+                    atlas,
+                    &self.settings.touch.button_label(id),
+                    r,
+                    self.touch.fingers.held(control) || self.touch.toggled.contains(&id),
+                    button.opacity,
+                    button.background,
+                    button.stroke,
+                );
+                continue;
+            }
+            if control == Control::Stick {
+                touch_draw::draw_stick(
+                    batch,
+                    atlas,
+                    r,
+                    self.touch.analog.unwrap_or([0.0, 0.0]),
+                    self.touch.fingers.held(control),
+                    self.settings.touch.stick_opacity,
+                );
+                continue;
+            }
+            touch_draw::draw_control(
                 batch,
                 atlas,
                 control,
                 r,
                 self.touch.fingers.held(control),
-                Some(self.touch.fingers.stick_point(r)),
+                self.settings.touch.style(control).opacity,
             );
-            if control == Control::Joystick
-                && touch::forward_lock()
-                && self.touch.fingers.held(Control::Forward)
-            {
-                draw_lock(batch, atlas, touch::lock_rect(r), self.touch.fingers.locked);
-            }
         }
+    }
+
+    /// The menu pointer in cursor mode: a mouse arrow whose tip is where a tap clicks. iOS has no
+    /// visible cursor, so the game draws the one a mouse would bring.
+    pub(super) fn draw_touch_cursor(&self, batch: &mut HudBatch) {
+        if self.settings.touch.pointer != touch::PointerMode::Cursor
+            || self.touch_playing()
+            || self.touch_on_phone()
+        {
+            return;
+        }
+        let Some(at) = self.touch.cursor else {
+            return;
+        };
+        draw_arrow(batch, &self.gui.atlas, at);
+    }
+
+    /// A hardware mouse on an iPhone: the system draws no pointer there, so a menu would have no
+    /// visible spot to click. The arrow is the one cursor mode draws for a finger.
+    #[cfg(target_os = "ios")]
+    pub(super) fn draw_hardware_cursor(&self, batch: &mut HudBatch) {
+        use winit::platform::ios::WindowExtIOS;
+
+        if self.captured
+            || !self.touch.hardware.used_mouse()
+            || !horizon_gamecontroller::mouse_connected()
+        {
+            return;
+        }
+        let Some(window) = &self.window else { return };
+        if window.has_system_pointer() {
+            return;
+        }
+        draw_arrow(batch, &self.gui.atlas, self.cursor);
+    }
+}
+
+/// A classic mouse arrow whose tip is `at`: a black arrow needs a light edge to stay visible.
+fn draw_arrow(batch: &mut HudBatch, atlas: &HudAtlas, at: (f32, f32)) {
+    // The head's triangle and the tail hanging from it, scaled about the tip.
+    let head = [[0.0, 0.0], [0.0, 15.2], [11.6, 11.1]];
+    let tail = [[4.5, 12.2], [7.0, 18.0], [9.3, 16.9], [6.8, 11.2]];
+    for grow in [1.6, 0.0] {
+        let color = if grow > 0.0 { u32::MAX } else { 0xFF000000 };
+        fill_poly(batch, atlas, at, &head, grow, color);
+        fill_poly(batch, atlas, at, &tail, grow, color);
+    }
+}
+
+/// One convex shape filled, its corners `grow` pixels further from their centre: the outline behind the
+/// arrow, drawn just larger than it.
+fn fill_poly(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    at: (f32, f32),
+    shape: &[[f32; 2]],
+    grow: f32,
+    color: u32,
+) {
+    let n = shape.len() as f32;
+    let c = shape
+        .iter()
+        .fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n]);
+    let grown: Vec<[f32; 2]> = shape
+        .iter()
+        .map(|p| {
+            let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+            let length = (dx * dx + dy * dy).sqrt();
+            let k = if length > 0.0 {
+                1.0 + grow / length
+            } else {
+                1.0
+            };
+            [at.0 + c[0] + dx * k, at.1 + c[1] + dy * k]
+        })
+        .collect();
+    for i in 1..grown.len() - 1 {
+        batch.fill_quad(
+            atlas,
+            [grown[0], grown[i], grown[i + 1], grown[i + 1]],
+            color,
+        );
     }
 }
 
@@ -1023,67 +1827,19 @@ impl Game<'_> {
     /// The buttons over a screen: ✕ where the screen has no way out of its own on a touch screen
     /// (`touch_close_shown`), and ⌨ beside it while a text field has focus.
     pub(super) fn draw_touch_close(&mut self, batch: &mut HudBatch) {
-        #[cfg(target_os = "ios")]
-        {
-            self.touch.cursor_drawn = Some((self.key_screen(), self.cursor));
-        }
-        if !touch::controls_visible() || self.hardware_hides_touch() || self.touch_on_phone() {
+        if self.hardware_hides_touch() || self.touch_on_phone() {
             return;
         }
-        #[cfg(target_os = "ios")]
-        if !self.touch_playing()
-            && (touch::cursor_mode() || horizon_ios_launcher::native_gestures_available())
-        {
-            for (c, r) in self.visible_touch_layout(batch.width, batch.height) {
-                if !matches!(c, Control::Hotbar(_)) {
-                    let (x, y) = self.touch.cursor.joystick.thumb;
-                    let point = if self.touch.cursor.joystick.velocity != (0.0, 0.0) {
-                        (r[0] + x as f32, r[1] + y as f32)
-                    } else {
-                        (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
-                    };
-                    draw_amethyst_control(
-                        batch,
-                        &self.gui.atlas,
-                        c,
-                        r,
-                        self.touch.cursor_keys.contains(&c),
-                        Some(point),
-                    );
-                }
-            }
-            let at = self
-                .touch
-                .cursor
-                .position
-                .unwrap_or((batch.width / 2.0, batch.height / 2.0));
-            if self.touch_menu_cursor_mode() {
-                use horizon_client::pad_cursor;
-                let (left, top) = pad_cursor::origin(at);
-                batch.sprite_scaled(
-                    &self.gui.atlas,
-                    pad_cursor::SPRITE,
-                    left,
-                    top,
-                    pad_cursor::DRAWN,
-                    pad_cursor::DRAWN,
-                    u32::MAX,
-                );
-            }
-        }
-        let held = self
-            .touch
-            .menu
-            .as_ref()
-            .is_some_and(|finger| finger.target == MenuTarget::Close);
+        let held = self.touch.menu.as_ref().is_some_and(|f| f.closed);
         let keyboard = self.touch_shown() && self.field_focused();
         let atlas = &self.gui.atlas;
+        let opacity = self.settings.touch.opacity;
         if self.touch_close_shown() {
             let r = touch::close_rect(batch.width, batch.height);
-            touch_button(batch, atlas, r, held);
-            shadowed(r, |r, color| {
+            touch_draw::draw_button(batch, atlas, r, held, opacity);
+            touch_draw::shadowed(r, |r, color| {
                 // Two diagonals of cells.
-                let u = cell_size(r);
+                let u = touch_draw::cell_size(r);
                 let (cx, cy) = ((r[0] + r[2] / 2.0).floor(), (r[1] + r[3] / 2.0).floor());
                 for i in -3..=3 {
                     let d = i as f32 * u;
@@ -1094,18 +1850,10 @@ impl Game<'_> {
         }
         if keyboard {
             let r = touch::keyboard_rect(batch.width, batch.height);
-            touch_button(
-                batch,
-                atlas,
-                r,
-                self.touch
-                    .menu
-                    .as_ref()
-                    .is_some_and(|finger| finger.target == MenuTarget::Keyboard),
-            );
-            shadowed(r, |r, color| {
+            touch_draw::draw_button(batch, atlas, r, false, opacity);
+            touch_draw::shadowed(r, |r, color| {
                 // A keyboard: two rows of keys over a space bar.
-                let u = cell_size(r) * 0.75;
+                let u = touch_draw::cell_size(r) * 0.75;
                 let (cx, cy) = ((r[0] + r[2] / 2.0).floor(), (r[1] + r[3] / 2.0).floor());
                 for row in 0..2 {
                     for key in 0..5 {
@@ -1127,14 +1875,11 @@ impl Game<'_> {
         let Some(batch) = self.touch_batch().filter(|_| self.touch_shown()) else {
             return Vec::new();
         };
-        if !touch::controls_visible() {
-            return Vec::new();
-        }
         let focused = self.field_focused();
         let px = |r: touch::Rect| r.map(|v| v * batch.scale);
         let mut buttons = Vec::new();
         if self.touch_playing() {
-            for (control, r) in self.visible_touch_layout(batch.width, batch.height) {
+            for (control, r) in self.settings.touch.layout(batch.width, batch.height) {
                 let label = match control {
                     Control::Forward => "▲".to_owned(),
                     Control::Back => "▼".to_owned(),
@@ -1145,17 +1890,17 @@ impl Game<'_> {
                     Control::Perspective => "View".to_owned(),
                     Control::Chat => "Chat".to_owned(),
                     Control::Pause => "II".to_owned(),
+                    Control::HideHud => "HUD".to_owned(),
                     Control::Inventory => "•••".to_owned(),
                     Control::Hotbar(slot) => (slot + 1).to_string(),
-                    Control::LeftClick => "LMB".to_owned(),
-                    Control::RightClick => "RMB".to_owned(),
-                    Control::Joystick => "↕".to_owned(),
-                    other => format!("{other:?}"),
+                    Control::Custom(id) => self.settings.touch.button_label(id),
+                    Control::Stick => "Stick".to_owned(),
                 };
                 buttons.push(horizon_airplay::Button {
                     label,
                     rect: px(r),
-                    held: self.touch.fingers.held(control),
+                    held: self.touch.fingers.held(control)
+                        || matches!(control, Control::Custom(id) if self.touch.toggled.contains(&id)),
                 });
             }
         } else {
@@ -1163,878 +1908,17 @@ impl Game<'_> {
                 buttons.push(horizon_airplay::Button {
                     label: "✕".to_owned(),
                     rect: px(touch::close_rect(batch.width, batch.height)),
-                    held: self
-                        .touch
-                        .menu
-                        .as_ref()
-                        .is_some_and(|finger| finger.target == MenuTarget::Close),
+                    held: self.touch.menu.as_ref().is_some_and(|f| f.closed),
                 });
             }
             if focused {
                 buttons.push(horizon_airplay::Button {
                     label: "⌨".to_owned(),
                     rect: px(touch::keyboard_rect(batch.width, batch.height)),
-                    held: self
-                        .touch
-                        .menu
-                        .as_ref()
-                        .is_some_and(|finger| finger.target == MenuTarget::Keyboard),
+                    held: false,
                 });
             }
         }
         buttons
     }
-}
-
-/// Vanilla's button sprite, nine-sliced to the touch button's size: highlighted while held, and see-through
-/// enough to keep the world behind it in sight.
-fn touch_button(
-    batch: &mut HudBatch,
-    atlas: &horizon_client::hud::HudAtlas,
-    r: touch::Rect,
-    held: bool,
-) {
-    let sprite = if held {
-        "gui/sprites/widget/button_highlighted"
-    } else {
-        "gui/sprites/widget/button"
-    };
-    let alpha = if held { 230 } else { 170 };
-    horizon_client::ui::nine_slice(
-        batch,
-        atlas,
-        sprite,
-        r[0],
-        r[1],
-        r[2],
-        r[3],
-        rgba(255, 255, 255, alpha),
-    );
-}
-
-/// The size of a mark's cell on a button `r`: two GUI pixels on the old 26-pixel buttons, growing with them.
-fn cell_size(r: touch::Rect) -> f32 {
-    (r[2] / 13.0).round().max(2.0)
-}
-
-/// Draw a mark twice, as Minecraft draws text: a dark copy a little down and right, then the white one.
-fn shadowed(r: touch::Rect, mut mark: impl FnMut(touch::Rect, u32)) {
-    let off = (cell_size(r) / 2.0).max(1.0);
-    mark([r[0] + off, r[1] + off, r[2], r[3]], rgba(63, 63, 63, 230));
-    mark(r, rgba(255, 255, 255, 240));
-}
-#[cfg(target_os = "ios")]
-impl Game<'_> {
-    fn touch_render_point(&self, at: (f32, f32)) -> (f32, f32) {
-        let at = self.screen_point(at);
-        let Some(batch) = self.screen_batch() else {
-            return at;
-        };
-        // Match CursorMoved's physical-pixel round trip exactly. Comparing an
-        // unrounded point with the rendered cursor can stall a press forever.
-        (
-            (at.0 * batch.scale) / batch.scale,
-            (at.1 * batch.scale) / batch.scale,
-        )
-    }
-    fn touch_click_context(&self) -> Option<ClickContext> {
-        let batch = self.touch_batch()?;
-        let at = self
-            .touch
-            .cursor
-            .position
-            .unwrap_or((batch.width / 2.0, batch.height / 2.0));
-        let screen_at = self.touch_render_point(at);
-        Some(ClickContext {
-            at,
-            screen_at,
-            size: (batch.width, batch.height),
-            screen: self.key_screen(),
-            modifiers: self.touch_effective_modifiers(),
-            touch_shift: self.touch.fingers.held(Control::Sneak)
-                || self.touch.cursor_keys.contains(&Control::Sneak),
-            guard: horizon_client::widgets::capture_pointer(screen_at),
-            surface: self.touch.native_surface,
-        })
-    }
-    fn touch_record_click_context(&mut self) {
-        let Some(context) = self.touch_click_context() else {
-            return;
-        };
-        if let Some((id, last)) = self.touch.click_contexts.last()
-            && *last == context
-        {
-            horizon_ios_launcher::set_touch_context(*id);
-            return;
-        }
-        let id = horizon_ios_launcher::next_touch_context();
-        if self.touch.click_contexts.len() >= 512 {
-            self.touch.click_contexts.remove(0);
-        }
-        self.touch.click_contexts.push((id, context));
-        horizon_ios_launcher::set_touch_context(id);
-    }
-    fn touch_cursor_flush(&mut self, event_loop: &dyn EventLoopCtl) {
-        for (i, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
-            .into_iter()
-            .enumerate()
-        {
-            if std::mem::take(&mut self.touch.cursor_cancelled[i]) {
-                self.touch_mouse_button(event_loop, button, false);
-            }
-        }
-    }
-    fn touch_cursor_reset(&mut self) {
-        self.touch.cursor.cancel();
-        self.touch.cursor_pending.clear();
-        self.touch.cursor_screen = None;
-        self.touch.cursor_drawn = None;
-        for control in std::mem::take(&mut self.touch.cursor_keys) {
-            if let Some(key) = key_of(control) {
-                let _ = self.touch_raw_key(key, false);
-            }
-        }
-        for (i, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
-            .into_iter()
-            .enumerate()
-        {
-            if std::mem::take(&mut self.touch.cursor_down[i]) {
-                // The synthetic down entered the window ledger. Clear it now
-                // even when no event loop is available (reload), then route
-                // its paired menu/window up at the next dispatch opportunity.
-                self.physical_buttons.remove(&button);
-                self.touch.cursor_cancelled[i] = true;
-            }
-        }
-    }
-    fn touch_cursor_motion(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
-        if self
-            .touch
-            .cursor_pending
-            .iter()
-            .any(|edge| edge.button.is_some_and(|(_, down)| down))
-        {
-            if let Some(context) = self.touch_click_context() {
-                let due = self
-                    .touch
-                    .cursor_pending
-                    .last()
-                    .map_or(self.frames, |edge| edge.due);
-                self.touch.cursor_pending.push(CursorEdge {
-                    button: None,
-                    due,
-                    context,
-                });
-            }
-        } else {
-            self.touch_pointer(event_loop, at);
-        }
-    }
-    fn touch_cursor_event(
-        &mut self,
-        event_loop: &dyn EventLoopCtl,
-        id: u64,
-        phase: TouchPhase,
-        at: (f32, f32),
-        size: (f32, f32),
-    ) {
-        if phase == TouchPhase::Cancelled && !self.touch.cursor.surface_finger(id) {
-            self.touch_cursor_reset();
-            self.touch_cursor_flush(event_loop);
-            return;
-        }
-        if self.touch.cursor_screen != Some(self.key_screen()) {
-            self.touch_cursor_reset();
-            self.touch_cursor_flush(event_loop);
-            self.touch.cursor_screen = Some(self.key_screen());
-        }
-        let surface = self.touch.cursor.primary_finger() == Some(id);
-        let layout = self.visible_touch_layout(size.0, size.1);
-        let phase = match phase {
-            TouchPhase::Started => 0,
-            TouchPhase::Moved => 1,
-            TouchPhase::Ended => 2,
-            TouchPhase::Cancelled => 3,
-        };
-        self.touch
-            .cursor
-            .set_virtual_mouse(self.touch_menu_cursor_mode());
-        let events = self
-            .touch
-            .cursor
-            .event_controls(id, phase, at, size, &layout);
-        if surface || self.touch.cursor.primary_finger() == Some(id) {
-            self.touch.native_surface = Some((id, at));
-        }
-        for event in events {
-            match event {
-                touch::desktop::Action::Move(x, y) => self.touch_cursor_motion(event_loop, (x, y)),
-                touch::desktop::Action::Key(control, down) => {
-                    if down {
-                        if !self.touch.cursor_keys.contains(&control) {
-                            self.touch.cursor_keys.push(control);
-                        }
-                    } else {
-                        self.touch.cursor_keys.retain(|c| *c != control);
-                    }
-                    if control == Control::MiddleClick {
-                        self.touch_queue_cursor_button(MouseButton::Middle, down);
-                    }
-                    if control == Control::More && down {
-                        self.touch.more = !self.touch.more;
-                    }
-                    if control == Control::Hide && down {
-                        self.touch.hidden = !self.touch.hidden;
-                    }
-                    if let Some(key) = key_of(control) {
-                        let _ = self.touch_raw_key(key, down);
-                    }
-                    if self.touch.cursor_screen != Some(self.key_screen()) {
-                        self.touch_cursor_reset();
-                        self.touch_cursor_flush(event_loop);
-                        break;
-                    }
-                }
-                touch::desktop::Action::Button(right, down) => self.touch_queue_cursor_button(
-                    if right {
-                        MouseButton::Right
-                    } else {
-                        MouseButton::Left
-                    },
-                    down,
-                ),
-            }
-        }
-        self.touch_record_click_context();
-    }
-    fn touch_menu_mouse_held(&self, button: MouseButton) -> bool {
-        let (index, control) = match button {
-            MouseButton::Left => (0, Control::LeftClick),
-            MouseButton::Right => (1, Control::RightClick),
-            MouseButton::Middle => (2, Control::MiddleClick),
-            _ => return false,
-        };
-        (index < 2 && self.touch.cursor.held(index == 1))
-            || self.touch.cursor_keys.contains(&control)
-            || self.touch.native_mouse[index]
-            || self.touch.custom_mouse[index]
-    }
-    fn touch_queue_cursor_button(&mut self, button: MouseButton, _down: bool) {
-        let down = self.touch_menu_mouse_held(button);
-        let index = match button {
-            MouseButton::Left => 0,
-            MouseButton::Right => 1,
-            MouseButton::Middle => 2,
-            _ => return,
-        };
-        let previous = self
-            .touch
-            .cursor_pending
-            .iter()
-            .rev()
-            .find_map(|edge| {
-                edge.button
-                    .filter(|(b, _)| *b == button)
-                    .map(|(_, down)| down)
-            })
-            .unwrap_or(self.touch.cursor_down[index]);
-        if previous == down {
-            return;
-        }
-        let Some(context) = self
-            .touch
-            .cursor_delivery
-            .clone()
-            .or_else(|| self.touch_click_context())
-        else {
-            return;
-        };
-        let due = self
-            .touch
-            .cursor_pending
-            .iter()
-            .filter(|edge| edge.button.is_some_and(|(b, _)| b == button))
-            .map(|edge| edge.due + 1)
-            .max()
-            .unwrap_or(0)
-            .max(self.frames + 1);
-        self.touch.cursor_pending.push(CursorEdge {
-            button: Some((button, down)),
-            due,
-            context,
-        });
-    }
-    fn touch_cursor_frame(&mut self, event_loop: &dyn EventLoopCtl, playing: bool) {
-        self.touch_cursor_flush(event_loop);
-        if playing
-            || self
-                .touch
-                .cursor_screen
-                .is_some_and(|screen| screen != self.key_screen())
-        {
-            self.touch_cursor_reset();
-            self.touch_cursor_flush(event_loop);
-            return;
-        }
-        let now = self.touch_now();
-        if let Some(touch::desktop::Action::Move(x, y)) = self.touch.cursor.tick(now) {
-            self.touch_cursor_motion(event_loop, (x, y));
-        }
-        let had_pending=!self.touch.cursor_pending.is_empty();
-        while let Some(edge) = self.touch.cursor_pending.first() {
-            if edge.due > self.frames {
-                break;
-            }
-            if edge.context.screen != self.key_screen()
-                || self
-                    .touch_batch()
-                    .is_none_or(|batch| edge.context.size != (batch.width, batch.height))
-            {
-                self.touch_cursor_reset();
-                self.touch_cursor_flush(event_loop);
-                break;
-            }
-            if edge.button.is_some_and(|(_, down)| down) {
-                let context = edge.context.clone();
-                if self.touch.cursor_drawn != Some((context.screen, context.screen_at)) {
-                    self.touch_pointer(event_loop, context.at);
-                    self.touch.cursor_pending[0].due = self.frames + 1;
-                    break;
-                }
-                if context.guard != horizon_client::widgets::capture_pointer(context.screen_at) {
-                    self.touch_cursor_reset();
-                    self.touch_cursor_flush(event_loop);
-                    break;
-                }
-            }
-            let edge = self.touch.cursor_pending.remove(0);
-            if edge.button.is_some_and(|(button, down)| {
-                !down
-                    && !self.touch.cursor_down[if button == MouseButton::Middle {
-                        2
-                    } else {
-                        usize::from(button == MouseButton::Right)
-                    }]
-            }) {
-                continue;
-            }
-            let old_modifiers = self.modifiers;
-            let old_delivery = self.touch.cursor_delivery.replace(edge.context.clone());
-            self.modifiers = edge.context.modifiers;
-            self.touch_pointer(event_loop, edge.context.at);
-            if let Some((button, down)) = edge.button {
-                if down {
-                    for later in &mut self.touch.cursor_pending {
-                        if later.button == Some((button, false)) {
-                            later.due = later.due.max(self.frames + 1);
-                        }
-                    }
-                }
-                self.touch.cursor_down[if button == MouseButton::Middle {
-                    2
-                } else {
-                    usize::from(button == MouseButton::Right)
-                }] = down;
-                self.touch_mouse_button(event_loop, button, down);
-            }
-            self.modifiers = old_modifiers;
-            self.touch.cursor_delivery = old_delivery;
-            if self.touch.cursor_screen != Some(self.key_screen()) {
-                self.touch_cursor_reset();
-                self.touch_cursor_flush(event_loop);
-                break;
-            }
-        }
-        if had_pending && self.touch.cursor_pending.is_empty()
-            && !self.hardware_hides_touch()
-            && let Some(at) = self.touch.cursor.position
-        {
-            self.touch_pointer(event_loop, at);
-        }
-        self.touch_record_click_context();
-    }
-}
-
-#[cfg(target_os = "ios")]
-fn gesture_modifiers(bits: u32) -> winit::keyboard::ModifiersState {
-    use winit::keyboard::ModifiersState as M;
-    let mut value = M::empty();
-    for (bit, flag) in [(1, M::SHIFT), (2, M::CONTROL), (4, M::ALT), (8, M::SUPER)] {
-        value.set(flag, bits & bit != 0);
-    }
-    value
-}
-
-#[cfg(target_os = "ios")]
-fn gesture_key(code: u16) -> Option<KeyCode> {
-    let name = match code {
-        65..=90 => format!("key.keyboard.{}", char::from_u32(u32::from(code) + 32)?),
-        48..=57 => format!("key.keyboard.{}", char::from_u32(u32::from(code))?),
-        290..=314 => format!("key.keyboard.f{}", code - 289),
-        320..=329 => format!("key.keyboard.keypad.{}", code - 320),
-        _ => format!(
-            "key.keyboard.{}",
-            match code {
-                39 => "apostrophe",
-                44 => "comma",
-                45 => "minus",
-                46 => "period",
-                47 => "slash",
-                59 => "semicolon",
-                61 => "equal",
-                91 => "left.bracket",
-                92 => "backslash",
-                93 => "right.bracket",
-                96 => "grave.accent",
-                280 => "caps.lock",
-                281 => "scroll.lock",
-                282 => "num.lock",
-                283 => "print.screen",
-                284 => "pause",
-                330 => "keypad.period",
-                331 => "keypad.divide",
-                332 => "keypad.multiply",
-                333 => "keypad.subtract",
-                334 => "keypad.add",
-                335 => "keypad.enter",
-                336 => "keypad.equal",
-                32 => "space",
-                256 => "escape",
-                257 => "enter",
-                258 => "tab",
-                259 => "backspace",
-                260 => "insert",
-                261 => "delete",
-                262 => "right",
-                263 => "left",
-                264 => "down",
-                265 => "up",
-                266 => "page.up",
-                267 => "page.down",
-                268 => "home",
-                269 => "end",
-                340 => "left.shift",
-                341 => "left.control",
-                342 => "left.alt",
-                343 => "left.win",
-                344 => "right.shift",
-                345 => "right.control",
-                346 => "right.alt",
-                347 => "right.win",
-                _ => return None,
-            }
-        ),
-    };
-    horizon_client::keybinds::key_code(&name)
-}
-
-#[cfg(target_os = "ios")]
-impl Game<'_> {
-    fn touch_raw_holds_mouse_mapping(&self, button: MouseButton) -> bool {
-        for (index, raw, control) in [
-            (0, MouseButton::Left, Control::LeftClick),
-            (1, MouseButton::Right, Control::RightClick),
-            (2, MouseButton::Middle, Control::MiddleClick),
-        ] {
-            let held = self.touch.fingers.held(control)
-                || (index < 2 && self.touch.cursor.held(index == 1))
-                || self.touch.cursor_keys.contains(&control)
-                || self.touch.cursor_down[index]
-                || self.touch.native_mouse.get(index).copied().unwrap_or(false)
-                || self.touch.custom_mouse[index];
-            if held
-                && self
-                    .settings
-                    .keys
-                    .translate_mouse_all(raw)
-                    .contains(&Err(button))
-            {
-                return true;
-            }
-        }
-        for control in [
-            Control::Forward,
-            Control::Back,
-            Control::Left,
-            Control::Right,
-            Control::Jump,
-            Control::Sneak,
-            Control::Perspective,
-            Control::Chat,
-            Control::Pause,
-            Control::Inventory,
-            Control::Sprint,
-            Control::Debug,
-            Control::PlayerList,
-        ] {
-            if (self.touch.fingers.held(control) || self.touch.cursor_keys.contains(&control))
-                && let Some(raw) = key_of(control)
-                && self.settings.keys.translate_all(raw).contains(&Err(button))
-            {
-                return true;
-            }
-        }
-        self.touch
-            .native_keys
-            .iter()
-            .chain(self.touch.custom_keys.iter())
-            .any(|raw| {
-                self.settings
-                    .keys
-                    .translate_all(*raw)
-                    .contains(&Err(button))
-            })
-    }
-    fn touch_native_handoff(&mut self) {
-        self.touch_native_reset();
-        // Discard old menu gestures without disabling recognition for a fresh
-        // touch that arrives before the next rendered frame.
-        horizon_ios_launcher::touch_gestures(self.key_screen(), 4, (0.0, 0.0), 1.0);
-    }
-    fn touch_native_reset(&mut self) {
-        self.touch.native_pending.clear();
-        self.touch.native_screen = None;
-        let mut keys = std::mem::take(&mut self.touch.native_keys);
-        keys.extend(std::mem::take(&mut self.touch.custom_keys));
-        for raw in keys {
-            let _ = self.touch_raw_key(raw, false);
-        }
-        for (i, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
-            .into_iter()
-            .enumerate()
-        {
-            let native = std::mem::take(&mut self.touch.native_mouse[i]);
-            let custom = std::mem::take(&mut self.touch.custom_mouse[i]);
-            if native || custom {
-                let _ = self.touch_raw_button(button, false);
-            }
-        }
-    }
-    fn touch_custom_activity(&mut self) {
-        self.touch.seen = true;
-        self.touch.hardware.touch();
-        self.last_input = Instant::now();
-    }
-    fn touch_custom_keyboard(&mut self, event_loop: &dyn EventLoopCtl, key: KeyCode, down: bool) {
-        if down {
-            self.touch_custom_activity();
-        }
-        let Some(id) = self.window.as_ref().map(|window| window.id()) else {
-            return;
-        };
-        self.touch_window_event(
-            event_loop,
-            id,
-            WindowEvent::KeyboardInput {
-                device_id: DeviceId::dummy(),
-                is_synthetic: true,
-                event: winit::event::KeyEvent::from_virtual_key(
-                    key,
-                    if down {
-                        ElementState::Pressed
-                    } else {
-                        ElementState::Released
-                    },
-                ),
-            },
-        );
-    }
-    fn touch_native_input(
-        &mut self,
-        event_loop: &dyn EventLoopCtl,
-        input: touch::desktop::Physical,
-    ) {
-        use touch::desktop::Physical;
-        match input {
-            Physical::Key(code, down) | Physical::CustomKey(code, down) => {
-                let custom = matches!(input, Physical::CustomKey(..));
-                if let Some(raw) = gesture_key(code) {
-                    let owners = if custom {
-                        &mut self.touch.custom_keys
-                    } else {
-                        &mut self.touch.native_keys
-                    };
-                    if !down && !owners.contains(&raw) {
-                        return;
-                    }
-                    if down {
-                        if !owners.contains(&raw) {
-                            owners.push(raw);
-                        }
-                    } else {
-                        owners.retain(|key| *key != raw);
-                    }
-                    if !down && self.touch_key_held(raw) {
-                        return;
-                    }
-                    if custom {
-                        self.touch_custom_keyboard(event_loop, raw, down);
-                        return;
-                    }
-                    if let Err(error) = self.touch_raw_key(raw, down) {
-                        log::warn!("Horizon: touch key: {error}");
-                    }
-                }
-            }
-            Physical::Mouse(index, down) | Physical::CustomMouse(index, down) if index < 3 => {
-                if matches!(input, Physical::CustomMouse(..)) {
-                    if down {
-                        self.touch_custom_activity();
-                    }
-                    self.touch.custom_mouse[index as usize] = down;
-                } else {
-                    self.touch.native_mouse[index as usize] = down;
-                }
-                if !down
-                    && (self.touch.custom_mouse[index as usize]
-                        || self.touch.native_mouse[index as usize])
-                {
-                    return;
-                }
-                let button = match index {
-                    0 => MouseButton::Left,
-                    1 => MouseButton::Right,
-                    _ => MouseButton::Middle,
-                };
-                if self.touch_playing() {
-                    if down {
-                        self.touch_grab();
-                    }
-                    if let Err(error) = self.touch_raw_button(button, down) {
-                        log::warn!("Horizon: touch button: {error}");
-                    }
-                } else {
-                    self.touch.cursor_screen = Some(self.key_screen());
-                    self.touch_queue_cursor_button(button, down);
-                }
-            }
-            Physical::Scroll(x, y) => self.touch_scroll(event_loop, x as f32, y as f32),
-            Physical::Keyboard => self.toggle_system_keyboard(),
-            Physical::ToggleControls => {
-                let scale = self.touch_batch().map_or(1.0, |b| b.scale);
-                let _ = self.touch_act(vec![Out::Press(Control::Hide)], scale);
-            }
-            Physical::Cancel => self.touch_native_reset(),
-            _ => {}
-        }
-    }
-    fn touch_native_frame(&mut self, event_loop: &dyn EventLoopCtl) {
-        let screen = self.key_screen();
-        if self.touch.native_screen.is_some_and(|old| old != screen) {
-            self.touch_native_reset();
-        }
-        self.touch.native_screen = Some(screen);
-        let Some(batch) = self.touch_batch() else {
-            return;
-        };
-        let blocked = horizon_ios_launcher::covered();
-        let no_world = self.player.is_none() || self.title.is_some();
-        let flags = u32::from(self.touch_playing())
-            | if blocked { 2 } else { 0 }
-            | if no_world { 8 } else { 0 }
-            | if self.touch.hidden { 16 } else { 0 }
-            | if self.touch.more { 32 } else { 0 }
-            | if self.touch_close_shown() { 64 } else { 0 }
-            | if self.touch_shown() && self.field_focused() {
-                128
-            } else {
-                0
-            }
-            | if self.hardware_hides_touch() { 256 } else { 0 };
-        self.touch_record_click_context();
-        let events = horizon_ios_launcher::touch_gestures(
-            screen,
-            flags,
-            (f64::from(batch.width), f64::from(batch.height)),
-            f64::from(batch.scale),
-        );
-        let now = self.touch_now();
-        let (due, later) = std::mem::take(&mut self.touch.native_pending)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(_, deadline, frame)| {
-                *deadline <= now && *frame <= self.frames
-            });
-        self.touch.native_pending = later;
-        for (input, _, _) in due {
-            self.touch_native_input(event_loop, input);
-        }
-        for event in events {
-            if self.key_screen() != screen {
-                self.touch_native_reset();
-                break;
-            }
-            let context = self
-                .touch
-                .click_contexts
-                .iter()
-                .find(|(id, _)| *id == event.context)
-                .map(|(_, c)| c.clone());
-            if event.context != 0 && context.is_none() {
-                continue;
-            }
-            let context = context.or_else(|| self.touch_click_context());
-            let context = context.map(|mut context| {
-                context.modifiers = gesture_modifiers(event.modifiers);
-                if event.kind == 1 {
-                    if !self.touch_menu_cursor_mode() {
-                        context.at = (event.point.0 as f32, event.point.1 as f32);
-                    } else if let Some((id, at)) = context.surface
-                        && id == event.touch
-                    {
-                        context.at.0 =
-                            (context.at.0 + event.point.0 as f32 - at.0).clamp(0.0, context.size.0);
-                        context.at.1 =
-                            (context.at.1 + event.point.1 as f32 - at.1).clamp(0.0, context.size.1);
-                    }
-                    let screen_at = self.touch_render_point(context.at);
-                    if context.screen_at != screen_at {
-                        context.screen_at = screen_at;
-                        context.guard = horizon_client::widgets::capture_pointer(screen_at);
-                    }
-                }
-                context
-            });
-            let recognized = touch::desktop::Recognized {
-                kind: event.kind,
-                phase: event.phase,
-                slot: event.slot,
-                point: event.point,
-            };
-            for (delay, input) in
-                recognized.inputs(self.touch_playing(), no_world || touch::mouse_gestures())
-            {
-                if delay == 0.0 {
-                    let old_modifiers = self.modifiers;
-                    let old_context = self.touch.cursor_delivery.clone();
-                    if let Some(context) = context.clone() {
-                        self.modifiers = context.modifiers;
-                        self.touch.cursor_delivery = Some(context);
-                    }
-                    self.touch_native_input(event_loop, input);
-                    self.modifiers = old_modifiers;
-                    self.touch.cursor_delivery = old_context;
-                } else {
-                    self.touch.native_pending.push((
-                        input,
-                        now + (delay - event.age).max(0.0),
-                        self.frames + 1,
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl Game<'_> {
-    // Title-screen taps must target the visible button directly, even when the
-    // player's in-world menus use a virtual pointer with separate click buttons.
-    fn touch_menu_cursor_mode(&self) -> bool {
-        self.player.is_some() && self.title.is_none() && touch::cursor_mode()
-    }
-
-    fn visible_touch_layout(&self, w: f32, h: f32) -> Vec<(Control, touch::Rect)> {
-        touch::layout(w, h)
-            .into_iter()
-            .filter(|(c, _)| {
-                // No controller overlay outside a world, including stale player
-                // state while returning to the title. Painting and hit tests agree.
-                if self.player.is_none() || self.title.is_some() {
-                    return false;
-                }
-                if self.touch.hidden {
-                    matches!(c, Control::Hide | Control::Hotbar(_))
-                } else {
-                    self.touch.more
-                        || !matches!(
-                            c,
-                            Control::Perspective
-                                | Control::Chat
-                                | Control::Debug
-                                | Control::PlayerList
-                        )
-                }
-            })
-            .collect()
-    }
-}
-fn draw_amethyst_control(
-    batch: &mut HudBatch,
-    atlas: &horizon_client::hud::HudAtlas,
-    c: Control,
-    r: touch::Rect,
-    held: bool,
-    point: Option<(f32, f32)>,
-) {
-    let start = batch.vertices.len();
-    if c == Control::Joystick {
-        let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
-        horizon_client::ui_theme::touch_disc(
-            atlas,
-            batch,
-            centre,
-            r[2] * 0.375 + 0.25,
-            rgba(0, 0, 0, 77),
-        );
-        horizon_client::ui_theme::touch_disc(
-            atlas,
-            batch,
-            point.unwrap_or(centre),
-            r[2] / 8.0,
-            rgba(0, 0, 0, 255),
-        );
-    } else {
-        let label = match c {
-            Control::More => "More",
-            Control::Hide => "Hide\nGUI",
-            Control::Runtime => "Runtime\nMenu",
-            Control::Debug => "Debug\nMenu",
-            Control::PlayerList => "Player\nList",
-            Control::Jump => "Jump",
-            Control::Sneak => "Shift",
-            Control::Sprint => "Sprint",
-            Control::LeftClick => "Left\nClick",
-            Control::RightClick => "Right\nClick",
-            Control::MiddleClick => "Middle\nClick",
-            Control::Perspective => "Third\nperson",
-            Control::Chat => "Chat",
-            Control::Pause => "Pause",
-            Control::Inventory => "Inventory",
-            Control::Forward => "W",
-            Control::Back => "S",
-            Control::Left => "A",
-            Control::Right => "D",
-            _ => "",
-        };
-        horizon_client::ui_theme::touch_control(atlas, batch, r, label, held);
-    }
-    for v in &mut batch.vertices[start..] {
-        v.color =
-            (v.color & 0x00ffffff) | ((((v.color >> 24) as f32 * touch::opacity(c)) as u32) << 24);
-    }
-}
-
-fn draw_lock(
-    batch: &mut HudBatch,
-    atlas: &horizon_client::hud::HudAtlas,
-    r: touch::Rect,
-    locked: bool,
-) {
-    let (cx, cy) = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
-    horizon_client::ui_theme::touch_disc(
-        atlas,
-        batch,
-        (cx, cy),
-        r[2] / 2.0,
-        if locked {
-            rgba(130, 110, 190, 230)
-        } else {
-            rgba(60, 60, 60, 200)
-        },
-    );
-    let u = r[2] / 10.0;
-    let ink = rgba(255, 255, 255, 240);
-    batch.fill(atlas, cx - 3.0 * u, cy, 6.0 * u, 4.0 * u, ink);
-    batch.fill(atlas, cx - 2.0 * u, cy - 3.0 * u, 4.0 * u, u, ink);
-    batch.fill(atlas, cx - 2.0 * u, cy - 2.0 * u, u, 2.0 * u, ink);
-    batch.fill(atlas, cx + u, cy - 2.0 * u, u, 2.0 * u, ink);
 }

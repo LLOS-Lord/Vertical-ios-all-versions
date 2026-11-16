@@ -1280,6 +1280,11 @@ impl Streaming {
             self.submit(None, 0, Job::Free(meshes));
         }
     }
+    /// A memory warning: the pool's workers give back what they keep between
+    /// jobs now, without waiting out the idle delay; loaded chunks stay.
+    pub fn release_memory(&self) {
+        horizon_threads::jobs::pool().trim();
+    }
     /// The columns the server unloaded (ClientboundForgetLevelChunkPacket),
     /// often thousands at once (a teleport or a moved view): their pending
     /// sections go through [`forget_pending_sections`]. Returns the chunks

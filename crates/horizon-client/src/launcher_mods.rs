@@ -84,7 +84,9 @@ fn mods_dir(home: &Path) -> PathBuf {
 }
 
 fn read_source_meta(home: &Path, mod_id: &str) -> Option<StoredSourceMeta> {
-    let path = mods_dir(home).join(".sources").join(format!("{mod_id}.json"));
+    let path = mods_dir(home)
+        .join(".sources")
+        .join(format!("{mod_id}.json"));
     let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -130,17 +132,18 @@ fn owned_namespaces(id: &str, extra: &[String]) -> Vec<String> {
 pub fn list_installed(home: &Path) -> Vec<InstalledModRow> {
     let dir = mods_dir(home);
     let mod_list = ModList::load(home);
-    let browser_manifest: BTreeMap<String, Value> = fs::read_to_string(home.join(MOD_BROWSER_MANIFEST))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v["entries"].as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|e| {
-            let id = e["id"].as_str()?.to_owned();
-            Some((id, e))
-        })
-        .collect();
+    let browser_manifest: BTreeMap<String, Value> =
+        fs::read_to_string(home.join(MOD_BROWSER_MANIFEST))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v["entries"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let id = e["id"].as_str()?.to_owned();
+                Some((id, e))
+            })
+            .collect();
 
     let mut rows = Vec::new();
     for path in horizon_mods::find(&dir) {
@@ -244,9 +247,11 @@ pub fn list_installed(home: &Path) -> Vec<InstalledModRow> {
     }
 
     rows.sort_by(|a, b| {
-        b.enabled
-            .cmp(&a.enabled)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        b.enabled.cmp(&a.enabled).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
     });
     rows
 }
@@ -263,7 +268,11 @@ fn clean_mod_id(raw: &str) -> Option<&str> {
 }
 
 /// Enable or disable an installed mod in `Documents/horizon-mods.txt`.
-pub fn set_enabled(home: &Path, mod_id: &str, enabled: bool) -> Result<Vec<InstalledModRow>, String> {
+pub fn set_enabled(
+    home: &Path,
+    mod_id: &str,
+    enabled: bool,
+) -> Result<Vec<InstalledModRow>, String> {
     let id = clean_mod_id(mod_id).ok_or("invalid mod id")?;
     let mut list = ModList::load(home);
     if enabled {

@@ -100,7 +100,7 @@ final class GameOptions: ObservableObject {
     static let groups: [Category] = [
         Category(title: "Video", icon: "display", rows: [
             Row(key: "graphicsPreset", title: "Graphics",
-                names: ["fast": "Fast", "fancy": "Fancy", "fabulous": "Fabulous!", "custom": "Custom"]),
+                names: ["low": "Low", "fast": "Fast", "fancy": "Fancy", "fabulous": "Fabulous!", "custom": "Custom"]),
             Row(key: "renderDistance", title: "Render Distance", format: { "\(Int($0)) chunks" }, cap: 32),
             Row(key: "simulationDistance", title: "Simulation Distance", format: { "\(Int($0)) chunks" }),
             Row(key: "maxFps", title: "Max Framerate", format: { $0 >= 260 ? "Unlimited" : "\(Int($0)) fps" }),
@@ -138,7 +138,6 @@ struct SettingsPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            TouchControlsSettings()
             SectionHeader(title: "Game files")
             SecondaryButton(title: "Manage Game Versions (\(link.version))", icon: "square.stack.3d.up") {
                 link.showingVersionBrowser = true

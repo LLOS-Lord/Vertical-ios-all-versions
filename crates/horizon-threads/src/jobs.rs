@@ -137,6 +137,9 @@ struct Inner {
     finished: Condvar,
     /// Workers running a [`Class::Far`] job.
     far: AtomicUsize,
+    /// Bumped by [`Pool::trim`]: each worker that has not seen the current
+    /// value frees what it keeps between jobs without waiting to be idle.
+    trim: AtomicU64,
     /// Workers that freed their buffers and took no job since.
     released: AtomicUsize,
     threads: AtomicUsize,
@@ -213,6 +216,7 @@ impl Pool {
             wake: Condvar::new(),
             finished: Condvar::new(),
             far: AtomicUsize::new(0),
+            trim: AtomicU64::new(0),
             released: AtomicUsize::new(0),
             threads: AtomicUsize::new(threads.max(1)),
             idle_release,
@@ -273,6 +277,14 @@ impl Pool {
 
     /// Wake every worker: many jobs were queued at once.
     pub fn notify_all(&self) {
+        self.inner.notify(true);
+    }
+
+    /// A memory warning: wake every worker to give back what it keeps between
+    /// jobs now, without waiting out the idle delay, and then the allocator's
+    /// free pages.
+    pub fn trim(&self) {
+        self.inner.trim.fetch_add(1, Ordering::SeqCst);
         self.inner.notify(true);
     }
 }
@@ -424,7 +436,18 @@ fn work(inner: &Inner, worker: usize) {
     // wait: with jobs queued every few seconds on some worker, a pool of idle
     // workers would otherwise never free anything.
     let mut idle_since = Instant::now();
+    let mut seen_trim = inner.trim.load(Ordering::SeqCst);
     loop {
+        let trim = inner.trim.load(Ordering::SeqCst);
+        if trim != seen_trim {
+            seen_trim = trim;
+            // A memory warning ([`Pool::trim`]): free what this worker keeps
+            // now, as the idle wait would.
+            if !released {
+                release_worker_state(inner, worker);
+                released = true;
+            }
+        }
         let epoch = inner.epoch.load(Ordering::SeqCst);
         if let Some((entry, far)) = choose(inner) {
             if released {
@@ -478,29 +501,37 @@ fn work(inner: &Inner, worker: usize) {
         }
         // Nothing to do for a while (a server nobody is on, a player standing
         // still): free this worker's buffers until the next job needs them.
+        release_worker_state(inner, worker);
         released = true;
-        let last = inner.released.fetch_add(1, Ordering::Relaxed) + 1
-            == inner.threads.load(Ordering::Relaxed);
-        let sources: Vec<_> = inner
-            .sources
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|e| e.source.clone())
-            .collect();
-        for source in &sources {
-            let _ = catch_unwind(AssertUnwindSafe(|| source.idle(worker)));
-        }
-        if last {
-            for source in &sources {
-                let _ = catch_unwind(AssertUnwindSafe(|| source.all_idle()));
-            }
-        }
-        // The allocator keeps freed pages until memory runs short: hand back
-        // what this worker just freed (its own heap), and the shared arenas'
-        // once every worker has.
-        crate::release_free_memory();
     }
+}
+
+/// Worker `worker` frees what it keeps between jobs in every source, now. The
+/// last worker to do so also tells the sources every worker is idle. The
+/// caller sets its own `released` flag and drops no lock: this touches only
+/// the sources' per-worker state.
+fn release_worker_state(inner: &Inner, worker: usize) {
+    let last =
+        inner.released.fetch_add(1, Ordering::Relaxed) + 1 == inner.threads.load(Ordering::Relaxed);
+    let sources: Vec<_> = inner
+        .sources
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|e| e.source.clone())
+        .collect();
+    for source in &sources {
+        let _ = catch_unwind(AssertUnwindSafe(|| source.idle(worker)));
+    }
+    if last {
+        for source in &sources {
+            let _ = catch_unwind(AssertUnwindSafe(|| source.all_idle()));
+        }
+    }
+    // The allocator keeps freed pages until memory runs short: hand back
+    // what this worker just freed (its own heap), and the shared arenas'
+    // once every worker has.
+    crate::release_free_memory();
 }
 
 #[cfg(test)]

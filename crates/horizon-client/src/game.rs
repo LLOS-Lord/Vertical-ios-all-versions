@@ -256,6 +256,7 @@ mod machines;
 mod maps;
 mod melee;
 mod memory;
+mod memory_warning;
 mod menu_clicks;
 mod minecarts;
 #[cfg(test)]
@@ -2149,6 +2150,7 @@ struct Game<'a> {
     rest_loader: Option<WorldRestLoader>,
     pending_entry: Option<PendingWorldEntry>,
     quit_to_launcher: bool,
+    restart_for_active_version: bool,
     /// `DebugEntryChunkGeneration`'s `lastPos` and `result`: F3's `Density` line is sampled
     /// again only when the feet block (or the dimension) changes.
     debug_density: RefCell<debug_keys::DensityCache>,
@@ -2973,6 +2975,9 @@ struct Game<'a> {
     debug_options: Option<debug_options::DebugOptionsUi>,
     /// `DebugEntryMemory`'s readings (game/debug_lines.rs).
     memory_meter: std::cell::RefCell<horizon_client::debug_overlay::MemoryMeter>,
+    /// iOS memory warnings: how many came close together, and whether the
+    /// render distance is lowered (game/memory_warning.rs).
+    memory: memory_warning::Memory,
     /// The F3 overlay's vertices between rebuilds (`draw_debug_overlay_under`).
     debug_paint: RefCell<horizon_client::debug_overlay::PaintCache>,
     /// The F3 overlay's last reading of the refresh rate, and when it was taken.
@@ -5584,6 +5589,57 @@ impl Game<'_> {
             PresenceStatus::Online
         }
     }
+    /// A memory warning (iOS `applicationDidReceiveMemoryWarning`): give back
+    /// what can be given back, and lower the render distance when the warnings
+    /// come close together in a singleplayer world at a long distance.
+    pub(super) fn on_memory_warning(&mut self, now: Instant) {
+        self.streaming.release_memory();
+        horizon_threads::release_free_memory();
+        // A remote server's chunks are not ours to unload, and without a world
+        // (or a player) there is no render distance in use. The warning still
+        // counts: while lowered, it postpones the restore.
+        let second = self.memory.note_warning(now);
+        if self.player.is_none() || self.integrated.is_none() || self.memory.is_lowered() {
+            return;
+        }
+        if self.settings.render_distance <= memory_warning::LOWER_ABOVE || !second {
+            return;
+        }
+        self.memory.lower();
+        self.apply_memory_radius();
+        self.system_message(horizon_client::text::Text::literal(format!(
+            "Running low on memory: render distance lowered to {} until the pressure passes",
+            memory_warning::LOWER_RADIUS
+        )));
+    }
+    /// The restore side of [`Game::on_memory_warning`], once a quiet while has
+    /// passed; leaving the world forgets the lowering.
+    fn memory_tick(&mut self, now: Instant) {
+        if self.player.is_none() {
+            let lowered = self.memory.is_lowered();
+            self.memory.close_world();
+            if lowered {
+                self.apply_memory_radius();
+            }
+            return;
+        }
+        if self.memory.is_lowered() {
+            // A dimension change or a view distance packet sets the radius
+            // again: the lowering holds until it is restored.
+            self.apply_memory_radius();
+        }
+        if self.memory.restore_due(now) {
+            self.memory.restore();
+            self.apply_memory_radius();
+            self.system_message(horizon_client::text::Text::literal(format!(
+                "Memory pressure gone: render distance restored to {}",
+                self.settings.render_distance
+            )));
+        }
+    }
+    fn apply_memory_radius(&mut self) {
+        self.streaming.radius = self.memory.effective(self.settings.render_distance);
+    }
     fn tick(&mut self) -> Result<()> {
         if self.agent.hold_server {
             return Ok(());
@@ -5922,9 +5978,16 @@ impl Game<'_> {
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_over_hud(&mut batch);
+        // The touch buttons over a menu, under the arrow they move.
+        self.draw_touch_menu_pad(&mut batch);
         // Finalize touch input after every screen, including title/options early
         // returns and prompts. Queued clicks require this drawn-pointer acknowledgement.
         self.draw_touch_close(&mut batch);
+        // Last of all, over every screen: the pointer is drawn by the game, so it must not be
+        // missed on the screens that return early (options, win, debug options).
+        self.draw_touch_cursor(&mut batch);
+        #[cfg(target_os = "ios")]
+        self.draw_hardware_cursor(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
@@ -6021,7 +6084,9 @@ impl Game<'_> {
         // the sleep overlay, debug screen and open screens still draw.
         let spectator = self.spectator();
         let (wi, hi) = (w as i32, h as i32);
-        let show_hud = !self.ui.hide_gui && !self.replay.playing();
+        // The hide-HUD button hides the HUD, the touch controls with it; the controls still take
+        // touches where they were, so a remembered tap brings the HUD back.
+        let show_hud = !self.ui.hide_gui && !self.replay.playing() && !self.touch.hud_hidden;
         // Hud.extractRenderState asks `Screen.isInGameUi` twice: such a screen
         // defers the subtitles over itself, and keeps them while F1 hides the
         // rest of the HUD.
@@ -10018,7 +10083,7 @@ impl Game<'_> {
                 )
             )
         {
-            if !self.touch_synthetic_input() {self.input_keyboard_used();}
+            self.input_keyboard_used();
         }
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && event.state == ElementState::Pressed
@@ -11569,6 +11634,7 @@ impl<'a> Game<'a> {
             rest_loader: None,
             pending_entry: None,
             quit_to_launcher: false,
+            restart_for_active_version: false,
             debug_density: RefCell::default(),
             pending_pack_reload: false,
             frame_attempted: render_settings::FrameAttempt::default(),
@@ -12032,6 +12098,7 @@ impl<'a> Game<'a> {
             ),
             debug_options: None,
             memory_meter: Default::default(),
+            memory: Default::default(),
             debug_paint: Default::default(),
             debug_refresh: Default::default(),
             gpu_utilization: 0.0,

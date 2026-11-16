@@ -1,21 +1,31 @@
 import SwiftUI
 import UIKit
 
+// Presentation requests can overlap while the Rust bridge acknowledges them.
+private var presentationPending = false
+
+/// The orientation the last `turn` asked for, kept for the repairs below (see `verify`). The count
+/// lets a check queued by an older turn stand down when a newer one took over.
+private var rotationTarget: UIInterfaceOrientationMask = .landscape
+private var rotationCount = 0
+private var rotationWatchInstalled = false
+
 /// The C entry point `horizon-ios-launcher` looks up: show the launcher while the engine is stopped or starting. Play dismisses it; the game's Quit Game asks for it again. `submit` is how the
 /// launcher asks the game things (Bridge.swift). Called on the main thread; the presenting waits a turn of the
 /// run loop, because at startup the game's view controller may not be on screen yet while its first frame is
 /// being set up.
 @_cdecl("horizon_launcher_present")
 public func horizonLauncherPresent(_ submit: HorizonSubmit?) -> Bool {
-    Diagnostics.record("Launcher presented")
     Bridge.submit = submit
     Theme.registerFonts()
-    DispatchQueue.main.async { present(attempts: 20) }
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    Diagnostics.record("launcher presented; Horizon \(version) on iOS \(UIDevice.current.systemVersion)")
+    DispatchQueue.main.async {
+        watchRotations()
+        present(attempts: 20)
+    }
     return true
 }
-
-// Presentation requests can overlap while the Rust bridge acknowledges them.
-private var presentationPending = false
 
 private func present(attempts: Int) {
     guard let root = gameViewController(), root.view.window != nil else {
@@ -31,7 +41,6 @@ private func present(attempts: Int) {
     if root is LauncherHostingController || presentationPending {
         return
     }
-    TouchGestureBridge.shared.attach(to: root.view)
     presentationPending = true
     let host = LauncherHostingController(rootView: AnyView(EmptyView()))
     host.rootView = AnyView(
@@ -41,19 +50,17 @@ private func present(attempts: Int) {
             let scene = host.view.window?.windowScene
             host.dismiss(animated: true) {
                 Task { @MainActor in
+                    // The window allows only landscape again before the phone turns back.
                     _ = await Bridge.send("launcher-visible false")
                     turn(scene, to: .landscape)
                 }
             }
         })
-
     )
     host.modalPresentationStyle = .fullScreen
-    host.modalPresentationCapturesStatusBarAppearance = true
     host.modalTransitionStyle = .crossDissolve
     Task { @MainActor in
-        // iOS 16 can retain the game's landscape geometry if presentation and
-        // rotation race the underlying controller's supported-mask change.
+        // The launcher turns with the device, so the window must allow portrait before it is presented.
         _ = await Bridge.send("launcher-visible true")
         guard root.view.window != nil else {
             presentationPending = false
@@ -62,7 +69,6 @@ private func present(attempts: Int) {
         }
         root.present(host, animated: false) {
             presentationPending = false
-            turn(host.view.window?.windowScene, to: UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait)
         }
     }
 }
@@ -70,17 +76,190 @@ private func present(attempts: Int) {
 /// Ask the scene to turn to `orientations` now, rather than when the phone is next moved.
 func turn(_ scene: UIWindowScene?, to orientations: UIInterfaceOrientationMask) {
     guard let scene else { return }
-    for window in scene.windows {
-        window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-        var top = window.rootViewController
-        while let next = top?.presentedViewController {
-            top = next
+    watchRotations()
+    rotationCount += 1
+    let count = rotationCount
+    rotationTarget = orientations
+    if #available(iOS 16.0, *) {
+        let current = mask(for: scene.effectiveGeometry.interfaceOrientation)
+        Diagnostics.record("orientation turn to \(label(orientations)) from \(current.map(label) ?? "unknown"), device \(UIDevice.current.orientation.rawValue), window \(sizeText(scene.windows.first?.bounds.size ?? .zero)), screen \(sizeText(scene.screen.bounds.size))")
+        // `launcher-visible` changes the game's mask, and UIKit may already be turning the scene
+        // because of it. A second geometry request in the middle of that turn leaves the window at
+        // the intersection of the portrait and landscape sizes (a square game view on iOS 16), so
+        // only ask when the scene is still somewhere the target does not allow.
+        if let current, orientations.contains(current) {
+            verify(scene, count: count, attempt: 1, after: 0.8)
+            return
         }
-        top?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        for window in scene.windows {
+            window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            var top = window.rootViewController
+            while let next = top?.presentedViewController {
+                top = next
+            }
+            top?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+        // Let those updates reach UIKit before the request, so the two do not race.
+        DispatchQueue.main.async {
+            guard count == rotationCount else { return }
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: orientations)) { error in
+                NSLog("Horizon orientation request failed: %@", error.localizedDescription)
+                Diagnostics.record("orientation request failed: \(error.localizedDescription)")
+            }
+        }
+    } else {
+        // iOS 15 has no scene geometry request: UIKit turns when a view controller that supports the
+        // orientations is presented, and asks again after this nudge.
+        UIViewController.attemptRotationToDeviceOrientation()
     }
-    scene.requestGeometryUpdate(.iOS(interfaceOrientations: orientations)) { error in
-        NSLog("Horizon orientation request failed: %@", error.localizedDescription)
+    verify(scene, count: count, attempt: 1, after: 0.8)
+}
+
+/// Every physical turn is a chance for UIKit to stop a turn half-way, and the same can be left
+/// behind by the launch itself: check the window after one (see `verify`).
+private func watchRotations() {
+    guard !rotationWatchInstalled else { return }
+    rotationWatchInstalled = true
+    UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+    let check: (Notification) -> Void = { _ in
+        guard let scene = windowScene() else { return }
+        verify(scene, count: rotationCount, attempt: 1, after: 0.6)
     }
+    NotificationCenter.default.addObserver(
+        forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main, using: check)
+    NotificationCenter.default.addObserver(
+        forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main, using: check)
+    // The launch itself may have ended in a wrong window before anything asked for an orientation.
+    if let scene = windowScene() {
+        verify(scene, count: rotationCount, attempt: 1, after: 1.2)
+    }
+}
+
+/// A turn UIKit could not finish leaves the window at the intersection of the portrait and
+/// landscape sizes — the game draws into a square beside black — and nothing lays it out again, so
+/// it stays that way until the app is restarted. Look once the turn had time to finish, ask the
+/// scene one more time, and as a last resort take the screen's size back for the orientation the
+/// scene is actually in and lay the views out so winit sends a new `Resized`.
+private func verify(
+    _ scene: UIWindowScene, count: Int, attempt: Int, after delay: TimeInterval,
+    waited: Int = 0
+) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        guard count == rotationCount else { return }
+        // Presenting lays the views out itself, but a stopped turn found here must not be dropped:
+        // check again once the presentation settles.
+        guard !presentationPending else {
+            if waited < 6 {
+                verify(scene, count: count, attempt: attempt, after: 0.5, waited: waited + 1)
+            }
+            return
+        }
+        guard let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first else { return }
+        let screen = scene.screen.bounds.size
+        let bounds = window.bounds.size
+        let short = min(screen.width, screen.height)
+        let long = max(screen.width, screen.height)
+        // The launcher turns with the device, so the size the window must have is the screen's in
+        // the scene's own orientation. A transposed window (the intersection size, or the previous
+        // turn's) is wrong here even though it is one of the screen's two sizes.
+        let orientation = sceneOrientation(scene)
+        let expected: CGSize? = orientation.isPortrait ? CGSize(width: short, height: long)
+            : orientation.isLandscape ? CGSize(width: long, height: short) : nil
+        let covers = expected.map { fills(bounds, $0) } ?? (
+            (abs(bounds.width - screen.width) < 1 && abs(bounds.height - screen.height) < 1)
+            || (abs(bounds.width - screen.height) < 1 && abs(bounds.height - screen.width) < 1))
+        let root = window.rootViewController
+        let gameCovers = root.map { fills($0.view.bounds.size, bounds) } ?? true
+        // The launcher is a full-screen modal over the game: it must cover the window too.
+        let top = topmost(root)
+        let presentedCovers = top === root || top.map { fills($0.view.bounds.size, bounds) } ?? true
+        if covers && gameCovers && presentedCovers { return }
+        Diagnostics.record("rotation left window \(sizeText(bounds)) on a \(sizeText(screen)) screen in \(orientation.isPortrait ? "portrait" : "landscape") (attempt \(attempt), device \(UIDevice.current.orientation.rawValue))")
+        // The window is right and only a view lagged a layout: one pass is enough.
+        if covers {
+            layOut(window)
+            return
+        }
+        // Asking for the last turn's orientation while the launcher is up is what left a
+        // landscape-sized window on a portrait screen (or the reverse) on a jailbroken phone: the
+        // launcher follows the device, so settle in the orientation it is in. The game is asked
+        // for the turn `turn` made.
+        if attempt == 1 {
+            if #available(iOS 16.0, *) {
+                let launcherUp = top is LauncherHostingController
+                let settle = (launcherUp ? mask(for: orientation) : nil) ?? rotationTarget
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: settle)) { error in
+                    Diagnostics.record("rotation retry failed: \(error.localizedDescription)")
+                }
+            } else {
+                UIViewController.attemptRotationToDeviceOrientation()
+            }
+            verify(scene, count: count, attempt: 2, after: 1.2)
+            return
+        }
+        window.frame = CGRect(origin: .zero, size: orientation.isPortrait
+            ? CGSize(width: short, height: long) : CGSize(width: long, height: short))
+        layOut(window)
+        // A window frame set by hand can lose to a late scene layout: look again once.
+        if attempt < 3 { verify(scene, count: count, attempt: attempt + 1, after: 1.0) }
+    }
+}
+
+/// The orientation the scene is drawing in now (the launcher follows the device; the game view
+/// controller then turns it back to landscape).
+private func sceneOrientation(_ scene: UIWindowScene) -> UIInterfaceOrientation {
+    if #available(iOS 16.0, *) { return scene.effectiveGeometry.interfaceOrientation }
+    return scene.interfaceOrientation
+}
+
+/// Lay the window's views out from its bounds, so winit reports the size it now has.
+private func layOut(_ window: UIWindow) {
+    let root = window.rootViewController
+    let top = topmost(root)
+    for controller in top === root ? [root] : [root, top] {
+        controller?.view.frame = window.bounds
+        controller?.view.setNeedsLayout()
+        controller?.view.layoutIfNeeded()
+    }
+    Diagnostics.record("laid out window \(sizeText(window.bounds.size)); game view \(sizeText(root?.view.bounds.size ?? .zero)); launcher view \(sizeText(top === root ? .zero : top?.view.bounds.size ?? .zero))")
+}
+
+private func fills(_ a: CGSize, _ b: CGSize) -> Bool {
+    abs(a.width - b.width) < 1 && abs(a.height - b.height) < 1
+}
+
+private func topmost(_ controller: UIViewController?) -> UIViewController? {
+    var top = controller
+    while let next = top?.presentedViewController {
+        top = next
+    }
+    return top
+}
+
+@available(iOS 16.0, *)
+private func mask(for orientation: UIInterfaceOrientation) -> UIInterfaceOrientationMask? {
+    switch orientation {
+    case .portrait, .portraitUpsideDown: return .portrait
+    case .landscapeLeft, .landscapeRight: return .landscape
+    default: return nil
+    }
+}
+
+private func label(_ mask: UIInterfaceOrientationMask) -> String {
+    if mask == .portrait { return "portrait" }
+    if mask == .landscape { return "landscape" }
+    return "mask \(mask.rawValue)"
+}
+
+private func sizeText(_ size: CGSize) -> String {
+    "\(Int(size.width.rounded()))x\(Int(size.height.rounded()))"
+}
+
+private func windowScene() -> UIWindowScene? {
+    let scenes = UIApplication.shared.connectedScenes
+        .filter { $0.session.role == .windowApplication }
+        .compactMap { $0 as? UIWindowScene }
+    return scenes.first { $0.windows.contains(where: \.isKeyWindow) } ?? scenes.first
 }
 
 /// The view controller of winit's window: the one the launcher is presented from.
@@ -97,19 +276,8 @@ func gameViewController() -> UIViewController? {
     return top
 }
 
-/// The launcher stands upright, as the design does; the game under it is held sideways by its own view
-/// controller after dismissal. While covered, that controller permits both orientations.
+/// The launcher turns with the device like any screen; the game under it is held sideways by its own view
+/// controller, which the phone turns back to when Play dismisses this one. GameInfo.plist allows both.
 private final class LauncherHostingController: UIHostingController<AnyView> {
-    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-        UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
-    }
-    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
-        guard UIDevice.current.userInterfaceIdiom == .pad else { return .portrait }
-        return UIApplication.shared.connectedScenes
-            .filter { $0.session.role == .windowApplication }
-        .compactMap { $0 as? UIWindowScene }
-            .first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation ?? .portrait
-    }
     override var preferredStatusBarStyle: UIStatusBarStyle { .default }
-    override var prefersStatusBarHidden: Bool { true }
 }

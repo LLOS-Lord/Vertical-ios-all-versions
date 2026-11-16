@@ -3661,7 +3661,8 @@ impl Dragon {
         if let Some(h) = nbt_value::float(tag.get("Health")) {
             self.health = h as f32;
         }
-        self.sitting_damage = nbt_value::float(tag.get("sitting_damage_received")).unwrap_or(0.0) as f32;
+        self.sitting_damage =
+            nbt_value::float(tag.get("sitting_damage_received")).unwrap_or(0.0) as f32;
         if let Some(p) = nbt_value::number(tag.get("DragonPhase")) {
             self.phase = Phase::from_id(p as i32);
         }

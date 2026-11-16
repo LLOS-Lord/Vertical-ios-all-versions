@@ -16,6 +16,7 @@ use horizon_client::{
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
+    path::Path,
     sync::mpsc::{self, Receiver, TryRecvError},
 };
 
@@ -249,8 +250,9 @@ impl Game<'_> {
                 }
 
                 "launcher-state" => {
-                    let active_version =
-                        horizon_client::versions::active_version_id(&horizon_client::import::home());
+                    let active_version = horizon_client::versions::active_version_id(
+                        &horizon_client::import::home(),
+                    );
                     let state = json!({
                         "phase": if self.title.is_some() { "title" } else { "world" },
                         "screen": self.screen_name(),
@@ -264,18 +266,39 @@ impl Game<'_> {
                 // The game is up: the download screen has nothing left to show.
                 "download-state" => request.answer(r#"{"phase":"done"}"#),
                 "launcher-start" => {
-                    horizon_client::versions::apply_active_protocol_preference(
-                        &horizon_client::import::home(),
-                    );
+                    let home = horizon_client::import::home();
+                    if let Some(base) = horizon_client::versions::find_simulation_base(&home) {
+                        let _ =
+                            horizon_client::versions::upgrade_partial_mojang_versions(&home, &base);
+                    }
+                    horizon_client::versions::apply_active_protocol_preference(&home);
+                    let current_root = self.vanilla_root();
+                    let desired_root =
+                        horizon_client::import::resources_root(&current_root, Some(&home));
+                    let version_changed = self.title.is_some()
+                        && desired_root
+                            .as_deref()
+                            .is_some_and(|r| r != current_root.as_path());
+                    if let Some(root) = desired_root.as_deref() {
+                        horizon_client::versions::heal_placeholder_assets(&home, root);
+                    } else {
+                        horizon_client::versions::heal_placeholder_assets(&home, &current_root);
+                    }
                     let accepted = !self.quit_to_launcher
                         && horizon_ios_launcher::start_owned(start_owner(&request.line));
-                    request.answer(
-                        &json!({
-                            "ok": accepted,
-                            "phase": if self.title.is_some() { "title" } else { "world" },
-                        })
-                        .to_string(),
-                    );
+                    if accepted && version_changed {
+                        self.restart_for_active_version = true;
+                        self.quit_to_launcher = true;
+                        request.answer(&json!({ "ok": true, "phase": "loading" }).to_string());
+                    } else {
+                        request.answer(
+                            &json!({
+                                "ok": accepted,
+                                "phase": if self.title.is_some() { "title" } else { "world" },
+                            })
+                            .to_string(),
+                        );
+                    }
                 }
                 "launcher-commit-start" => commit_start(request),
                 "launcher-cancel-start" => {
@@ -434,8 +457,8 @@ impl Loading {
     /// running game, where a change also applies at once).
     fn launcher_options(&mut self, line: &str) -> Value {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let mut file = self.settings.to_file();
         if words[0] == "options-get" {
+            let file = self.settings.to_file();
             let mut options = serde_json::Map::new();
             for key in &words[1..] {
                 match file.describe(key) {
@@ -445,30 +468,13 @@ impl Loading {
             }
             return json!({ "options": options });
         }
-        let Some(key) = words.get(1).copied() else {
-            return json!({ "error": "options-set KEY VALUE" });
-        };
-        let value = line
-            .trim_start()
-            .strip_prefix("options-set")
-            .and_then(|rest| rest.trim_start().strip_prefix(key))
-            .map(str::trim)
-            .unwrap_or_default();
-        if let Err(e) = file.set_text(key, value) {
-            return json!({ "error": e });
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join("options.txt");
+        match set_launcher_option(&mut self.settings, &path, line) {
+            Ok(answer) => answer,
+            Err(error) => json!({ "error": error }),
         }
-        let mut settings = horizon_client::settings::Settings::from_file(file);
-        // Horizon's own files are not in options.txt.
-        std::mem::swap(&mut settings.horizon, &mut self.settings.horizon);
-        std::mem::swap(&mut settings.controller, &mut self.settings.controller);
-        std::mem::swap(&mut settings.extras, &mut self.settings.extras);
-        self.settings = settings;
-        self.settings.save(
-            &std::env::current_dir()
-                .unwrap_or_default()
-                .join("options.txt"),
-        );
-        json!({ "ok": true, "key": key, "option": self.settings.to_file().describe(key) })
     }
 
     /// The launcher's requests before the game exists: the start, its state, imports (how a phone with no game
@@ -537,9 +543,13 @@ impl Loading {
                                 horizon_client::settings::Settings::load(&Game::options_path());
                             horizon_client::versions::apply_active_protocol_preference(&home);
                             self.refresh_import_root(&home)?;
-                            if let Err(reason) = horizon_client::versions::validate_playable_root(
+                            horizon_client::versions::heal_placeholder_assets(
+                                &home,
                                 &self.vanilla_root,
-                            ) {
+                            );
+                            if let Err(reason) =
+                                horizon_client::versions::validate_playable_root(&self.vanilla_root)
+                            {
                                 let partial =
                                     horizon_client::versions::has_any_partial_mojang(&home);
                                 request.answer(
@@ -563,8 +573,9 @@ impl Loading {
                 "launcher-commit-start" => commit_start(request),
                 "launcher-cancel-start" => cancel_start(request),
                 "launcher-state" => {
-                    let active_version =
-                        horizon_client::versions::active_version_id(&horizon_client::import::home());
+                    let active_version = horizon_client::versions::active_version_id(
+                        &horizon_client::import::home(),
+                    );
                     let state = if horizon_ios_launcher::waiting() {
                         json!({ "phase": "waiting", "version": active_version })
                     } else if self.importing() {
@@ -625,6 +636,30 @@ impl Loading {
     }
 }
 
+/// `options-set KEY VALUE` on the settings the game will be made with, saved as the options screen
+/// saves them. `Settings::with_option` keeps Horizon's own stores (`horizon-touch.txt`, the touch
+/// layouts, the mod list, graphics) as they are: rebuilding the settings from options.txt alone
+/// resets them.
+fn set_launcher_option(
+    settings: &mut horizon_client::settings::Settings,
+    path: &Path,
+    line: &str,
+) -> std::result::Result<Value, String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let Some(key) = words.get(1).copied() else {
+        return Err("options-set KEY VALUE".to_owned());
+    };
+    let value = line
+        .trim_start()
+        .strip_prefix("options-set")
+        .and_then(|rest| rest.trim_start().strip_prefix(key))
+        .map(str::trim)
+        .unwrap_or_default();
+    *settings = settings.with_option(key, value)?;
+    settings.save(path);
+    Ok(json!({ "ok": true, "key": key, "option": settings.to_file().describe(key) }))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -653,6 +688,49 @@ mod tests {
         let installed = super::install_archive(&archive, &home, false).unwrap();
         assert_eq!(installed.kind, horizon_client::import::Kind::World);
         assert!(installed.path.join("level.dat").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The launcher turns a downloaded resource pack on before the game exists: the write must
+    /// leave the player's touch layouts (their own files, not options.txt's) alone.
+    #[test]
+    fn launcher_option_changes_keep_touch_layouts() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-launcher-options-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let options = root.join("options.txt");
+        let mut settings = horizon_client::settings::Settings::load(&options);
+        assert!(settings.create_touch_layout("pvp").is_some());
+        settings.save(&options);
+
+        let answer = super::set_launcher_option(
+            &mut settings,
+            &options,
+            "options-set resourcePacks [\"file/x.zip\"]",
+        )
+        .unwrap();
+        assert_eq!(answer["ok"], true);
+
+        let reloaded = horizon_client::settings::Settings::load(&options);
+        assert_eq!(reloaded.resource_packs, vec!["file/x.zip".to_owned()]);
+        assert_eq!(reloaded.touch.profile, "pvp");
+        assert!(
+            reloaded
+                .touch_profiles
+                .layouts
+                .contains_key(horizon_client::touch::DEFAULT_PROFILE)
+        );
+        assert!(
+            root.join(horizon_client::touch::LAYOUTS_DIR)
+                .join("Default.txt")
+                .is_file()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

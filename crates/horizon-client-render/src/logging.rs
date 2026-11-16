@@ -456,6 +456,9 @@ fn ours(target: &str) -> bool {
 
 impl log::Log for Logger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
+        if meta.target().starts_with("symphonia") {
+            return meta.level() <= log::Level::Warn;
+        }
         meta.level() <= log::Level::Info
     }
 

@@ -355,7 +355,7 @@ pub fn write_with_readers(root: &Path, readers: usize) -> io::Result<()> {
     let tmp = root.join(format!("{FILE_NAME}.{}.tmp", std::process::id()));
     remove_abandoned(root);
     let result = (|| {
-        let mut out = BufWriter::new(File::create(&tmp)?);
+        let mut out = BufWriter::with_capacity(512 << 10, File::create(&tmp)?);
         out.write_all(&MAGIC)?;
         out.write_all(&VERSION.to_le_bytes())?;
         out.write_all(
