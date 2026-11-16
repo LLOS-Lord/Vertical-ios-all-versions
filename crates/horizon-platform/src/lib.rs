@@ -88,6 +88,11 @@ pub mod hud {
     pub use horizon_hooks::hud::{Canvas, Corner, Layer, register};
 }
 
+/// Prepared-version catalogs and pure-Rust Modrinth / Java `.jar` mod porting.
+pub mod porter {
+    pub use horizon_hooks::porter::{PortOutcome, Porter, PreparedMirror, register};
+}
+
 /// The multiplayer server list as vanilla stores it (`servers.dat`): read, write, add, remove,
 /// and the lock held while it is read and written back.
 #[cfg(feature = "protocol")]

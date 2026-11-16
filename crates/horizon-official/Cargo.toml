@@ -14,8 +14,10 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+horizon-addresses = { path = "../horizon-addresses" }
 horizon-game = { path = "../horizon-game", default-features = false }
 horizon-platform = { path = "../horizon-platform" }
+horizon-port-pack = { path = "../horizon-port-pack" }
 horizon-heartbeat = { path = "../horizon-heartbeat" }
 horizon-friends = { path = "../horizon-friends", features = ["game"] }
 horizon-official-servers = { path = "../horizon-official-servers" }

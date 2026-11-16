@@ -296,61 +296,81 @@ final class PackChoices: ObservableObject {
 // MARK: - The page
 
 struct PacksPage: View {
+    enum ContentSection: String, CaseIterable, Identifiable {
+        case resource = "Resource Packs"
+        case shader = "Shader Packs"
+        case mods = "Mods"
+        var id: String { rawValue }
+    }
+
     @ObservedObject var link: GameLink
     @StateObject private var store = PackStore()
     @StateObject private var choices = PackChoices()
+    @State private var section = ContentSection.resource
     @State private var kind = PackKind.resource
     @State private var query = ""
     @State private var notice: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Picker("Kind", selection: $kind) {
-                ForEach(PackKind.allCases) { Text($0.title).tag($0) }
+            Picker("Kind", selection: $section) {
+                ForEach(ContentSection.allCases) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-
-            installedSection
-            if let issue = choices.issue {
-                Label(issue, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(Theme.warn)
-            }
-
-            if kind == .shader, let status = choices.shaderStatus {
-                Text(status).font(Theme.sans(12)).foregroundStyle(Theme.text)
-                ForEach(Array(choices.shaderNotes.prefix(8).enumerated()), id: \.offset) { _, note in
-                    Text(note).font(Theme.sans(11)).foregroundStyle(Theme.warn)
-                        .textSelection(.enabled)
+            .accessibilityIdentifier("packs-kind-picker")
+            .onChange(of: section) { next in
+                switch next {
+                case .resource: kind = .resource
+                case .shader: kind = .shader
+                case .mods: break
                 }
             }
 
-            SectionHeader(title: "Find on Modrinth")
-            Field(title: "SEARCH", placeholder: kind == .resource ? "Faithful, Stay True…" : "Complementary, BSL…",
-                  text: $query, keyboard: .default)
-                .onSubmit { Task { await store.search(kind, query: query) } }
-            if kind == .shader {
-                Text("Compatibility varies by pack and settings. Check the runtime notes for unsupported features or loading errors.")
+            if section == .mods {
+                ModsSectionView(link: link)
+            } else {
+                installedSection
+                if let issue = choices.issue {
+                    Label(issue, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(Theme.warn)
+                }
+
+                if kind == .shader, let status = choices.shaderStatus {
+                    Text(status).font(Theme.sans(12)).foregroundStyle(Theme.text)
+                    ForEach(Array(choices.shaderNotes.prefix(8).enumerated()), id: \.offset) { _, note in
+                        Text(note).font(Theme.sans(11)).foregroundStyle(Theme.warn)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                SectionHeader(title: "Find on Modrinth")
+                Field(title: "SEARCH", placeholder: kind == .resource ? "Faithful, Stay True…" : "Complementary, BSL…",
+                      text: $query, keyboard: .default)
+                    .onSubmit { Task { await store.search(kind, query: query) } }
+                if kind == .shader {
+                    Text("Compatibility varies by pack and settings. Check the runtime notes for unsupported features or loading errors.")
+                        .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
+                }
+                if let failed = store.failed {
+                    Label(failed, systemImage: "wifi.exclamationmark").font(Theme.sans(12)).foregroundStyle(Theme.warn)
+                }
+                if store.searching && store.results.isEmpty {
+                    ProgressView().tint(Theme.accentText).frame(maxWidth: .infinity).padding(24)
+                }
+                VStack(spacing: 0) {
+                    ForEach(store.results) { project in
+                        ProjectRow(project: project, progress: store.downloading[project.id],
+                                   version: link.version) {
+                            Task { await download(project) }
+                        }
+                        if project != store.results.last {
+                            Divider().overlay(Theme.border).padding(.leading, 70)
+                        }
+                    }
+                }
+                .card()
+                Text("Packs come from modrinth.com and their authors. Horizon is not affiliated with Modrinth.")
                     .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
             }
-            if let failed = store.failed {
-                Label(failed, systemImage: "wifi.exclamationmark").font(Theme.sans(12)).foregroundStyle(Theme.warn)
-            }
-            if store.searching && store.results.isEmpty {
-                ProgressView().tint(Theme.accentText).frame(maxWidth: .infinity).padding(24)
-            }
-            VStack(spacing: 0) {
-                ForEach(store.results) { project in
-                    ProjectRow(project: project, progress: store.downloading[project.id],
-                               version: link.version) {
-                        Task { await download(project) }
-                    }
-                    if project != store.results.last {
-                        Divider().overlay(Theme.border).padding(.leading, 70)
-                    }
-                }
-            }
-            .card()
-            Text("Packs come from modrinth.com and their authors. Horizon is not affiliated with Modrinth.")
-                .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
         }
         .task(id: kind) {
             store.reloadInstalled()

@@ -243,6 +243,7 @@ impl Loading {
             // publication before it reads, without blocking the frame thread.
             .or_else(|| home.is_dir().then(|| home.join("resources")));
         if let Some(root) = root {
+            horizon_world::datafix::set_resources(&root);
             options.resources = root.clone();
             self.vanilla_root = root;
         }

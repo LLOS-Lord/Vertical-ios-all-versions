@@ -132,6 +132,7 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         // The cable's door: an archive dragged into `Documents` is installed here, so the launch it was
         // dragged for is the one that finds it. `scan` says what it took and what it left alone.
         horizon_client::import::scan(&documents);
+        horizon_client::versions::apply_active_protocol_preference(&documents);
     }
     let renderers = crate::mod_api::mods()
         .iter()

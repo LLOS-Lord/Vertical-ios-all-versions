@@ -177,11 +177,23 @@ pub struct Installed {
 /// because a `resources` folder under its working directory means something else there.
 pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let has = |dir: &Path| dir.join(Kind::Resources.marker()).exists();
+    let sibling_is_external = home.is_none_or(|h| !sibling.starts_with(h));
+    if sibling_is_external && has(sibling) {
+        return Some(sibling.to_owned());
+    }
+    if let Some(home) = home {
+        if let Some(active) = crate::versions::active_ready_root(home) {
+            return Some(active);
+        }
+        let legacy = home.join(Kind::Resources.folder());
+        if has(&legacy) {
+            return Some(legacy);
+        }
+    }
     if has(sibling) {
         return Some(sibling.to_owned());
     }
-    home.map(|home| home.join(Kind::Resources.folder()))
-        .filter(|dir| has(dir))
+    None
 }
 
 /// Whether a game that found nothing to load should wait on screen instead of giving up. On a phone,
@@ -493,7 +505,16 @@ impl Pack {
                     let (files, bytes) = self.unpack(&scratch)?;
                     let dest = home.join(folder);
                     publish(&scratch, &dest)?;
-                    fs::remove_file(&archive)?;
+                    let _ = fs::remove_file(&archive);
+                    // Only upgrade top-level `Documents/` partial Mojang installs (not nested `versions/<id>/`).
+                    if home.file_name().is_none_or(|n| n != "versions")
+                        && home
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .is_none_or(|n| n != "versions")
+                    {
+                        let _ = crate::versions::upgrade_partial_mojang_versions(home, &dest);
+                    }
                     (dest, files, bytes)
                 }
             };
@@ -706,7 +727,35 @@ pub fn scan(home: &Path) -> Vec<Installed> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("zip") {
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        if matches!(ext.as_deref(), Some("hmod" | "jar")) {
+            match crate::launcher_mods::import_local_mod_file(home, &path) {
+                Ok(_) => {
+                    log::info!("Horizon: imported mod {} into horizon-mods", path.display());
+                    let _ = fs::remove_file(&path);
+                }
+                Err(error) => {
+                    let parked = path.with_extension(format!(
+                        "{}.failed",
+                        ext.as_deref().unwrap_or("mod")
+                    ));
+                    log::error!(
+                        "Horizon: {} would not import as mod: {error}; leaving it as {}",
+                        path.display(),
+                        parked.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    let _ = fs::rename(&path, &parked);
+                }
+            }
+            continue;
+        }
+        if ext.as_deref() != Some("zip") {
             continue;
         }
         let pack = match Pack::open(&path) {

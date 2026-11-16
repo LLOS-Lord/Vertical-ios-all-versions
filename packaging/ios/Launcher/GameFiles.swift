@@ -431,6 +431,7 @@ struct GameFilesCard: View {
     /// The game has none yet: say so first.
     var missing: Bool
     var setupHelp: (() -> Void)? = nil
+    var browseVersions: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -448,6 +449,10 @@ struct GameFilesCard: View {
             if missing, let setupHelp {
                 Button("Other ways to get game files", action: setupHelp)
                     .accessibilityIdentifier("launcher-game-files-help")
+            }
+            if let browseVersions {
+                SecondaryButton(title: "Browse & download versions from servers", icon: "globe", action: browseVersions)
+                    .accessibilityIdentifier("launcher-browse-versions")
             }
 
             if download.busy {
@@ -530,6 +535,7 @@ struct GameFilesRecovery: View {
     let version: String
     let signedIn: Bool
     var configureManually: (() -> Void)? = nil
+    var browseVersions: (() -> Void)? = nil
     @State private var choosingFile = false
     @State private var fileIssue: String?
     @Environment(\.dismiss) private var dismiss
@@ -548,7 +554,11 @@ struct GameFilesRecovery: View {
                     } else {
                         Text("Horizon needs Minecraft game files before you can play, open a world or join a server.")
                     }
-                    Text("You can retry automatic setup below, or prepare and transfer the files from a computer.")
+                    Text("You can retry automatic setup below, browse official Mojang & Horizon mirror servers directly, or transfer prepared files from a computer.")
+                    if let browseVersions {
+                        Button("Browse & download versions from servers", action: browseVersions)
+                            .accessibilityIdentifier("recovery-browse-versions")
+                    }
                 }
                 Section("Download from Mojang with Microsoft") {
                     Text(signedIn

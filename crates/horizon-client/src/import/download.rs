@@ -19,22 +19,30 @@ use std::{
 
 use super::{Installed, MAX_PACKED, Pack};
 
-/// Where the game files are downloaded from: this followed by `<version>.zip`.
-/// `HORIZON_GAME_FILES_URL` replaces it (a folder URL ending in `/`).
-pub const BASE_URL: &str = "https://cdn.gayfeet.lol/horizon/";
-
-/// The archive's address for this version.
+/// The archive's default address for this version, supplied by the registered Horizon porter
+/// (`horizon-addresses`) unless `HORIZON_GAME_FILES_URL` overrides it.
 pub fn url(version: &str) -> String {
-    let base = std::env::var("HORIZON_GAME_FILES_URL")
-        .ok()
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| BASE_URL.to_owned());
-    let base = if base.ends_with('/') {
-        base
-    } else {
-        format!("{base}/")
-    };
-    format!("{base}{version}.zip")
+    if let Ok(custom) = std::env::var("HORIZON_GAME_FILES_URL") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            if trimmed.ends_with(".zip") {
+                return trimmed.to_owned();
+            }
+            let base = if trimmed.ends_with('/') {
+                trimmed.to_owned()
+            } else {
+                format!("{trimmed}/")
+            };
+            return format!("{base}{version}.zip");
+        }
+    }
+    if let Some(default_url) = horizon_hooks::porter::engine::default_prepared_url() {
+        if let Some((prefix, _)) = default_url.rsplit_once('/') {
+            return format!("{prefix}/{version}.zip");
+        }
+        return default_url;
+    }
+    format!("{version}.zip")
 }
 
 /// What the download is doing now.
@@ -151,6 +159,16 @@ enum Stop {
     Broke(String),
     /// The server refused, or the file can't be kept: trying again won't help.
     Failed(String),
+}
+
+/// Download `url` into `work_dir/horizon-download.zip` using `.part` + `ETag` `If-Range` resume.
+pub fn fetch_resumable(
+    url: &str,
+    work_dir: &Path,
+    received: &AtomicU64,
+    total: &AtomicU64,
+) -> Result<PathBuf, String> {
+    fetch(url, work_dir, received, total)
 }
 
 /// Download `url` to `home/horizon-download.zip`, through a `.part` file so a cut download is
@@ -532,5 +550,49 @@ mod tests {
         );
         assert!(!home.join(PARTIAL_TAG).exists());
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn fetch_resumable_resumes_partial_archive_with_206_range_and_etag() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut request = [0u8; 1024];
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut request);
+            let split = payload.len() / 2;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"resume-tag\"\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&payload[..split]);
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let n = stream.read(&mut request).unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&request[..n]);
+            assert!(req_str.contains(&format!("Range: bytes={split}-")));
+            assert!(req_str.contains("If-Range: \"resume-tag\""));
+            let rest = &payload[split..];
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {split}-{}/{}\r\nContent-Length: {}\r\nETag: \"resume-tag\"\r\nConnection: close\r\n\r\n",
+                payload.len() - 1,
+                payload.len(),
+                rest.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(rest);
+        });
+        let dir = home("fetch-resumable-206");
+        let rec = AtomicU64::new(0);
+        let tot = AtomicU64::new(0);
+        let out = fetch_resumable(&format!("http://{address}/bundle.zip"), &dir, &rec, &tot)
+            .expect("resumable download succeeds");
+        assert_eq!(fs::read(&out).unwrap(), expected);
+        assert_eq!(rec.load(Ordering::Relaxed), expected.len() as u64);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

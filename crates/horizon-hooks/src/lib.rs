@@ -22,6 +22,7 @@ pub mod lang;
 pub mod pages;
 pub mod perf;
 pub mod players;
+pub mod porter;
 mod registry;
 pub mod settings;
 pub mod tunnel;
@@ -247,6 +248,7 @@ pub mod engine {
     /// registration ends.
     pub fn seal() {
         all();
+        crate::porter::all();
         crate::settings::all();
         crate::pages::engine::all();
         crate::hud::engine::all();

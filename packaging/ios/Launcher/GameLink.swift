@@ -8,10 +8,30 @@ enum GameFolder {
     static var saves: URL { documents.appendingPathComponent("saves") }
     static var screenshots: URL { documents.appendingPathComponent("screenshots") }
     static var resources: URL { documents.appendingPathComponent("resources") }
+    static var versions: URL { documents.appendingPathComponent("versions") }
 
-    /// Whether imported game files are in place (`import::resources_root`'s second stop).
+    /// Whether game files exist in `Documents/resources` or any managed `Documents/versions/<id>/resources`.
+    static func hasGameFiles(in documents: URL) -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: documents.appendingPathComponent("resources/horizon-resources.json").path) {
+            return true
+        }
+        let versionsRoot = documents.appendingPathComponent("versions")
+        guard let entries = try? fm.contentsOfDirectory(at: versionsRoot, includingPropertiesForKeys: nil) else {
+            return false
+        }
+        for entry in entries {
+            let marker = entry.appendingPathComponent("resources/horizon-resources.json")
+            if fm.fileExists(atPath: marker.path) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Whether imported or server-downloaded game files are in place (`import::resources_root`).
     static var hasGameFiles: Bool {
-        FileManager.default.fileExists(atPath: resources.appendingPathComponent("horizon-resources.json").path)
+        hasGameFiles(in: documents)
     }
 }
 
@@ -85,6 +105,8 @@ final class GameLink: ObservableObject {
     /// Counts server list reloads, so each one pings the servers again.
     @Published private(set) var serverRound = 0
     @Published private(set) var version = "26.3"
+    /// Opens the Multi-Version Server Browser & Switcher sheet.
+    @Published var showingVersionBrowser = false
     /// What the Play button says while it waits for the game to be ready to take it somewhere.
     @Published var requestingGameFiles = false
     @Published private(set) var launching: String?

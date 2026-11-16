@@ -3,16 +3,12 @@ name: ios
 # packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa. No tests run here. The .ipa is then posted to Discord when the repository secret
 # DISCORD_IPA_WEBHOOK is set.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       publish_release:
         description: Publish an unsigned release (main branch only)
         type: boolean
         default: false
-  pull_request:
-    branches: [main]
 permissions:
   contents: read
 concurrency:

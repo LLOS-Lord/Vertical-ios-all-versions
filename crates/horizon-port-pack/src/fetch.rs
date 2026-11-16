@@ -22,7 +22,7 @@ use std::{
 };
 
 /// Hosts a Modrinth pack may download from (the `.mrpack` format's list).
-const HOSTS: [&str; 4] = [
+pub(crate) const HOSTS: [&str; 4] = [
     "https://cdn.modrinth.com/",
     "https://github.com/",
     "https://raw.githubusercontent.com/",

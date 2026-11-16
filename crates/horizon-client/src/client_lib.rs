@@ -90,6 +90,7 @@ pub mod item_tooltip;
 pub mod join_seq;
 pub mod lan;
 pub mod landing;
+pub mod launcher_mods;
 pub use horizon_client_render::loading_overlay;
 pub mod legacy_combat;
 pub mod living_death;
@@ -157,6 +158,7 @@ pub mod title;
 pub mod toasts;
 pub mod ui_theme;
 pub mod vanillagen;
+pub mod versions;
 pub mod voxel_occlusion;
 // Keep the old path for native callers while giving the implementation a name
 // that does not collide with the gameplay adapter in `game/entity_culling.rs`.

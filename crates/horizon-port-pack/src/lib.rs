@@ -25,6 +25,7 @@ pub mod pipeline;
 pub mod processors;
 pub mod report;
 pub mod resourcepacks;
+pub mod store;
 pub mod upgrade;
 pub mod worldgen;
 mod yung;

@@ -63,6 +63,7 @@ targets:
       - path: TouchControlsTests.swift
       - path: FormattingTests.swift
       - path: AccountTests.swift
+      - path: VersionsAndModsTests.swift
     dependencies:
       - target: LauncherPreview
     settings:

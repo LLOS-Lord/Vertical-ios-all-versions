@@ -1,0 +1,259 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish unsigned + TrollStore IPA release (main branch)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  IOS_TARGET: aarch64-apple-ios
+  HORIZON_MSA_CLIENT_ID: "331e08f8-172d-43b9-835a-3108c2fcdbf3"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_INCREMENTAL: "0"
+  IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+
+jobs:
+  rust-tests:
+    name: Rust Guardrails & Functional Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux audio & udev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-rust-tests
+
+      - name: Run architecture & manifest guardrails
+        run: |
+          set -euo pipefail
+          python3 tools/check_layers.py
+          python3 tools/check_public_tree.py
+          python3 tools/check_android_manifest.py
+
+      - name: Run protocol, mod-porter, multi-version & launcher functional tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p horizon-hooks
+          cargo test --locked -p horizon-addresses
+          cargo test --locked -p horizon-protocol adapter::tests -- --nocapture
+          cargo test --locked -p horizon-port-pack -- --nocapture
+          cargo test --locked -p horizon-official --lib -- --nocapture
+          cargo test --locked -p horizon-client-lib --lib versions::tests -- --nocapture
+          cargo test --locked -p horizon-client-lib --lib launcher_mods::tests -- --nocapture
+          cargo test --locked -p horizon-client-lib --lib import::download::tests -- --nocapture
+          cargo test --locked -p horizon-client --lib game::launcher::tests -- --nocapture
+          cargo test --locked -p horizon-client --lib game::saves_control::tests -- --nocapture
+
+  ios-ipa:
+    name: iOS Swift Tests & Native ARM64 IPA
+    runs-on: ${{ github.event_name == 'pull_request' && 'macos-26-intel' || vars.MAC_RUNNER || 'macos-26' }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check Xcode 26+ & iPhoneOS SDK 26+
+        run: bash tools/ci/ios-toolchain.sh
+
+      - name: Install XcodeGen & ldid
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          command -v ldid >/dev/null || brew install ldid
+
+      - name: Run Swift LauncherLogicTests on iOS Simulator
+        run: |
+          set -euo pipefail
+          ( cd packaging/ios/Preview && xcodegen generate )
+          SIM_UDID=$(python3 - <<'PY'
+          import json, subprocess, sys
+          data = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"], text=True))
+          candidates = []
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              for dev in devices:
+                  if dev.get("isAvailable") and "iPhone" in dev.get("name", ""):
+                      candidates.append((runtime, dev["name"], dev["udid"]))
+          if not candidates:
+              sys.exit(1)
+          candidates.sort()
+          print(candidates[-1][2])
+          PY
+          )
+          echo "Testing on iOS Simulator UDID: $SIM_UDID"
+          xcodebuild test \
+            -project packaging/ios/Preview/LauncherPreview.xcodeproj \
+            -scheme LauncherPreview \
+            -only-testing:LauncherLogicTests \
+            -destination "platform=iOS Simulator,id=$SIM_UDID" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
+            > xcode-simulator-tests.log 2>&1 || { tail -120 xcode-simulator-tests.log; exit 1; }
+          grep -E "Test Suite .* passed|Executed [0-9]+ tests" xcode-simulator-tests.log || true
+
+      - name: Upload Simulator test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-test-log
+          path: xcode-simulator-tests.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.IOS_TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
+        with:
+          shared-key: ios-${{ env.IOS_TARGET }}
+
+      - name: Build native ARM64 Rust engine (horizon-official)
+        run: |
+          cargo build --release --locked --target "$IOS_TARGET" \
+            -p horizon-official --no-default-features --features audio,horizon-extras
+
+      - name: Bundle HorizonGame.app & build unsigned + TrollStore IPAs
+        run: |
+          set -euo pipefail
+          ( cd packaging/ios && xcodegen generate )
+          HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonIOS.xcodeproj \
+            -target HorizonGame -configuration Release -sdk iphoneos -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            CONFIGURATION_BUILD_DIR="$PWD/build-ios" \
+            build > xcode-game-build.log 2>&1 || { tail -80 xcode-game-build.log; exit 1; }
+
+          python3 tools/ci/ios_release.py --stamp-app build-ios/HorizonGame.app \
+            --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-commit "$GITHUB_SHA" --client-id "$HORIZON_MSA_CLIENT_ID"
+
+          # 1. Strictly unsigned IPA (for AltStore / SideStore / Sideloadly / Feather & ios_release.py audit)
+          rm -rf game-xcode && mkdir -p game-xcode/Payload
+          cp -a build-ios/HorizonGame.app game-xcode/Payload/
+          ( cd game-xcode && zip -qry ../Horizon-game-unsigned.ipa Payload )
+
+          # 2. Separate ldid ad-hoc signed IPA (for TrollStore direct install)
+          rm -rf game-trollstore && mkdir -p game-trollstore/Payload
+          cp -a build-ios/HorizonGame.app game-trollstore/Payload/
+          if [ -d game-trollstore/Payload/HorizonGame.app/Frameworks ]; then
+            for fw in game-trollstore/Payload/HorizonGame.app/Frameworks/*.framework; do
+              [ -e "$fw" ] && ldid -S "$fw"
+            done
+          fi
+          ldid -S game-trollstore/Payload/HorizonGame.app/Horizon
+          ( cd game-trollstore && zip -qry ../Horizon-TrollStore.ipa Payload )
+
+      - name: Upload Xcode build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcode-failure-log
+          path: xcode-game-build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Audit unsigned Mach-O & bundle integrity
+        run: |
+          python3 tools/ci/ios_release.py Horizon-game-unsigned.ipa \
+            --expect-commit "$GITHUB_SHA" --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-ios-unsigned
+          path: Horizon-game-unsigned.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload TrollStore IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-ios-trollstore
+          path: Horizon-TrollStore.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    needs: [rust-tests, ios-ipa]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: horizon-ios-unsigned
+          path: ipa-unsigned
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: horizon-ios-trollstore
+          path: ipa-trollstore
+
+      - name: Prepare versioned IPA assets & SHA-256 checksums
+        id: asset
+        run: |
+          set -euo pipefail
+          python3 tools/ci/ios_release.py ipa-unsigned/Horizon-game-unsigned.ipa \
+            --expect-commit "$GITHUB_SHA" --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output-dir release-assets >> "$GITHUB_OUTPUT"
+          cp ipa-trollstore/Horizon-TrollStore.ipa release-assets/Horizon-TrollStore.ipa
+          ( cd release-assets && sha256sum Horizon-TrollStore.ipa > Horizon-TrollStore.ipa.sha256 )
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IPA: ${{ steps.asset.outputs.ipa }}
+          CHECKSUM: ${{ steps.asset.outputs.checksum }}
+          VERSION: ${{ steps.asset.outputs.version }}
+          BUILD: ${{ steps.asset.outputs.build }}
+        run: |
+          bash tools/ci/publish-ios-release.sh
+          TAG="ios-build-${BUILD}"
+          gh release upload "$TAG" \
+            release-assets/Horizon-TrollStore.ipa \
+            release-assets/Horizon-TrollStore.ipa.sha256 \
+            --clobber --repo "$GH_REPO"

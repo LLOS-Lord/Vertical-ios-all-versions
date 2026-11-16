@@ -17,8 +17,31 @@ private enum PreviewEngine {
     static var phase: String?
     static var owner: String?
     static var committed = false
+    static var activeVersion = "26.3"
+    static var olderServers = true
+    static var mods: [[String: Any]] = [
+        [
+            "id": "copper-lamps",
+            "name": "Copper Lamps",
+            "version": "1.0.2",
+            "description": "Decorative oxidized copper lighting blocks.",
+            "authors": ["Horizon Team"],
+            "enabled": true,
+            "format": "hmod",
+            "origin": "horizon",
+            "loader": "horizon",
+            "verdict": "verified",
+            "summary": "Official signed Horizon content mod.",
+            "ports": ["4 blocks", "4 items", "4 recipes"],
+            "skipped": [],
+            "bytes": 48_120,
+        ],
+    ]
 
-    static func reset() { phase = nil; owner = nil; committed = false }
+    static func reset() {
+        phase = nil; owner = nil; committed = false
+        activeVersion = "26.3"; olderServers = true
+    }
     static var currentPhase: String {
         phase ?? (ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" ? "waiting" : "title")
     }
@@ -27,7 +50,89 @@ private enum PreviewEngine {
         guard let command = words.first else { return nil }
         let id = words.count == 2 ? String(words[1]) : nil
         switch command {
-        case "launcher-state": return ["phase": currentPhase, "version": "26.3"]
+        case "launcher-state": return ["phase": currentPhase, "version": activeVersion]
+        case "launcher-versions":
+            let payload = (id?.data(using: .utf8)).flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            } ?? [:]
+            let action = payload["action"] as? String ?? "list"
+            switch action {
+            case "select":
+                if let selected = payload["id"] as? String, !selected.isEmpty { activeVersion = selected }
+            case "older-servers":
+                olderServers = payload["enabled"] as? Bool ?? true
+            case "catalog":
+                return [
+                    "mirrors": [
+                        [
+                            "id": "community-26-3",
+                            "label": "Prepared 26.3 (Community Mirror)",
+                            "version": "26.3",
+                            "url": "https://mirror.example/horizon/26.3.zip",
+                            "notes": "Full prepared 26.3 runtime & assets.",
+                            "installed": true,
+                        ],
+                    ],
+                ]
+            case "mojang":
+                return [
+                    "latest_release": "26.3",
+                    "latest_snapshot": "26.4-snapshot-8",
+                    "has_simulation_base": true,
+                    "total": 3,
+                    "versions": [
+                        ["id": "26.3", "type": "release", "release_time": "2026-09-15T10:00:00Z", "protocol": 777, "support_tier": "native-26.3", "installed": true, "ready": true, "active": activeVersion == "26.3"],
+                        ["id": "1.21.4", "type": "release", "release_time": "2024-12-03T10:00:00Z", "protocol": 769, "support_tier": "protocol-adapter", "installed": true, "ready": true, "active": activeVersion == "1.21.4"],
+                        ["id": "1.12.2", "type": "release", "release_time": "2017-09-18T08:39:46Z", "support_tier": "world-datafix-assets", "installed": false, "ready": false, "active": false],
+                    ],
+                ]
+            case "job":
+                return ["active": false, "stage": "idle", "done": false]
+            default: break
+            }
+            return [
+                "active": activeVersion,
+                "older_servers": olderServers,
+                "has_simulation_base": true,
+                "versions": [
+                    ["id": "26.3", "release_type": "release", "source": "horizon-prepared", "protocol": 777, "support_tier": "native-26.3", "full_simulation": true, "ready": true, "active": activeVersion == "26.3", "files": 4200, "bytes": 620_000_000, "notes": "Full prepared Horizon runtime"],
+                    ["id": "1.21.4", "release_type": "release", "source": "mojang-official", "protocol": 769, "support_tier": "protocol-adapter", "full_simulation": true, "ready": true, "active": activeVersion == "1.21.4", "files": 3950, "bytes": 540_000_000, "notes": "Mojang 1.21.4 + Wire Adapter"],
+                ],
+                "job": ["active": false, "stage": "idle", "done": false],
+            ]
+        case "launcher-mods":
+            let payload = (id?.data(using: .utf8)).flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            } ?? [:]
+            let action = payload["action"] as? String ?? "list"
+            switch action {
+            case "toggle":
+                let target = payload["id"] as? String ?? ""
+                let enabled = payload["enabled"] as? Bool ?? false
+                mods = mods.map { item in
+                    guard item["id"] as? String == target else { return item }
+                    var copy = item; copy["enabled"] = enabled; return copy
+                }
+                return ["ok": true, "mods": mods]
+            case "delete":
+                let target = payload["id"] as? String ?? ""
+                mods.removeAll { $0["id"] as? String == target }
+                return ["ok": true, "mods": mods]
+            case "horizon-browse":
+                return [
+                    "hits": [
+                        ["id": "waystones-lite", "title": "Waystones Lite", "summary": "Craftable teleportation obelisks.", "authors": ["Horizon"], "categories": ["utility"], "version": "0.4.1", "downloads": 1840, "update_available": false],
+                    ],
+                ]
+            case "modrinth-search":
+                return [
+                    "hits": [
+                        ["project_id": "terralith", "slug": "terralith", "title": "Terralith", "description": "Overworld worldgen overhaul with 95+ biomes.", "author": "Stardust Labs", "downloads": 42_000_000, "categories": ["datapack", "worldgen"], "versions": ["1.21.4", "26.3"], "compatibility_hint": "high"],
+                    ],
+                ]
+            default:
+                return ["mods": mods]
+            }
         case "launcher-start":
             owner = id
             committed = committed || currentPhase == "world"
@@ -126,6 +231,7 @@ struct LauncherPreview: App {
         }
         if ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" {
             try? FileManager.default.removeItem(at: GameFolder.resources)
+            try? FileManager.default.removeItem(at: GameFolder.versions)
         }
         Theme.registerFonts()
         Bridge.submit = previewSubmit

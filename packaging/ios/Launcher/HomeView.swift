@@ -79,12 +79,19 @@ struct HomeView: View {
         .background(Theme.background.ignoresSafeArea())
         .tint(Theme.accent)
         .sheet(isPresented: $showingAccount) { accountSheet }
+        .sheet(isPresented: $link.showingVersionBrowser) {
+            VersionBrowserSheet(link: link)
+        }
         .sheet(isPresented: $link.requestingGameFiles) {
             GameFilesRecovery(download: download, version: link.version,
                               signedIn: account.profile != nil,
                               configureManually: {
                                   tab = .settings
                                   link.requestingGameFiles = false
+                              },
+                              browseVersions: {
+                                  link.requestingGameFiles = false
+                                  link.showingVersionBrowser = true
                               })
         }
         .onChange(of: download.state) { state in
@@ -185,17 +192,29 @@ struct HomeView: View {
             launchPanel
             if needsFiles {
                 GameFilesCard(download: download, missing: true,
-                              setupHelp: { link.requestingGameFiles = true })
+                              setupHelp: { link.requestingGameFiles = true },
+                              browseVersions: { link.showingVersionBrowser = true })
             }
         }
     }
 
     private var launchPanel: some View {
         VStack(alignment: .leading, spacing: 22) {
-            HStack(spacing: 8) {
-                Text("JAVA EDITION · \(link.version)").font(.caption.weight(.semibold)).tracking(1.4)
+            Button {
+                Haptics.tap()
+                link.showingVersionBrowser = true
+            } label: {
+                HStack(spacing: 8) {
+                    Text("JAVA EDITION · \(link.version)").font(.caption.weight(.semibold)).tracking(1.4)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.bold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.white.opacity(0.14), in: Capsule())
+                .foregroundStyle(.white.opacity(0.95))
             }
-            .foregroundStyle(.white.opacity(0.9))
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("launcher-version-picker")
             Spacer(minLength: 22)
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 14) {
@@ -215,7 +234,7 @@ struct HomeView: View {
                 }.foregroundStyle(.white.opacity(0.9))
                     .accessibilityIdentifier("launcher-playing-as")
             }
-            HStack {
+            HStack(spacing: 12) {
                 Button { Task { await link.play() } } label: {
                     Label(playLabel, systemImage: "play.fill")
                         .font(.headline).frame(minWidth: 124, minHeight: 36)
@@ -227,6 +246,20 @@ struct HomeView: View {
                 .accessibilityIdentifier("launcher-play-button")
                 if link.launching != nil {
                     Button("Cancel") { link.cancelLaunch() }.foregroundStyle(.white).frame(minHeight: 44)
+                } else {
+                    Button {
+                        Haptics.tap()
+                        link.showingVersionBrowser = true
+                    } label: {
+                        Label("Versions", systemImage: "square.stack.3d.up.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .frame(minHeight: 44)
+                            .background(.white.opacity(0.16), in: Capsule())
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("launcher-open-versions")
                 }
                 Spacer(minLength: 0)
             }

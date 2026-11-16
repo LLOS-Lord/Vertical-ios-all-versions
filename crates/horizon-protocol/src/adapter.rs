@@ -147,6 +147,64 @@ impl ServerVersion {
         Self::ALL.into_iter().find(|v| v.protocol() == protocol)
     }
 
+    /// Map a Minecraft release / pre-release / RC version identifier (for example `"26.3"`,
+    /// `"1.21.4"`, `"1.20.4"`, `"1.21.1-rc1"`) to the native wire translator covering it.
+    pub fn from_version_id(version_id: &str) -> Option<Self> {
+        let base = base_release_id(version_id);
+        match base {
+            "26.3" => Some(Self::Current),
+            "26.2" => Some(Self::V26_2),
+            "26.1" | "26.1.1" | "26.1.2" => Some(Self::V26_1),
+            "1.21.11" => Some(Self::V1_21_11),
+            "1.21.9" | "1.21.10" => Some(Self::V1_21_10),
+            "1.21.7" | "1.21.8" => Some(Self::V1_21_8),
+            "1.21.6" => Some(Self::V1_21_6),
+            "1.21.5" => Some(Self::V1_21_5),
+            "1.21.4" => Some(Self::V1_21_4),
+            "1.21.2" | "1.21.3" => Some(Self::V1_21_3),
+            "1.21" | "1.21.1" => Some(Self::V1_21_1),
+            "1.20.5" | "1.20.6" => Some(Self::V1_20_6),
+            "1.20.3" | "1.20.4" => Some(Self::V1_20_3),
+            "1.20.2" => Some(Self::V1_20_2),
+            _ => None,
+        }
+    }
+
+    /// Known vanilla protocol number for a release identifier across modern and classic eras,
+    /// used by the multi-version launcher to display protocol metadata even for releases older
+    /// than `1.20.2`.
+    pub fn protocol_for_version_id(version_id: &str) -> Option<i32> {
+        if let Some(supported) = Self::from_version_id(version_id) {
+            return Some(supported.protocol());
+        }
+        match base_release_id(version_id) {
+            "1.20" | "1.20.1" => Some(763),
+            "1.19.4" => Some(762),
+            "1.19.3" => Some(761),
+            "1.19.1" | "1.19.2" => Some(760),
+            "1.19" => Some(759),
+            "1.18.2" => Some(758),
+            "1.18" | "1.18.1" => Some(757),
+            "1.17.1" => Some(756),
+            "1.17" => Some(755),
+            "1.16.4" | "1.16.5" => Some(754),
+            "1.16.3" => Some(753),
+            "1.16.2" => Some(751),
+            "1.16.1" => Some(736),
+            "1.16" => Some(735),
+            "1.15.2" => Some(578),
+            "1.14.4" => Some(498),
+            "1.13.2" => Some(404),
+            "1.12.2" => Some(340),
+            "1.11.2" => Some(316),
+            "1.10.2" => Some(210),
+            "1.9.4" => Some(110),
+            "1.8" | "1.8.8" | "1.8.9" => Some(47),
+            "1.7.10" => Some(5),
+            _ => None,
+        }
+    }
+
     /// The pinned version's id for a packet this version's server sent as `id`. `None` when the pinned
     /// version has no such packet.
     pub fn clientbound_id(self, state: State, id: i32) -> Option<i32> {
@@ -464,6 +522,33 @@ impl ServerVersion {
     }
 }
 
+/// Strip `-rcN`, `-preN`, or `-snapshot-N` suffixes from a version id when matching its release
+/// family (`"1.21.4-rc2"` -> `"1.21.4"`, `"26.3-pre1"` -> `"26.3"`).
+fn base_release_id(version_id: &str) -> &str {
+    let trimmed = version_id.trim();
+    for marker in ["-rc", "-pre", "-snapshot"] {
+        if let Some((head, _)) = trimmed.split_once(marker) {
+            return head;
+        }
+    }
+    trimmed
+}
+
+static PREFERRED_PROTOCOL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Set the preferred target server version from the multi-version launcher (`None` resets to auto /
+/// `Current`).
+pub fn set_preferred_server_version(version: Option<ServerVersion>) {
+    let raw = version.map_or(0, ServerVersion::protocol);
+    PREFERRED_PROTOCOL.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Currently selected older/pinned server version profile, if the launcher chose one.
+pub fn preferred_server_version() -> Option<ServerVersion> {
+    let raw = PREFERRED_PROTOCOL.load(std::sync::atomic::Ordering::Relaxed);
+    (raw > 0).then(|| ServerVersion::from_protocol(raw)).flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +618,16 @@ mod tests {
         assert_eq!(ServerVersion::from_protocol(763), None);
         assert!(ServerVersion::V26_1.at_most(ServerVersion::V26_2));
         assert!(!ServerVersion::V26_2.at_most(ServerVersion::V26_1));
+        assert_eq!(
+            ServerVersion::from_version_id("1.21.4-rc1"),
+            Some(ServerVersion::V1_21_4)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("1.20.4"),
+            Some(ServerVersion::V1_20_3)
+        );
+        assert_eq!(ServerVersion::protocol_for_version_id("1.12.2"), Some(340));
+        assert_eq!(ServerVersion::protocol_for_version_id("1.8.9"), Some(47));
     }
 
     #[test]
@@ -612,5 +707,46 @@ mod tests {
                 .unwrap(),
             Some(body)
         );
+    }
+
+    #[test]
+    fn maps_multi_version_ids_and_preferred_server_version_roundtrip() {
+        assert_eq!(
+            ServerVersion::from_version_id("26.3"),
+            Some(ServerVersion::Current)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("26.2"),
+            Some(ServerVersion::V26_2)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("1.21.11"),
+            Some(ServerVersion::V1_21_11)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("1.21.4"),
+            Some(ServerVersion::V1_21_4)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("1.21"),
+            Some(ServerVersion::V1_21)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("1.20.4"),
+            Some(ServerVersion::V1_20_3)
+        );
+        assert_eq!(
+            ServerVersion::from_version_id("1.20.2"),
+            Some(ServerVersion::V1_20_2)
+        );
+        assert_eq!(ServerVersion::from_version_id("1.19.4"), None);
+        assert_eq!(ServerVersion::protocol_for_version_id("26.3"), Some(777));
+        assert_eq!(ServerVersion::protocol_for_version_id("1.12.2"), Some(340));
+        assert_eq!(ServerVersion::protocol_for_version_id("1.8.9"), Some(47));
+
+        set_preferred_server_version(Some(ServerVersion::V1_21_4));
+        assert_eq!(preferred_server_version(), Some(ServerVersion::V1_21_4));
+        set_preferred_server_version(None);
+        assert_eq!(preferred_server_version(), None);
     }
 }

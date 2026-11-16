@@ -176,9 +176,262 @@ pub(super) fn file_command(
             });
             return Ok(Some(None));
         }
+        "launcher-versions" => return handle_launcher_versions(line, reply),
+        "launcher-mods" => return handle_launcher_mods(line, reply),
         _ => return Ok(None),
     };
     Ok(Some(Some(value)))
+}
+
+fn versions_snapshot(home: &std::path::Path) -> Value {
+    use horizon_client::versions;
+    json!({
+        "active": versions::active_version_id(home),
+        "older_servers": versions::load_selection(home).older_servers,
+        "has_simulation_base": versions::find_simulation_base(home).is_some(),
+        "versions": versions::list_installed(home),
+        "job": versions::job_status(),
+    })
+}
+
+fn handle_launcher_versions(
+    line: &str,
+    reply: &Sender<String>,
+) -> Result<Option<Option<Value>>> {
+    use horizon_client::versions;
+    let raw = line
+        .trim_start()
+        .strip_prefix("launcher-versions")
+        .map(str::trim)
+        .unwrap_or("{}");
+    let args: Value = serde_json::from_str(raw).map_err(|e| format!("launcher-versions JSON: {e}"))?;
+    let home = horizon_client::import::home();
+    let action = args["action"].as_str().unwrap_or("list");
+
+    let sync_reply = match action {
+        "list" => versions_snapshot(&home),
+        "job" => serde_json::to_value(versions::job_status()).unwrap_or_default(),
+        "cancel" => {
+            versions::cancel_job();
+            serde_json::to_value(versions::job_status()).unwrap_or_default()
+        }
+        "select" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            match versions::select_version(&home, id) {
+                Ok(_) => versions_snapshot(&home),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "delete" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            match versions::delete_version(&home, id) {
+                Ok(()) => versions_snapshot(&home),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "older-servers" => {
+            let enabled = args["enabled"].as_bool().unwrap_or(true);
+            let mut sel = versions::load_selection(&home);
+            sel.older_servers = enabled;
+            match versions::save_selection(&home, &sel) {
+                Ok(()) => {
+                    versions::apply_active_protocol_preference(&home);
+                    versions_snapshot(&home)
+                }
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "download-prepared" => {
+            let url = args["url"].as_str().unwrap_or_default().to_owned();
+            let ver = args["version"].as_str().map(str::to_owned);
+            let sha = args["sha256"].as_str().map(str::to_owned);
+            match versions::start_prepared_download(home, url, ver, sha) {
+                Ok(job) => json!({ "ok": true, "job": job }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "download-mojang" => {
+            let id = args["id"].as_str().unwrap_or_default().to_owned();
+            match versions::start_mojang_download(home, id) {
+                Ok(job) => json!({ "ok": true, "job": job }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "catalog" => {
+            let custom_url = args["url"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match versions::fetch_prepared_catalog(&home, custom_url.as_deref()) {
+                    Ok(mirrors) => json!({ "mirrors": mirrors }),
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        "mojang" => {
+            let kind = args["kind"].as_str().map(str::to_owned);
+            let query = args["query"].as_str().unwrap_or_default().to_owned();
+            let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+            let refresh = args["refresh"].as_bool().unwrap_or(false);
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match versions::fetch_mojang_versions(
+                    &home,
+                    kind.as_deref(),
+                    &query,
+                    limit,
+                    offset,
+                    refresh,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        other => json!({ "error": format!("unknown launcher-versions action {other}") }),
+    };
+    Ok(Some(Some(sync_reply)))
+}
+
+fn handle_launcher_mods(
+    line: &str,
+    reply: &Sender<String>,
+) -> Result<Option<Option<Value>>> {
+    use horizon_client::launcher_mods;
+    let raw = line
+        .trim_start()
+        .strip_prefix("launcher-mods")
+        .map(str::trim)
+        .unwrap_or("{}");
+    let args: Value = serde_json::from_str(raw).map_err(|e| format!("launcher-mods JSON: {e}"))?;
+    let home = horizon_client::import::home();
+    let action = args["action"].as_str().unwrap_or("list");
+
+    let sync_reply = match action {
+        "list" => json!({ "mods": launcher_mods::list_installed(&home) }),
+        "toggle" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            let enabled = args["enabled"].as_bool().unwrap_or(true);
+            match launcher_mods::set_enabled(&home, id, enabled) {
+                Ok(mods) => json!({ "ok": true, "mods": mods }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "delete" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            match launcher_mods::delete_mod(&home, id) {
+                Ok(mods) => json!({ "ok": true, "mods": mods }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "horizon-browse" => {
+            let query = args["query"].as_str().unwrap_or_default().to_owned();
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match launcher_mods::browse_horizon_registry(&home, &query) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        "horizon-install" => {
+            let id = args["id"].as_str().unwrap_or_default().to_owned();
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match launcher_mods::install_from_horizon_registry(&home, &id) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        "modrinth-search" => {
+            let query = args["query"].as_str().unwrap_or_default().to_owned();
+            let ver = args["version"].as_str().map(str::to_owned);
+            let loader = args["loader"].as_str().map(str::to_owned);
+            let sort = args["sort"].as_str().map(str::to_owned);
+            let limit = args["limit"].as_u64().unwrap_or(30) as usize;
+            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match launcher_mods::search_modrinth(
+                    &query,
+                    ver.as_deref(),
+                    loader.as_deref(),
+                    sort.as_deref(),
+                    limit,
+                    offset,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        "modrinth-versions" => {
+            let project_id = args["project_id"].as_str().unwrap_or_default().to_owned();
+            let ver = args["version"].as_str().map(str::to_owned);
+            let loader = args["loader"].as_str().map(str::to_owned);
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match launcher_mods::modrinth_versions(
+                    &project_id,
+                    ver.as_deref(),
+                    loader.as_deref(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        "modrinth-install" => {
+            let project_id = args["project_id"].as_str().unwrap_or_default().to_owned();
+            let version_id = args["version_id"].as_str().map(str::to_owned);
+            let mc_ver = args["minecraft_version"].as_str().map(str::to_owned);
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match launcher_mods::install_from_modrinth(
+                    &home,
+                    &project_id,
+                    version_id.as_deref(),
+                    mc_ver.as_deref(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        "import" => {
+            let path = PathBuf::from(args["path"].as_str().unwrap_or_default());
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let answer = match launcher_mods::import_local_mod_file(&home, &path) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+                let _ = reply.send(answer.to_string());
+            });
+            return Ok(Some(None));
+        }
+        other => json!({ "error": format!("unknown launcher-mods action {other}") }),
+    };
+    Ok(Some(Some(sync_reply)))
 }
 
 impl Game<'_> {

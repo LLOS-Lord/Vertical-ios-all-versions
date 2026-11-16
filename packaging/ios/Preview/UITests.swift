@@ -376,4 +376,26 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertFalse(app.buttons["Change Offline Name"].exists)
     }
 
+    func testMultiVersionBrowserAndInLauncherModsAreReachable() {
+        let app = launch(signedIn: false)
+        let versionsButton = app.buttons["launcher-open-versions"]
+        XCTAssertTrue(versionsButton.waitForExistence(timeout: 5))
+        versionsButton.tap()
+        XCTAssertTrue(app.staticTexts["Game Versions"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["versions-done-button"].exists)
+        app.buttons["versions-done-button"].tap()
+
+        let bar = app.tabBars.firstMatch
+        if bar.exists {
+            bar.buttons["Packs"].tap()
+        } else {
+            app.buttons["launcher-nav-packs"].tap()
+        }
+        let picker = app.segmentedControls["packs-kind-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 5))
+        picker.buttons["Mods"].tap()
+        XCTAssertTrue(app.staticTexts["Installed Mods"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Copper Lamps"].waitForExistence(timeout: 5))
+    }
+
 }

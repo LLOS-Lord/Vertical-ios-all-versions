@@ -800,22 +800,41 @@ fn connect_tcp(
     Ok((c, host, port))
 }
 
-/// Whether joining servers of older releases is on (roadmap `older-servers`): off by default while the
-/// adapter is incomplete; `HORIZON_OLDER_SERVERS=1` turns it on.
+/// Whether joining servers of older releases (1.20.2–26.2 via `horizon_protocol::adapter`) is enabled.
+/// Enabled by default on iOS & Android and whenever an older active version profile sets a protocol
+/// preference; `HORIZON_OLDER_SERVERS=0` explicitly turns it off.
 pub fn older_servers_enabled() -> bool {
-    std::env::var_os("HORIZON_OLDER_SERVERS").is_some_and(|v| v == "1")
+    if let Some(val) = std::env::var_os("HORIZON_OLDER_SERVERS") {
+        return val != "0" && val != "false";
+    }
+    if horizon_protocol::adapter::preferred_server_version().is_some() {
+        return true;
+    }
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        crate::versions::load_selection(&crate::import::home()).older_servers
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        false
+    }
 }
 
-/// The older release a server speaks, by its status ping, when Horizon can translate it; `None` for the
-/// pinned version, an unknown one, a failed ping, or with the feature off.
+/// The older release a server speaks, by its status ping (falling back to the active profile's
+/// preferred protocol when status ping is proxied or blocked), when Horizon can translate it.
 fn older_server(address: &str) -> Option<horizon_protocol::adapter::ServerVersion> {
-    use horizon_protocol::adapter::ServerVersion;
+    use horizon_protocol::adapter::{ServerVersion, preferred_server_version};
     if !older_servers_enabled() {
         return None;
     }
-    let (json, _) = ping(address, Duration::from_secs(5)).ok()?;
-    let protocol = i32::try_from(json["version"]["protocol"].as_i64()?).ok()?;
-    ServerVersion::from_protocol(protocol).filter(|v| *v != ServerVersion::Current)
+    if let Ok((json, _)) = ping(address, Duration::from_secs(5))
+        && let Some(raw) = json["version"]["protocol"].as_i64()
+        && let Ok(protocol) = i32::try_from(raw)
+        && let Some(ver) = ServerVersion::from_protocol(protocol)
+    {
+        return (ver != ServerVersion::Current).then_some(ver);
+    }
+    preferred_server_version().filter(|v| *v != ServerVersion::Current)
 }
 
 /// `Connection.exceptionCaught`: a read that timed out ends with

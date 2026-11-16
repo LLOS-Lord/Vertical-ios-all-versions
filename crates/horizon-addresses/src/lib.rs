@@ -48,3 +48,34 @@ pub const STUN_SERVERS: &[&str] = &["stun.cloudflare.com:3478", "stun.l.google.c
 /// Play with Friends' troubleshooting page, shown to hosts nobody can reach.
 pub const FRIENDS_HELP: &str =
     "https://github.com/horizon-rust/horizon/blob/main/docs/play-with-friends.md#troubleshooting";
+
+/// Remote JSON catalogs listing prepared Horizon resource bundles across game versions for mobile
+/// launchers (`HORIZON_VERSION_CATALOG_URL` overrides the primary catalog).
+pub const MOBILE_VERSION_CATALOGS: &[&str] = &[
+    "https://raw.githubusercontent.com/LLOS-Lord/Vertical-ios/main/packaging/ios/versions-catalog.json",
+    "https://horizon-rust.github.io/horizon-mods/versions-catalog.json",
+];
+
+/// Default prepared game-files mirror archive for mobile launchers (`HORIZON_GAME_FILES_URL`
+/// overrides it).
+pub const MOBILE_PREPARED_26_3_ZIP: &str = "https://cdn.gayfeet.lol/horizon/26.3.zip";
+
+/// Built-in prepared Horizon bundle mirrors (`(id, label, version, url, notes)`), passed into the
+/// engine by `horizon-official` so mobile launchers can browse mirrors or add custom server URLs.
+pub const MOBILE_PREPARED_MIRRORS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "vertical-cdn-26.3",
+        "Vertical Community Mirror (26.3 Full Prepared)",
+        "26.3",
+        "https://cdn.gayfeet.lol/horizon/26.3.zip",
+        "Full PC horizon-prepare bundle (simulation tables + Mojang 26.3 assets). Unlocks full offline simulation for all Mojang versions.",
+    ),
+    (
+        "github-release-26.3",
+        "Vertical-iOS GitHub Releases (26.3 Prepared)",
+        "26.3",
+        "https://github.com/LLOS-Lord/Vertical-ios/releases/latest/download/horizon-resources-26.3.zip",
+        "GitHub Release mirror for prepared 26.3 game files (~589 MB).",
+    ),
+];
+

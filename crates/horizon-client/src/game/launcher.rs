@@ -118,6 +118,8 @@ fn allowed_while_stopping(command: &str) -> bool {
             | "server-ping"
             | "import"
             | "import-game-files"
+            | "launcher-versions"
+            | "launcher-mods"
     )
 }
 
@@ -247,11 +249,14 @@ impl Game<'_> {
                 }
 
                 "launcher-state" => {
+                    let active_version =
+                        horizon_client::versions::active_version_id(&horizon_client::import::home());
                     let state = json!({
                         "phase": if self.title.is_some() { "title" } else { "world" },
                         "screen": self.screen_name(),
                         "player": self.options.player_name(),
-                        "version": horizon_core::version::VERSION_ID,
+                        "version": active_version,
+                        "engine_version": horizon_core::version::VERSION_ID,
                     });
                     request.answer(&state.to_string());
                 }
@@ -259,6 +264,9 @@ impl Game<'_> {
                 // The game is up: the download screen has nothing left to show.
                 "download-state" => request.answer(r#"{"phase":"done"}"#),
                 "launcher-start" => {
+                    horizon_client::versions::apply_active_protocol_preference(
+                        &horizon_client::import::home(),
+                    );
                     let accepted = !self.quit_to_launcher
                         && horizon_ios_launcher::start_owned(start_owner(&request.line));
                     request.answer(
@@ -487,19 +495,28 @@ impl Loading {
                     request.answer(&json!({ "ok": accepted }).to_string());
                 }
 
-                "game-files-source" => request.answer(
-                    &json!({
-                        "url": horizon_client::import::download::url(horizon_core::VANILLA_VERSION),
-                        "version": horizon_core::VANILLA_VERSION,
-                    })
-                    .to_string(),
-                ),
+                "game-files-source" => {
+                    let home = horizon_client::import::home();
+                    let active = horizon_client::versions::active_version_id(&home);
+                    request.answer(
+                        &json!({
+                            "url": horizon_client::import::download::url(&active),
+                            "version": active,
+                            "engine_version": horizon_core::VANILLA_VERSION,
+                        })
+                        .to_string(),
+                    );
+                }
                 "launcher-start" => {
                     if importing_archive() {
                         request.answer(r#"{"error":"Wait for the current import to finish."}"#);
                     } else {
                         if horizon_ios_launcher::waiting() {
-                            self.refresh_import_root(&horizon_client::import::home())?;
+                            let home = horizon_client::import::home();
+                            self.settings =
+                                horizon_client::settings::Settings::load(&Game::options_path());
+                            horizon_client::versions::apply_active_protocol_preference(&home);
+                            self.refresh_import_root(&home)?;
                         }
                         let accepted =
                             horizon_ios_launcher::start_owned(start_owner(&request.line));
@@ -509,12 +526,14 @@ impl Loading {
                 "launcher-commit-start" => commit_start(request),
                 "launcher-cancel-start" => cancel_start(request),
                 "launcher-state" => {
+                    let active_version =
+                        horizon_client::versions::active_version_id(&horizon_client::import::home());
                     let state = if horizon_ios_launcher::waiting() {
-                        json!({ "phase": "waiting" })
+                        json!({ "phase": "waiting", "version": active_version })
                     } else if self.importing() {
-                        json!({ "phase": "needs_files", "reason": self.import_reason() })
+                        json!({ "phase": "needs_files", "reason": self.import_reason(), "version": active_version })
                     } else {
-                        json!({ "phase": "loading", "progress": self.progress.fraction() })
+                        json!({ "phase": "loading", "progress": self.progress.fraction(), "version": active_version })
                     };
                     request.answer(&state.to_string());
                 }

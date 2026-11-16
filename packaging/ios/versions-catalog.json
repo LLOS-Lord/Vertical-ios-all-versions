@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "description": "Prepared Horizon resource bundles for Vertical-iOS multi-version launcher. Self-hosted or GitHub Release archives built with `cargo run -p horizon-prepare` and `--pack-resources` can be added here or entered directly as a custom URL in the iOS Version Browser.",
+  "versions": [
+    {
+      "id": "vertical-cdn-26.3",
+      "label": "Minecraft 26.3 — Full Prepared Runtime (Community CDN)",
+      "version": "26.3",
+      "url": "https://cdn.gayfeet.lol/horizon/26.3.zip",
+      "bytes": 617611264,
+      "notes": "Complete prepared tree (simulation/parity tables + Mojang 26.3 assets). Installing one full prepared runtime also unlocks on-device Mojang preparation for all older & snapshot versions."
+    },
+    {
+      "id": "github-release-26.3",
+      "label": "Minecraft 26.3 — GitHub Release Mirror",
+      "version": "26.3",
+      "url": "https://github.com/LLOS-Lord/Vertical-ios/releases/latest/download/horizon-resources-26.3.zip",
+      "notes": "GitHub Releases fallback mirror for prepared 26.3 game files."
+    }
+  ]
+}

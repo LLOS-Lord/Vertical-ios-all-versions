@@ -140,7 +140,12 @@ struct SettingsPage: View {
         VStack(alignment: .leading, spacing: 16) {
             TouchControlsSettings()
             SectionHeader(title: "Game files")
-            GameFilesCard(download: download, missing: !GameFolder.hasGameFiles)
+            SecondaryButton(title: "Manage Game Versions (\(link.version))", icon: "square.stack.3d.up") {
+                link.showingVersionBrowser = true
+            }
+            .accessibilityIdentifier("settings-manage-versions")
+            GameFilesCard(download: download, missing: !GameFolder.hasGameFiles,
+                          browseVersions: { link.showingVersionBrowser = true })
 
             SectionHeader(title: "About")
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }
