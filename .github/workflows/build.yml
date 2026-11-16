@@ -70,8 +70,8 @@ jobs:
           cargo test --locked -p horizon-client-lib --lib versions::tests -- --nocapture
           cargo test --locked -p horizon-client-lib --lib launcher_mods::tests -- --nocapture
           cargo test --locked -p horizon-client-lib --lib import::download::tests -- --nocapture
-          cargo test --locked -p horizon-client --lib game::launcher::tests -- --nocapture
-          cargo test --locked -p horizon-client --lib game::saves_control::tests -- --nocapture
+          cargo test --locked -p horizon-client --test ios_all_versions_e2e -- --nocapture
+          cargo check --locked -p horizon-official --bin horizon-official --no-default-features --features audio,horizon-extras
 
   ios-ipa:
     name: iOS Swift Tests & Native ARM64 IPA

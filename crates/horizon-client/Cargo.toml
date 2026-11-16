@@ -178,6 +178,10 @@ test = false
 name = "it"
 path = "tests/it/main.rs"
 
+[[test]]
+name = "ios_all_versions_e2e"
+path = "tests/ios_all_versions_e2e.rs"
+
 [[example]]
 name = "native_gui_overlay_probe"
 path = "examples/native_gui_overlay_probe.rs"
