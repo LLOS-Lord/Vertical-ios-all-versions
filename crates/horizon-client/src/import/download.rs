@@ -19,30 +19,35 @@ use std::{
 
 use super::{Installed, MAX_PACKED, Pack};
 
-/// The archive's default address for this version, supplied by the registered Horizon porter
-/// (`horizon-addresses`) unless `HORIZON_GAME_FILES_URL` overrides it.
-pub fn url(version: &str) -> String {
-    if let Ok(custom) = std::env::var("HORIZON_GAME_FILES_URL") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            if trimmed.ends_with(".zip") {
-                return trimmed.to_owned();
-            }
-            let base = if trimmed.ends_with('/') {
-                trimmed.to_owned()
-            } else {
-                format!("{trimmed}/")
-            };
-            return format!("{base}{version}.zip");
+/// Resolve the archive URL for `version` from an optional explicit override (`HORIZON_GAME_FILES_URL`)
+/// and an optional registered porter default URL.
+fn url_with_default(version: &str, custom: Option<&str>, registered: Option<&str>) -> String {
+    if let Some(custom) = custom.map(str::trim).filter(|s| !s.is_empty()) {
+        if custom.ends_with(".zip") {
+            return custom.to_owned();
         }
+        let base = if custom.ends_with('/') {
+            custom.to_owned()
+        } else {
+            format!("{custom}/")
+        };
+        return format!("{base}{version}.zip");
     }
-    if let Some(default_url) = horizon_hooks::porter::engine::default_prepared_url() {
+    if let Some(default_url) = registered {
         if let Some((prefix, _)) = default_url.rsplit_once('/') {
             return format!("{prefix}/{version}.zip");
         }
-        return default_url;
+        return default_url.to_owned();
     }
     format!("{version}.zip")
+}
+
+/// The archive's default address for this version, supplied by the registered Horizon porter
+/// (`horizon-addresses`) unless `HORIZON_GAME_FILES_URL` overrides it.
+pub fn url(version: &str) -> String {
+    let custom = std::env::var("HORIZON_GAME_FILES_URL").ok();
+    let registered = horizon_hooks::porter::engine::default_prepared_url();
+    url_with_default(version, custom.as_deref(), registered.as_deref())
 }
 
 /// What the download is doing now.
@@ -325,7 +330,19 @@ mod tests {
 
     #[test]
     fn the_archive_is_named_for_the_version() {
-        assert_eq!(url("26.3"), "https://cdn.gayfeet.lol/horizon/26.3.zip");
+        assert_eq!(
+            url_with_default(
+                "1.21.4",
+                None,
+                Some("https://mirror.example/horizon/26.3.zip"),
+            ),
+            "https://mirror.example/horizon/1.21.4.zip"
+        );
+        assert_eq!(
+            url_with_default("26.3", Some("https://cdn.example/bundles"), None),
+            "https://cdn.example/bundles/26.3.zip"
+        );
+        assert_eq!(url_with_default("26.3", None, None), "26.3.zip");
     }
 
     /// One HTTP answer from a local socket: `length` in the header, `body` sent.

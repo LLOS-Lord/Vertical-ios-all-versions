@@ -620,4 +620,26 @@ mod native_creation_tests {
         assert_eq!(o.difficulty, 2);
         assert!(serde_json::from_str::<NativeWorldCreation>(r#"{"unsupported":true}"#).is_err());
     }
+
+    #[test]
+    fn launcher_versions_and_mods_control_commands_answer_json_snapshots() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ver_line = r#"launcher-versions {"action":"list"}"#;
+        let ver_words: Vec<&str> = ver_line.split_whitespace().collect();
+        let ver_reply = super::file_command(&ver_words, ver_line, &tx)
+            .expect("versions command ok")
+            .expect("handled")
+            .expect("synchronous json");
+        assert!(ver_reply["active"].is_string());
+        assert!(ver_reply["versions"].is_array());
+        assert!(ver_reply["older_servers"].is_boolean());
+
+        let mod_line = r#"launcher-mods {"action":"list"}"#;
+        let mod_words: Vec<&str> = mod_line.split_whitespace().collect();
+        let mod_reply = super::file_command(&mod_words, mod_line, &tx)
+            .expect("mods command ok")
+            .expect("handled")
+            .expect("synchronous json");
+        assert!(mod_reply["mods"].is_array());
+    }
 }
