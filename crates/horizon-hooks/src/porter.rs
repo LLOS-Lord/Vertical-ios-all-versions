@@ -47,6 +47,12 @@ pub trait Porter: Sync {
         None
     }
 
+    /// Compact simulation-runtime archive URL (`sim-base-26.3.zip`) used to equip Mojang
+    /// on-device downloads with `horizon-prepare`'s exported `26.3` simulation tables.
+    fn simulation_base_url(&self) -> Option<&str> {
+        None
+    }
+
     /// Remote JSON catalog URLs listing prepared Horizon bundles across versions.
     fn catalog_urls(&self) -> Vec<String> {
         Vec::new()
@@ -128,6 +134,12 @@ pub mod engine {
         all()
             .iter()
             .find_map(|p| p.default_prepared_url().map(str::to_owned))
+    }
+
+    pub fn simulation_base_url() -> Option<String> {
+        all()
+            .iter()
+            .find_map(|p| p.simulation_base_url().map(str::to_owned))
     }
 
     pub fn catalog_urls() -> Vec<String> {

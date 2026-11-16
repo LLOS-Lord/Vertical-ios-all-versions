@@ -120,14 +120,22 @@ final class DownloadModel: ObservableObject {
         close()
     }
 
+    /// Dismiss the download screen and re-open the full native Launcher (Versions, Mods, Settings).
+    func returnToLauncher() {
+        close()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            _ = horizonLauncherPresent(Bridge.submit)
+        }
+    }
+
     private func apply(_ state: [String: Any]) {
+        if let version = state["version"] as? String, !version.isEmpty {
+            self.version = version
+        }
         switch state["phase"] as? String {
         case "downloading":
             let bytes = (state["received"] as? NSNumber)?.int64Value ?? 0
             total = (state["total"] as? NSNumber)?.int64Value ?? 0
-            if let version = state["version"] as? String {
-                self.version = version
-            }
             measure(bytes)
             received = bytes
             phase = .downloading
@@ -210,9 +218,16 @@ struct DownloadView: View {
                         PrimaryButton(title: "Try again", icon: "arrow.clockwise") {
                             Task { await model.retry() }
                         }
+                        SecondaryButton(title: "Return to Launcher", icon: "house.fill") {
+                            model.returnToLauncher()
+                        }
                         SecondaryButton(title: "Other ways to get them", icon: "wifi") {
                             model.otherWays()
                         }
+                    }
+                } else {
+                    SecondaryButton(title: "Return to Launcher", icon: "house.fill") {
+                        model.returnToLauncher()
                     }
                 }
                 Spacer()

@@ -22,6 +22,79 @@ final class VersionsAndModsTests: XCTestCase {
         try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
         try Data("{}".utf8).write(to: legacy.appendingPathComponent("horizon-resources.json"))
         XCTAssertTrue(GameFolder.hasGameFiles(in: root))
+
+        try FileManager.default.removeItem(at: legacy)
+        let hiddenBase = root.appendingPathComponent("versions/.sim-base-26.3/resources")
+        try FileManager.default.createDirectory(at: hiddenBase, withIntermediateDirectories: true)
+        try Data(#"{"schema":7,"full_simulation":true}"#.utf8)
+            .write(to: hiddenBase.appendingPathComponent("horizon-resources.json"))
+        XCTAssertFalse(GameFolder.hasGameFiles(in: root), "Hidden .sim-base-26.3 must not count as a user version")
+
+        let partial = root.appendingPathComponent("versions/26.3/resources")
+        try FileManager.default.createDirectory(at: partial, withIntermediateDirectories: true)
+        try Data(#"{"schema":7,"full_simulation":false}"#.utf8)
+            .write(to: partial.appendingPathComponent("horizon-resources.json"))
+        XCTAssertFalse(GameFolder.hasGameFiles(in: root), "Partial Mojang install must require sim-base completion")
+
+        try Data(#"{"schema":7,"full_simulation":true}"#.utf8)
+            .write(to: partial.appendingPathComponent("horizon-resources.json"))
+        XCTAssertTrue(GameFolder.hasGameFiles(in: root))
+    }
+
+    @MainActor
+    func testMojangPlusSimBaseModeRepairsPartialAndDownloadsExplicitly() async {
+        let marker = GameFolder.resources.appendingPathComponent("horizon-resources.json")
+        let previous = try? Data(contentsOf: marker)
+        try? FileManager.default.removeItem(at: marker)
+        let versionsBackup = GameFolder.documents.appendingPathComponent("versions.test-backup-\(UUID().uuidString)")
+        let hadVersions = FileManager.default.fileExists(atPath: GameFolder.versions.path)
+        if hadVersions { try? FileManager.default.moveItem(at: GameFolder.versions, to: versionsBackup) }
+        defer {
+            if let previous { try? previous.write(to: marker) }
+            else { try? FileManager.default.removeItem(at: marker) }
+            try? FileManager.default.removeItem(at: GameFolder.versions)
+            if hadVersions { try? FileManager.default.moveItem(at: versionsBackup, to: GameFolder.versions) }
+        }
+
+        // 1. Fresh install (`partial_mojang == false`): `startAutomaticallyIfNeeded()` stays `.idle`,
+        // while explicit `startAutomatic()` dispatches `download-mojang`.
+        var commands: [String] = []
+        let fresh = GameFilesDownload(
+            automaticSource: { ["mode": "mojang_plus_sim_base", "version": "26.3", "partial_mojang": false] },
+            versionBridge: { line in
+                commands.append(line)
+                if line.contains(#""action":"job""#) {
+                    return ["active": false, "done": true, "version_id": "26.3"]
+                }
+                return ["ok": true]
+            },
+            diagnostic: { _ in }
+        )
+        await fresh.startAutomaticallyIfNeeded()
+        XCTAssertEqual(fresh.state, .idle)
+        XCTAssertTrue(commands.isEmpty)
+
+        await fresh.startAutomatic()
+        XCTAssertTrue(commands.first?.contains("download-mojang") == true)
+        XCTAssertEqual(fresh.state, .done("Minecraft 26.3 is installed and ready to play."))
+
+        // 2. Partial Mojang install (`partial_mojang == true`): `startAutomaticallyIfNeeded()`
+        // automatically runs `repair` to fetch `sim-base-26.3.zip` (~45 MB).
+        var repairCommands: [String] = []
+        let partial = GameFilesDownload(
+            automaticSource: { ["mode": "mojang_plus_sim_base", "version": "1.20.4", "partial_mojang": true] },
+            versionBridge: { line in
+                repairCommands.append(line)
+                if line.contains(#""action":"job""#) {
+                    return ["active": false, "done": true, "version_id": "1.20.4"]
+                }
+                return ["ok": true]
+            },
+            diagnostic: { _ in }
+        )
+        await partial.startAutomaticallyIfNeeded()
+        XCTAssertTrue(repairCommands.first?.contains(#""action":"repair""#) == true)
+        XCTAssertEqual(partial.state, .done("Minecraft 1.20.4 is installed and ready to play."))
     }
 
     @MainActor

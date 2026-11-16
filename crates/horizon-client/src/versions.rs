@@ -38,31 +38,56 @@ pub const MOJANG_RESOURCES_BASE_URL: &str = "https://resources.download.minecraf
 const SELECTION_FILE: &str = "versions/active.json";
 const PROFILE_FILE: &str = "version-profile.json";
 const MANIFEST_CACHE_FILE: &str = "versions/mojang-manifest-cache.json";
+const SIM_BASE_DIR_NAME: &str = ".sim-base-26.3";
 const SCHEMA_VERSION: u32 = 7;
 
-/// Top-level simulation/datagen files produced by `horizon-prepare` (`SCHEMA = 7`).
-/// When a full prepared Horizon base is present on the device, `prepare_mojang_on_device` links
-/// (via APFS hardlink, falling back to copy) these simulation tables into newly downloaded Mojang
-/// version directories so the native Rust engine has complete block/entity/registry/datafix tables.
-const BASE_SIMULATION_FILES: &[&str] = &[
+/// Complete list of required top-level simulation/datagen files produced by `horizon-prepare`
+/// (`SCHEMA = 7`, `OUTPUT_VERSION = 4`) and read by `load_resources_with_access`, `Assets::load`,
+/// `load_world_rest`, and `GameCpuResources::load`.
+pub const REQUIRED_SIMULATION_FILES: &[&str] = &[
+    "facts.json",
+    "block-tags.json",
+    "movement-properties.nbt",
+    "attributes.json",
+    "landing-definitions.json",
+    "damage-types.json",
+    "damage-tags.json",
+    "damage-catalog.json",
+    "player-float-ids.json",
+    "cached-collision.nbt",
+    "render-definitions.json",
+    "occlusion.nbt",
+    "gameplay-facts.json",
+    "entity-types.json",
+    "block-behaviours.json",
+    "datafix-tables.json",
+    "model-states.json",
+    "entity-models.json",
+    "mob-data.json",
+    "command-registries.json",
     "registries.json",
     "commands.json",
-    "command-registries.json",
-    "facts.json",
-    "block-behaviours.json",
-    "block-tags.json",
     "items.json",
-    "entity-models.json",
-    "render-definitions.json",
-    "cached-collision.nbt",
-    "occlusion.nbt",
-    "movement-properties.nbt",
-    "datafix-tables.json",
-    "horizon-prepare.json",
+    "creative-inventory.json",
 ];
 
-/// Top-level simulation folders linked when absent from an older Mojang `client.jar`.
-const BASE_SIMULATION_DIRS: &[&str] = &["worldgen", "packs"];
+/// Optional metadata files written by `horizon-prepare` and linked when present.
+const OPTIONAL_SIMULATION_FILES: &[&str] = &[
+    "horizon-prepare.json",
+    "asset-index.json",
+    "pack.png",
+];
+
+/// Required nested worldgen & font files verified before declaring a resource directory playable.
+const REQUIRED_NESTED_FILES: &[&str] = &[
+    "worldgen/blocks/block-properties.nbt",
+    "worldgen/blocks/cached-collision.nbt",
+    "worldgen/blocks/cached-support.nbt",
+    "assets/minecraft/font/default.json",
+];
+
+/// Top-level simulation folders linked from the prepared Horizon base.
+const BASE_SIMULATION_DIRS: &[&str] = &["worldgen", "biome-parameters", "packs"];
 
 /// Active version & cross-version protocol preference stored in `Documents/versions/active.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,24 +286,100 @@ pub fn save_selection(home: &Path, selection: &ActiveSelection) -> Result<(), St
     fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn has_simulation_tables(resources_dir: &Path) -> bool {
-    resources_dir.join("horizon-resources.json").is_file()
-        && resources_dir.join("registries.json").is_file()
-        && resources_dir.join("facts.json").is_file()
+/// Validate that `resources_dir` contains a complete, engine-loadable Horizon prepared tree:
+/// - `horizon-resources.json` exists, parses as JSON, is not marked `full_simulation: false`,
+///   and matches `horizon_world::DATA_VERSION`.
+/// - Every required `horizon-prepare` simulation table (`REQUIRED_SIMULATION_FILES`) and nested
+///   worldgen/font file (`REQUIRED_NESTED_FILES`) exists on disk.
+pub fn validate_playable_root(resources_dir: &Path) -> Result<(), String> {
+    let manifest_path = resources_dir.join("horizon-resources.json");
+    if !manifest_path.is_file() {
+        return Err("No game files installed yet (missing horizon-resources.json).".into());
+    }
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Could not read horizon-resources.json: {e}"))?;
+    let manifest: Value = serde_json::from_str(&manifest_text)
+        .map_err(|e| format!("Invalid horizon-resources.json: {e}"))?;
+    if manifest.get("full_simulation").and_then(Value::as_bool) == Some(false) {
+        let ver = manifest
+            .get("source_minecraft")
+            .or_else(|| manifest.get("minecraft"))
+            .and_then(Value::as_str)
+            .unwrap_or("selected version");
+        return Err(format!(
+            "Minecraft {ver} was downloaded without Horizon's simulation runtime tables. Tap Complete Setup in Game Versions to finish installing (~45 MB)."
+        ));
+    }
+    let expected_dv = i64::from(horizon_world::DATA_VERSION);
+    match manifest.get("data_version").and_then(Value::as_i64) {
+        Some(dv) if dv == expected_dv => {}
+        Some(other) => {
+            return Err(format!(
+                "Game files data_version ({other}) does not match Horizon {} ({expected_dv}).",
+                horizon_core::VANILLA_VERSION
+            ));
+        }
+        None => {
+            return Err(
+                "Game files are incomplete (missing data_version in horizon-resources.json)."
+                    .into(),
+            );
+        }
+    }
+    for rel in REQUIRED_SIMULATION_FILES
+        .iter()
+        .chain(REQUIRED_NESTED_FILES.iter())
+    {
+        if !resources_dir.join(rel).is_file() {
+            return Err(format!(
+                "Game files are incomplete (missing required engine table '{rel}')."
+            ));
+        }
+    }
+    Ok(())
 }
 
-fn is_ready_root(resources_dir: &Path) -> bool {
+pub fn has_simulation_tables(resources_dir: &Path) -> bool {
+    validate_playable_root(resources_dir).is_ok()
+}
+
+pub fn is_ready_root(resources_dir: &Path) -> bool {
+    validate_playable_root(resources_dir).is_ok()
+}
+
+/// True when `resources_dir` holds an incomplete/partial Mojang download (`horizon-resources.json`
+/// exists on disk, but `validate_playable_root` has not passed yet).
+pub fn has_partial_mojang_root(resources_dir: &Path) -> bool {
+    resources_dir.join("horizon-resources.json").is_file() && !is_ready_root(resources_dir)
+}
+
+/// True when at least one partial Mojang version exists under `home/versions/*/resources`.
+pub fn has_any_partial_mojang(home: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(home.join("versions")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let hidden = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        !hidden && has_partial_mojang_root(&path.join("resources"))
+    })
+}
+
+fn has_installed_marker(resources_dir: &Path) -> bool {
     resources_dir.join("horizon-resources.json").is_file()
 }
 
 fn read_profile(resources_dir: &Path, fallback_id: &str) -> VersionProfile {
+    let full = has_simulation_tables(resources_dir);
     if let Ok(text) = fs::read_to_string(resources_dir.join(PROFILE_FILE))
         && let Ok(mut parsed) = serde_json::from_str::<VersionProfile>(&text)
     {
-        parsed.full_simulation = parsed.full_simulation || has_simulation_tables(resources_dir);
+        parsed.full_simulation = full;
         return parsed;
     }
-    let full = has_simulation_tables(resources_dir);
     let protocol = ServerVersion::protocol_for_version_id(fallback_id);
     let adapter = ServerVersion::from_version_id(fallback_id).map(|v| format!("{v:?}"));
     VersionProfile {
@@ -294,19 +395,25 @@ fn read_profile(resources_dir: &Path, fallback_id: &str) -> VersionProfile {
         notes: if full {
             "Prepared Horizon runtime & assets.".into()
         } else {
-            "Imported Horizon resource directory.".into()
+            "Partial Mojang install — needs Horizon simulation runtime (~45 MB).".into()
         },
     }
 }
 
 fn write_profile(resources_dir: &Path, profile: &VersionProfile) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
-    fs::write(resources_dir.join(PROFILE_FILE), bytes)
+    write_unlinked(&resources_dir.join(PROFILE_FILE), &bytes)
         .map_err(|e| format!("{}: {e}", resources_dir.display()))
 }
 
 /// List all installed versions under `home/versions/*/resources` plus legacy `home/resources`.
+/// Includes partial Mojang installs (`ready: false`) so the launcher can repair or remove them,
+/// while only marking genuinely playable (`ready: true`) versions as `active` for engine launch.
 pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
+    if let Some(base) = find_simulation_base(home) {
+        let _ = upgrade_partial_mojang_versions(home, &base);
+    }
+
     let sel = load_selection(home);
     let mut map: BTreeMap<String, InstalledVersion> = BTreeMap::new();
 
@@ -324,7 +431,7 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
                 continue;
             }
             let res = path.join("resources");
-            if !is_ready_root(&res) {
+            if !has_installed_marker(&res) {
                 continue;
             }
             let prof = read_profile(&res, folder_id);
@@ -343,7 +450,7 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
                     id,
                     release_type: prof.release_type,
                     source: prof.source,
-                    full_simulation: prof.full_simulation,
+                    full_simulation: ready,
                     ready,
                     active: false,
                     legacy_root: false,
@@ -358,7 +465,7 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
     }
 
     let legacy = home.join("resources");
-    if is_ready_root(&legacy) {
+    if has_installed_marker(&legacy) {
         let inferred_id = fs::read_to_string(legacy.join("horizon-resources.json"))
             .ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -371,6 +478,7 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
             .unwrap_or_else(|| horizon_core::VANILLA_VERSION.to_owned());
         if !map.contains_key(&inferred_id) {
             let prof = read_profile(&legacy, &inferred_id);
+            let ready = is_ready_root(&legacy);
             map.insert(
                 inferred_id.clone(),
                 InstalledVersion {
@@ -384,8 +492,8 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
                     id: inferred_id,
                     release_type: prof.release_type,
                     source: prof.source,
-                    full_simulation: prof.full_simulation,
-                    ready: true,
+                    full_simulation: ready,
+                    ready,
                     active: false,
                     legacy_root: true,
                     files: prof.files,
@@ -400,8 +508,12 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
 
     let mut list: Vec<InstalledVersion> = map.into_values().collect();
     list.sort_by(|a, b| {
-        (a.id != horizon_core::VANILLA_VERSION)
-            .cmp(&(b.id != horizon_core::VANILLA_VERSION))
+        b.ready
+            .cmp(&a.ready)
+            .then_with(|| {
+                (a.id != horizon_core::VANILLA_VERSION)
+                    .cmp(&(b.id != horizon_core::VANILLA_VERSION))
+            })
             .then_with(|| b.installed_epoch.cmp(&a.installed_epoch))
             .then_with(|| b.id.cmp(&a.id))
     });
@@ -414,7 +526,8 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
     list
 }
 
-/// Return the active version's `resources/` directory when at least one ready version exists.
+/// Return the active version's `resources/` directory when at least one genuinely playable
+/// (`validate_playable_root == Ok`) version exists.
 pub fn active_ready_root(home: &Path) -> Option<PathBuf> {
     list_installed(home)
         .into_iter()
@@ -452,6 +565,12 @@ pub fn apply_active_protocol_preference(home: &Path) {
 pub fn select_version(home: &Path, version_id: &str) -> Result<InstalledVersion, String> {
     let clean = sanitize_version_id(version_id).ok_or("invalid version id")?;
     let installed = list_installed(home);
+    if let Some(partial) = installed.iter().find(|v| v.id == clean && !v.ready) {
+        let _ = partial;
+        return Err(format!(
+            "Minecraft {clean} needs Horizon's simulation runtime (~45 MB). Tap Complete Setup first."
+        ));
+    }
     let found = installed
         .into_iter()
         .find(|v| v.id == clean && v.ready)
@@ -476,7 +595,7 @@ pub fn delete_version(home: &Path, version_id: &str) -> Result<(), String> {
         removed = true;
     }
     let legacy = home.join("resources");
-    if !removed && is_ready_root(&legacy) {
+    if !removed && has_installed_marker(&legacy) {
         let list = list_installed(home);
         if list.iter().any(|v| v.id == clean && v.legacy_root) {
             fs::remove_dir_all(&legacy).map_err(|e| format!("{}: {e}", legacy.display()))?;
@@ -499,11 +618,21 @@ pub fn delete_version(home: &Path, version_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Locate any installed resource root that holds full `horizon-prepare` simulation tables.
+/// Locate a pristine installed resource root that holds full `horizon-prepare` simulation tables.
+/// Checks dedicated `.sim-base-26.3/resources`, `26.3/resources`, and `resources` first so classic
+/// version texture overlays never bleed across other versions.
 pub fn find_simulation_base(home: &Path) -> Option<PathBuf> {
-    let legacy = home.join("resources");
-    if has_simulation_tables(&legacy) {
-        return Some(legacy);
+    let preferred = [
+        home.join("versions").join(SIM_BASE_DIR_NAME).join("resources"),
+        home.join("versions")
+            .join(horizon_core::VANILLA_VERSION)
+            .join("resources"),
+        home.join("resources"),
+    ];
+    for cand in preferred {
+        if has_simulation_tables(&cand) {
+            return Some(cand);
+        }
     }
     let versions_dir = home.join("versions");
     let entries = fs::read_dir(versions_dir).ok()?;
@@ -516,12 +645,38 @@ pub fn find_simulation_base(home: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Write `bytes` to `dst` after unlinking `dst` first so hardlinked base files are never mutated.
+fn write_unlinked(dst: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if dst.exists() {
+        let _ = fs::remove_file(dst);
+    }
+    fs::write(dst, bytes)
+}
+
 fn link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() {
         return Ok(());
     }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if fs::hard_link(src, dst).is_ok() {
+        return Ok(());
+    }
+    fs::copy(src, dst).map(|_| ())
+}
+
+/// Replace `dst` with a hardlink/copy of `src`, unlinking `dst` first so any prior hardlink to a
+/// shared simulation base remains completely untouched.
+fn replace_link_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if dst.exists() {
+        let _ = fs::remove_file(dst);
     }
     if fs::hard_link(src, dst).is_ok() {
         return Ok(());
@@ -550,9 +705,35 @@ fn link_missing_tree(src_dir: &Path, dst_dir: &Path) -> std::io::Result<usize> {
     Ok(count)
 }
 
+/// Build a schema-valid `horizon-resources.json` derived from `base`'s manifest, preserving
+/// `data_version`, `schema`, and hashes while recording `source_minecraft`.
+fn build_manifest_from_base(base: &Path, version_id: &str) -> Value {
+    let mut obj = fs::read_to_string(base.join("horizon-resources.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.entry("schema".to_owned())
+        .or_insert_with(|| json!(SCHEMA_VERSION));
+    obj.insert(
+        "data_version".to_owned(),
+        json!(i64::from(horizon_world::DATA_VERSION)),
+    );
+    obj.insert(
+        "minecraft".to_owned(),
+        json!(horizon_core::VANILLA_VERSION),
+    );
+    obj.insert("source_minecraft".to_owned(), json!(version_id));
+    obj.insert("full_simulation".to_owned(), json!(true));
+    Value::Object(obj)
+}
+
 fn populate_from_simulation_base(base: &Path, target_resources: &Path, version_id: &str) -> usize {
     let mut linked = 0usize;
-    for file_name in BASE_SIMULATION_FILES {
+    for file_name in REQUIRED_SIMULATION_FILES
+        .iter()
+        .chain(OPTIONAL_SIMULATION_FILES.iter())
+    {
         let src = base.join(file_name);
         let dst = target_resources.join(file_name);
         if src.is_file() && !dst.exists() && link_or_copy_file(&src, &dst).is_ok() {
@@ -566,31 +747,54 @@ fn populate_from_simulation_base(base: &Path, target_resources: &Path, version_i
             linked += n;
         }
     }
-    // Older Mojang jars (<1.21.4) do not have modern `assets/minecraft/items/*.json` item model
-    // definitions or newer GUI sprite slices: fill ONLY missing files from the base so the
-    // downloaded version's own textures/models/sounds always take priority!
-    for sub in [
-        "assets/minecraft/items",
-        "assets/minecraft/textures/gui/sprites",
-        "assets/minecraft/shaders",
-        "assets/minecraft/font",
-        "data/minecraft",
-    ] {
+    if version_id != horizon_core::VANILLA_VERSION {
+        // Older Mojang versions (< 26.3) carry older JSON schemas in `data/minecraft/*`,
+        // `assets/minecraft/models/*`, `assets/minecraft/blockstates/*`, `assets/minecraft/items/*`,
+        // `assets/minecraft/textures/gui/sprites/*`, and `assets/minecraft/lang/*.lang`.
+        // Replace schema-bound directories with the 26.3 simulation base while preserving all
+        // authentic version textures & sounds already unpacked in `target_resources`!
+        for schema_bound in [
+            "data",
+            "assets/minecraft/models",
+            "assets/minecraft/blockstates",
+            "assets/minecraft/items",
+            "assets/minecraft/atlases",
+            "assets/minecraft/equipment",
+            "assets/minecraft/shaders",
+            "assets/minecraft/font",
+            "assets/minecraft/textures/gui/sprites",
+        ] {
+            let src = base.join(schema_bound);
+            let dst = target_resources.join(schema_bound);
+            if src.is_dir() {
+                let _ = fs::remove_dir_all(&dst);
+                if let Ok(n) = link_missing_tree(&src, &dst) {
+                    linked += n;
+                }
+            }
+        }
+        for schema_file in [
+            "assets/pack.mcmeta",
+            "assets/minecraft/sounds.json",
+            "assets/minecraft/lang/en_us.json",
+        ] {
+            let src = base.join(schema_file);
+            let dst = target_resources.join(schema_file);
+            if src.is_file() && replace_link_or_copy_file(&src, &dst).is_ok() {
+                linked += 1;
+            }
+        }
+    }
+    // Fill any remaining missing assets/data files (e.g. blocks/items added after `version_id`,
+    // panorama fallback, Unifont) from the 26.3 base without overwriting `version_id`'s textures/sounds.
+    for sub in ["assets", "data"] {
         if let Ok(n) = link_missing_tree(&base.join(sub), &target_resources.join(sub)) {
             linked += n;
         }
     }
-    // Update `horizon-resources.json` so `KnownCore::load` recognizes the linked 26.3 core
-    // registries while preserving `source_minecraft`.
-    let manifest = json!({
-        "schema": SCHEMA_VERSION,
-        "minecraft": horizon_core::VANILLA_VERSION,
-        "source_minecraft": version_id,
-        "prepared_by": "horizon-on-device",
-        "full_simulation": true,
-    });
+    let manifest = build_manifest_from_base(base, version_id);
     if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
-        let _ = fs::write(target_resources.join("horizon-resources.json"), bytes);
+        let _ = write_unlinked(&target_resources.join("horizon-resources.json"), &bytes);
     }
     linked
 }
@@ -606,14 +810,17 @@ pub fn upgrade_partial_mojang_versions(home: &Path, base_resources: &Path) -> us
     };
     let mut upgraded = 0usize;
     for entry in entries.flatten() {
-        let res = entry.path().join("resources");
-        if !is_ready_root(&res) || res == base_resources || has_simulation_tables(&res) {
-            continue;
-        }
-        let Some(folder_id) = entry.path().file_name().and_then(|s| s.to_str()).map(str::to_owned)
-        else {
+        let path = entry.path();
+        let Some(folder_id) = path.file_name().and_then(|s| s.to_str()).map(str::to_owned) else {
             continue;
         };
+        if folder_id.starts_with('.') {
+            continue;
+        }
+        let res = path.join("resources");
+        if !has_installed_marker(&res) || res == base_resources || has_simulation_tables(&res) {
+            continue;
+        }
         let mut prof = read_profile(&res, &folder_id);
         let added = populate_from_simulation_base(base_resources, &res, &prof.id);
         if has_simulation_tables(&res) {
@@ -1112,29 +1319,248 @@ fn run_prepared_download(
     let _ = fs::remove_dir_all(&work_dir);
 
     let full_sim = has_simulation_tables(&installed.path);
+    if !full_sim {
+        return Err(validate_playable_root(&installed.path)
+            .err()
+            .unwrap_or_else(|| "Downloaded archive is missing required Horizon simulation tables.".into()));
+    }
     let profile = VersionProfile {
         id: version_id.to_owned(),
         release_type: "release".into(),
         source: "horizon-prepared".into(),
         protocol: ServerVersion::protocol_for_version_id(version_id),
         protocol_adapter: ServerVersion::from_version_id(version_id).map(|v| format!("{v:?}")),
-        full_simulation: full_sim,
+        full_simulation: true,
         files: installed.files,
         bytes: installed.bytes,
         installed_epoch: now_epoch(),
         notes: "Prepared Horizon runtime & assets.".into(),
     };
     write_profile(&installed.path, &profile)?;
-
-    if full_sim {
-        let _ = upgrade_partial_mojang_versions(home, &installed.path);
-    }
+    let _ = upgrade_partial_mojang_versions(home, &installed.path);
 
     let mut sel = load_selection(home);
     sel.active = version_id.to_owned();
     save_selection(home, &sel)?;
     apply_active_protocol_preference(home);
     Ok(())
+}
+
+fn simulation_base_archive_url() -> Option<String> {
+    if let Ok(env_url) = std::env::var("HORIZON_SIM_BASE_URL")
+        && !env_url.trim().is_empty()
+    {
+        return Some(env_url.trim().to_owned());
+    }
+    horizon_hooks::porter::engine::simulation_base_url()
+        .or_else(horizon_hooks::porter::engine::default_prepared_url)
+}
+
+/// Ensure a complete `26.3` simulation runtime base exists on disk (`find_simulation_base`),
+/// downloading the compact `sim-base-26.3.zip` archive into `versions/.sim-base-26.3/resources`
+/// if no full prepared runtime is installed yet.
+pub fn ensure_simulation_base_with_job(
+    job: &Arc<JobState>,
+    home: &Path,
+    override_url: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(existing) = find_simulation_base(home) {
+        return Ok(existing);
+    }
+    let url = override_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(simulation_base_archive_url)
+        .ok_or_else(|| {
+            "No Horizon simulation runtime URL is configured. Import a prepared 26.3 bundle or configure a mirror URL.".to_owned()
+        })?;
+
+    check_cancelled(job)?;
+    let work_dir = home.join("versions").join(".download-sim-base");
+    fs::create_dir_all(&work_dir).map_err(|e| format!("{}: {e}", work_dir.display()))?;
+
+    let archive_path = if let Some(local_path) = url.strip_prefix("file://") {
+        let copy = work_dir.join("sim-base.zip");
+        fs::copy(local_path, &copy).map_err(|e| format!("{local_path}: {e}"))?;
+        copy
+    } else {
+        update_job(job, |st| {
+            st.stage = "sim-base".into();
+            st.received_bytes = 0;
+            st.total_bytes = 0;
+            st.detail = "Downloading Horizon 26.3 simulation runtime tables…".into();
+        });
+        let received = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mon_rec = received.clone();
+        let mon_tot = total.clone();
+        let mon_job = job.clone();
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let mon_done = done_flag.clone();
+        let monitor = std::thread::spawn(move || {
+            while !mon_done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                update_job(&mon_job, |st| {
+                    st.received_bytes = mon_rec.load(Ordering::Relaxed);
+                    st.total_bytes = mon_tot.load(Ordering::Relaxed);
+                });
+            }
+        });
+        let fetched = crate::import::download::fetch_resumable(&url, &work_dir, &received, &total);
+        done_flag.store(true, Ordering::Relaxed);
+        let _ = monitor.join();
+        update_job(job, |st| {
+            st.received_bytes = received.load(Ordering::Relaxed);
+            st.total_bytes = total.load(Ordering::Relaxed);
+        });
+        fetched?
+    };
+
+    check_cancelled(job)?;
+    update_job(job, |st| {
+        st.stage = "sim-base-install".into();
+        st.detail = "Installing Horizon 26.3 simulation runtime tables…".into();
+    });
+    let pack = crate::import::Pack::open(&archive_path).map_err(|e| e.to_string())?;
+    if pack.kind != crate::import::Kind::Resources {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err("Simulation base archive did not contain horizon-resources.json.".into());
+    }
+    let sim_home = home.join("versions").join(SIM_BASE_DIR_NAME);
+    fs::create_dir_all(&sim_home).map_err(|e| format!("{}: {e}", sim_home.display()))?;
+    let installed = pack.install(&sim_home).map_err(|e| e.to_string())?;
+    let _ = fs::remove_dir_all(&work_dir);
+
+    validate_playable_root(&installed.path)?;
+    Ok(installed.path)
+}
+
+/// Repair / complete any partial Mojang install(s) on the device by fetching the compact
+/// `sim-base-26.3.zip` runtime (if missing) and rebuilding/linking simulation tables without
+/// re-downloading Mojang's `client.jar` or `assets/objects`.
+pub fn start_repair_versions(
+    home: PathBuf,
+    target_id: Option<String>,
+    custom_sim_base_url: Option<String>,
+) -> Result<VersionJobStatus, String> {
+    let clean_target = target_id.as_deref().and_then(sanitize_version_id);
+    let label = clean_target
+        .clone()
+        .unwrap_or_else(|| horizon_core::VANILLA_VERSION.to_owned());
+    let job = begin_job(&label, "horizon-repair", "Checking Horizon simulation runtime…")?;
+    let initial = job_status();
+
+    std::thread::spawn(move || {
+        let outcome = run_repair_versions(
+            &job,
+            &home,
+            clean_target.as_deref(),
+            custom_sim_base_url.as_deref(),
+        );
+        update_job(&job, |st| {
+            st.active = false;
+            match outcome {
+                Ok(repaired_id) => {
+                    st.stage = "done".into();
+                    st.done = true;
+                    st.version_id = repaired_id.clone();
+                    st.detail = format!("Minecraft {repaired_id} is ready to play.");
+                }
+                Err(err) => {
+                    st.stage = "failed".into();
+                    st.done = false;
+                    st.error = Some(err);
+                }
+            }
+        });
+    });
+
+    Ok(initial)
+}
+
+fn run_repair_versions(
+    job: &Arc<JobState>,
+    home: &Path,
+    target_id: Option<&str>,
+    custom_sim_base_url: Option<&str>,
+) -> Result<String, String> {
+    let base = ensure_simulation_base_with_job(job, home, custom_sim_base_url)?;
+    check_cancelled(job)?;
+
+    update_job(job, |st| {
+        st.stage = "preparing".into();
+        st.detail = "Linking simulation runtime into installed Mojang version(s)…".into();
+    });
+
+    // If Mojang's cached `versions/<id>/<id>.jar` and `assets/indexes/<idx>.json` are still in
+    // `Documents/minecraft/`, re-run `prepare_mojang_on_device` cleanly for full schema-safe layering.
+    let mc_cache = home.join("minecraft");
+    let objects_dir = mc_cache.join("assets/objects");
+    if let Some(tid) = target_id {
+        let jar = mc_cache.join("versions").join(tid).join(format!("{tid}.jar"));
+        let meta_path = mc_cache.join("versions").join(tid).join(format!("{tid}.json"));
+        if jar.is_file()
+            && let Ok(meta_text) = fs::read_to_string(&meta_path)
+            && let Ok(meta) = serde_json::from_str::<Value>(&meta_text)
+        {
+            let idx_id = meta["assetIndex"]["id"].as_str().unwrap_or(tid);
+            let idx_path = mc_cache.join("assets/indexes").join(format!("{idx_id}.json"));
+            let asset_index = fs::read_to_string(&idx_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or_else(|| json!({ "objects": {} }));
+            let rtype = meta["type"].as_str().unwrap_or("release");
+            let _ = prepare_mojang_on_device(home, tid, rtype, &jar, &asset_index, &objects_dir)?;
+        }
+    }
+
+    let _ = upgrade_partial_mojang_versions(home, &base);
+
+    let chosen = if let Some(tid) = target_id {
+        let res = home.join("versions").join(tid).join("resources");
+        validate_playable_root(&res)?;
+        let mut sel = load_selection(home);
+        sel.active = tid.to_owned();
+        save_selection(home, &sel)?;
+        apply_active_protocol_preference(home);
+        tid.to_owned()
+    } else if let Some(first_ready) = list_installed(home).into_iter().find(|v| v.ready) {
+        let mut sel = load_selection(home);
+        sel.active = first_ready.id.clone();
+        let _ = save_selection(home, &sel);
+        apply_active_protocol_preference(home);
+        first_ready.id
+    } else {
+        // Promote `.sim-base-26.3` into `versions/26.3/resources` if no user version existed yet!
+        let v26_dir = home
+            .join("versions")
+            .join(horizon_core::VANILLA_VERSION)
+            .join("resources");
+        if !is_ready_root(&v26_dir) {
+            let linked = link_missing_tree(&base, &v26_dir).unwrap_or(0);
+            let prof = VersionProfile {
+                id: horizon_core::VANILLA_VERSION.to_owned(),
+                release_type: "release".into(),
+                source: "horizon-prepared".into(),
+                protocol: ServerVersion::protocol_for_version_id(horizon_core::VANILLA_VERSION),
+                protocol_adapter: None,
+                full_simulation: true,
+                files: linked,
+                bytes: 0,
+                installed_epoch: now_epoch(),
+                notes: "Horizon 26.3 compact simulation runtime.".into(),
+            };
+            let _ = write_profile(&v26_dir, &prof);
+        }
+        let mut sel = load_selection(home);
+        sel.active = horizon_core::VANILLA_VERSION.to_owned();
+        let _ = save_selection(home, &sel);
+        apply_active_protocol_preference(home);
+        horizon_core::VANILLA_VERSION.to_owned()
+    };
+
+    Ok(chosen)
 }
 
 /// Start downloading & preparing an official Mojang version (`client.jar` + asset index + objects)
@@ -1341,12 +1767,17 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
         return Err(err);
     }
 
+    // Automatically ensure the Horizon 26.3 simulation runtime base is installed on disk BEFORE
+    // finalizing `prepare_mojang_on_device` so every Mojang download completes ready to play!
+    let _sim_base = ensure_simulation_base_with_job(job, home, None)?;
+    check_cancelled(job)?;
+
     update_job(job, |st| {
         st.stage = "preparing".into();
         st.detail = format!("Preparing {version_id} resources on device…");
     });
 
-    prepare_mojang_on_device(
+    let prof = prepare_mojang_on_device(
         home,
         version_id,
         &release_type,
@@ -1354,6 +1785,12 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
         &asset_index,
         &objects_dir,
     )?;
+    if !prof.full_simulation {
+        return Err(
+            "Mojang assets were unpacked, but Horizon's simulation runtime tables are still missing."
+                .into(),
+        );
+    }
 
     let mut sel = load_selection(home);
     sel.active = version_id.to_owned();
@@ -1366,14 +1803,179 @@ fn version_json_json_url(url: &str) -> &str {
     url
 }
 
+/// Pre-1.13 ("The Flattening") block texture renames (`textures/blocks/<old>.png` -> `textures/block/<new>.png`).
+const CLASSIC_BLOCK_TEXTURE_ALIASES: &[(&str, &str)] = &[
+    ("grass_top", "grass_block_top"),
+    ("grass_side", "grass_block_side"),
+    ("grass_side_overlay", "grass_block_side_overlay"),
+    ("grass_side_snowed", "grass_block_snow"),
+    ("dirt_podzol_top", "podzol_top"),
+    ("dirt_podzol_side", "podzol_side"),
+    ("stone_granite", "granite"),
+    ("stone_granite_smooth", "polished_granite"),
+    ("stone_diorite", "diorite"),
+    ("stone_diorite_smooth", "polished_diorite"),
+    ("stone_andesite", "andesite"),
+    ("stone_andesite_smooth", "polished_andesite"),
+    ("cobblestone_mossy", "mossy_cobblestone"),
+    ("planks_oak", "oak_planks"),
+    ("planks_spruce", "spruce_planks"),
+    ("planks_birch", "birch_planks"),
+    ("planks_jungle", "jungle_planks"),
+    ("planks_acacia", "acacia_planks"),
+    ("planks_big_oak", "dark_oak_planks"),
+    ("log_oak", "oak_log"),
+    ("log_oak_top", "oak_log_top"),
+    ("log_spruce", "spruce_log"),
+    ("log_spruce_top", "spruce_log_top"),
+    ("log_birch", "birch_log"),
+    ("log_birch_top", "birch_log_top"),
+    ("log_jungle", "jungle_log"),
+    ("log_jungle_top", "jungle_log_top"),
+    ("log_acacia", "acacia_log"),
+    ("log_acacia_top", "acacia_log_top"),
+    ("log_big_oak", "dark_oak_log"),
+    ("log_big_oak_top", "dark_oak_log_top"),
+    ("leaves_oak", "oak_leaves"),
+    ("leaves_spruce", "spruce_leaves"),
+    ("leaves_birch", "birch_leaves"),
+    ("leaves_jungle", "jungle_leaves"),
+    ("leaves_acacia", "acacia_leaves"),
+    ("leaves_big_oak", "dark_oak_leaves"),
+    ("sapling_oak", "oak_sapling"),
+    ("sapling_spruce", "spruce_sapling"),
+    ("sapling_birch", "birch_sapling"),
+    ("sapling_jungle", "jungle_sapling"),
+    ("sapling_acacia", "acacia_sapling"),
+    ("sapling_roofed_oak", "dark_oak_sapling"),
+    ("brick", "bricks"),
+    ("nether_brick", "nether_bricks"),
+    ("red_nether_brick", "red_nether_bricks"),
+    ("sandstone_normal", "sandstone"),
+    ("sandstone_carved", "chiseled_sandstone"),
+    ("sandstone_smooth", "cut_sandstone"),
+    ("red_sandstone_normal", "red_sandstone"),
+    ("red_sandstone_carved", "chiseled_red_sandstone"),
+    ("red_sandstone_smooth", "cut_red_sandstone"),
+    ("stonebrick", "stone_bricks"),
+    ("stonebrick_mossy", "mossy_stone_bricks"),
+    ("stonebrick_cracked", "cracked_stone_bricks"),
+    ("stonebrick_carved", "chiseled_stone_bricks"),
+    ("quartz_block_side", "quartz_block_side"),
+    ("quartz_block_chiseled", "chiseled_quartz_block"),
+    ("quartz_block_lines", "quartz_pillar"),
+    ("reeds", "sugar_cane"),
+    ("web", "cobweb"),
+    ("tallgrass", "short_grass"),
+    ("deadbush", "dead_bush"),
+    ("waterlily", "lily_pad"),
+    ("torch_on", "torch"),
+    ("redstone_torch_on", "redstone_torch"),
+    ("redstone_lamp_off", "redstone_lamp"),
+    ("furnace_front_off", "furnace_front"),
+    ("workbench_top", "crafting_table_top"),
+    ("workbench_front", "crafting_table_front"),
+    ("workbench_side", "crafting_table_side"),
+    ("noteblock", "note_block"),
+    ("mob_spawner", "spawner"),
+    ("ice_packed", "packed_ice"),
+    ("melon_side", "melon_side"),
+    ("wool_colored_white", "white_wool"),
+    ("wool_colored_orange", "orange_wool"),
+    ("wool_colored_magenta", "magenta_wool"),
+    ("wool_colored_light_blue", "light_blue_wool"),
+    ("wool_colored_yellow", "yellow_wool"),
+    ("wool_colored_lime", "lime_wool"),
+    ("wool_colored_pink", "pink_wool"),
+    ("wool_colored_gray", "gray_wool"),
+    ("wool_colored_silver", "light_gray_wool"),
+    ("wool_colored_cyan", "cyan_wool"),
+    ("wool_colored_purple", "purple_wool"),
+    ("wool_colored_blue", "blue_wool"),
+    ("wool_colored_brown", "brown_wool"),
+    ("wool_colored_green", "green_wool"),
+    ("wool_colored_red", "red_wool"),
+    ("wool_colored_black", "black_wool"),
+];
+
+/// Pre-1.13 item texture renames (`textures/items/<old>.png` -> `textures/item/<new>.png`).
+const CLASSIC_ITEM_TEXTURE_ALIASES: &[(&str, &str)] = &[
+    ("apple_golden", "golden_apple"),
+    ("beef_cooked", "cooked_beef"),
+    ("beef_raw", "beef"),
+    ("porkchop_cooked", "cooked_porkchop"),
+    ("porkchop_raw", "porkchop"),
+    ("chicken_cooked", "cooked_chicken"),
+    ("chicken_raw", "chicken"),
+    ("mutton_cooked", "cooked_mutton"),
+    ("mutton_raw", "mutton"),
+    ("wood_sword", "wooden_sword"),
+    ("wood_pickaxe", "wooden_pickaxe"),
+    ("wood_axe", "wooden_axe"),
+    ("wood_shovel", "wooden_shovel"),
+    ("wood_hoe", "wooden_hoe"),
+    ("gold_sword", "golden_sword"),
+    ("gold_pickaxe", "golden_pickaxe"),
+    ("gold_axe", "golden_axe"),
+    ("gold_shovel", "golden_shovel"),
+    ("gold_hoe", "golden_hoe"),
+    ("gold_helmet", "golden_helmet"),
+    ("gold_chestplate", "golden_chestplate"),
+    ("gold_leggings", "golden_leggings"),
+    ("gold_boots", "golden_boots"),
+    ("potion_bottle_empty", "glass_bottle"),
+    ("fireball", "fire_charge"),
+    ("slimeball", "slime_ball"),
+    ("totem", "totem_of_undying"),
+    ("reeds", "sugar_cane"),
+    ("bucket_empty", "bucket"),
+    ("bucket_water", "water_bucket"),
+    ("bucket_lava", "lava_bucket"),
+    ("bucket_milk", "milk_bucket"),
+];
+
+fn apply_classic_texture_aliases(staging: &Path) -> usize {
+    let mut added = 0usize;
+    for (legacy_sub, modern_sub, renames) in [
+        (
+            "assets/minecraft/textures/blocks",
+            "assets/minecraft/textures/block",
+            CLASSIC_BLOCK_TEXTURE_ALIASES,
+        ),
+        (
+            "assets/minecraft/textures/items",
+            "assets/minecraft/textures/item",
+            CLASSIC_ITEM_TEXTURE_ALIASES,
+        ),
+    ] {
+        let src_dir = staging.join(legacy_sub);
+        let dst_dir = staging.join(modern_sub);
+        if !src_dir.is_dir() {
+            continue;
+        }
+        if let Ok(n) = link_missing_tree(&src_dir, &dst_dir) {
+            added += n;
+        }
+        for &(old_stem, new_stem) in renames {
+            for ext in ["png", "png.mcmeta"] {
+                let src = src_dir.join(format!("{old_stem}.{ext}"));
+                let dst = dst_dir.join(format!("{new_stem}.{ext}"));
+                if src.is_file() && !dst.exists() && link_or_copy_file(&src, &dst).is_ok() {
+                    added += 1;
+                }
+            }
+        }
+    }
+    added
+}
+
 /// Pure-Rust on-device resource builder for any Mojang `client.jar` + verified `assetIndex`:
-/// - Unpacks `assets/`, `data/`, and `pack.mcmeta` from `client.jar`.
-/// - Materializes indexed Mojang assets (`sounds/`, `lang/`, `font/`, `textures/gui/title/background/`, `pack.png`, etc.)
-///   into `assets/<namespace>/...` via zero-copy APFS hardlinks from `minecraft/assets/objects/`.
-/// - Creates pre-1.13 flattening aliases (`textures/blocks/*` -> `textures/block/*`,
-///   `textures/items/*` -> `textures/item/*`) so classic/1.8/1.12 Mojang textures map onto
-///   modern resource locations cleanly.
-/// - Links simulation/datagen tables from any installed Horizon base runtime (`find_simulation_base`).
+/// - For `26.3`: unpacks complete `26.3` `assets/` & `data/`, materializes `assetIndex` objects,
+///   and links all `horizon-prepare` simulation tables from `find_simulation_base`.
+/// - For older/snapshot versions (`!= 26.3`): performs Schema-Safe Multi-Version Layering — keeping
+///   26.3's schema-bound `data/`, `models/`, `blockstates/`, `items/`, `shaders/`, `font/`, and GUI
+///   sprites intact while overlaying the downloaded version's authentic block/item/entity/environment
+///   textures (with pre-1.13 flattening renames) and `.ogg` sounds/music!
 pub fn prepare_mojang_on_device(
     home: &Path,
     version_id: &str,
@@ -1383,6 +1985,7 @@ pub fn prepare_mojang_on_device(
     objects_dir: &Path,
 ) -> Result<VersionProfile, String> {
     let clean = sanitize_version_id(version_id).ok_or("invalid version id")?;
+    let is_native_pinned = clean == horizon_core::VANILLA_VERSION;
     let sim_base = find_simulation_base(home);
 
     let version_dir = home.join("versions").join(&clean);
@@ -1408,10 +2011,20 @@ pub fn prepare_mojang_on_device(
         if entry.is_symlink() {
             continue;
         }
-        let keep = name == "pack.mcmeta"
-            || name == "pack.png"
-            || name.starts_with("assets/")
-            || name.starts_with("data/");
+        let keep = if is_native_pinned {
+            name == "pack.mcmeta"
+                || name == "pack.png"
+                || name.starts_with("assets/")
+                || name.starts_with("data/")
+        } else {
+            // For non-26.3 versions, keep authentic non-GUI textures (plus title background
+            // panorama faces) and audio; 26.3 HUD/menu sprites & JSON schemas come from `sim_base`.
+            name == "pack.png"
+                || (name.starts_with("assets/minecraft/textures/")
+                    && (!name.starts_with("assets/minecraft/textures/gui/")
+                        || name.starts_with("assets/minecraft/textures/gui/title/background/panorama_")))
+                || name.starts_with("assets/minecraft/sounds/")
+        };
         if !keep || name.contains("..") || name.starts_with('/') {
             continue;
         }
@@ -1436,6 +2049,15 @@ pub fn prepare_mojang_on_device(
             if clean_rel.is_empty() || clean_rel.contains("..") {
                 continue;
             }
+            if !is_native_pinned {
+                let allowed_non_native = clean_rel.contains("/sounds/")
+                    || clean_rel.starts_with("minecraft/sounds/")
+                    || clean_rel.contains("textures/gui/title/background/panorama_")
+                    || (clean_rel.contains("/textures/") && !clean_rel.contains("/textures/gui/"));
+                if !allowed_non_native {
+                    continue;
+                }
+            }
             let src = objects_dir
                 .join(&hash[..2].to_ascii_lowercase())
                 .join(hash.to_ascii_lowercase());
@@ -1456,31 +2078,19 @@ pub fn prepare_mojang_on_device(
         }
     }
 
-    // Pre-1.13 texture folder aliases (`textures/blocks` -> `textures/block`, `textures/items` -> `textures/item`).
-    for (legacy_sub, modern_sub) in [
-        ("assets/minecraft/textures/blocks", "assets/minecraft/textures/block"),
-        ("assets/minecraft/textures/items", "assets/minecraft/textures/item"),
-    ] {
-        let src = staging.join(legacy_sub);
-        let dst = staging.join(modern_sub);
-        if src.is_dir()
-            && let Ok(added) = link_missing_tree(&src, &dst)
-        {
-            files += added;
-        }
-    }
+    // Pre-1.13 texture folder aliases & classic block/item texture flattening renames.
+    files += apply_classic_texture_aliases(&staging);
 
     let mut full_simulation = false;
     let mut notes = format!("Official Mojang {clean} assets & data unpacked on device.");
     if let Some(base) = sim_base.as_deref() {
         let linked = populate_from_simulation_base(base, &staging, &clean);
-        full_simulation = has_simulation_tables(&staging);
-        if full_simulation {
-            files += linked;
-            notes = format!(
-                "Mojang {clean} assets + linked Horizon simulation runtime ({linked} base files)."
-            );
-        }
+        validate_playable_root(&staging)?;
+        full_simulation = true;
+        files += linked;
+        notes = format!(
+            "Mojang {clean} assets + linked Horizon simulation runtime ({linked} base files)."
+        );
     } else {
         let manifest = json!({
             "schema": SCHEMA_VERSION,
@@ -1490,10 +2100,10 @@ pub fn prepare_mojang_on_device(
             "full_simulation": false,
         });
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-        fs::write(staging.join("horizon-resources.json"), manifest_bytes)
+        write_unlinked(&staging.join("horizon-resources.json"), &manifest_bytes)
             .map_err(|e| e.to_string())?;
         notes.push_str(
-            " Install one Prepared Horizon Base bundle to link simulation tables automatically.",
+            " Tap Complete Setup to download Horizon's simulation runtime (~45 MB).",
         );
     }
 
@@ -1545,21 +2155,46 @@ mod tests {
 
     fn write_simulated_prepared_base(root: &Path) {
         fs::create_dir_all(root.join("assets/minecraft/items")).unwrap();
+        fs::create_dir_all(root.join("assets/minecraft/font")).unwrap();
+        fs::create_dir_all(root.join("assets/minecraft/models/block")).unwrap();
+        fs::create_dir_all(root.join("assets/minecraft/blockstates")).unwrap();
+        fs::create_dir_all(root.join("assets/minecraft/textures/gui/sprites")).unwrap();
+        fs::create_dir_all(root.join("assets/minecraft/lang")).unwrap();
         fs::create_dir_all(root.join("data/minecraft")).unwrap();
-        fs::create_dir_all(root.join("worldgen")).unwrap();
+        fs::create_dir_all(root.join("worldgen/blocks")).unwrap();
+        fs::create_dir_all(root.join("biome-parameters")).unwrap();
+        let manifest = json!({
+            "schema": 7,
+            "data_version": horizon_world::DATA_VERSION,
+            "minecraft": horizon_core::VANILLA_VERSION,
+        });
         fs::write(
             root.join("horizon-resources.json"),
-            r#"{"schema":7,"minecraft":"26.3"}"#,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        for name in BASE_SIMULATION_FILES {
+        for name in REQUIRED_SIMULATION_FILES
+            .iter()
+            .chain(OPTIONAL_SIMULATION_FILES.iter())
+        {
             fs::write(root.join(name), b"{}").unwrap();
         }
+        for rel in REQUIRED_NESTED_FILES {
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, b"{}").unwrap();
+        }
+        fs::write(root.join("assets/pack.mcmeta"), br#"{"pack":{"pack_format":55}}"#).unwrap();
+        fs::write(root.join("assets/minecraft/sounds.json"), b"{}").unwrap();
+        fs::write(root.join("assets/minecraft/lang/en_us.json"), b"{}").unwrap();
         fs::write(
             root.join("assets/minecraft/items/stone.json"),
             r#"{"model":{"type":"minecraft:model","model":"minecraft:block/stone"}}"#,
         )
         .unwrap();
+        validate_playable_root(root).expect("fixture must pass validate_playable_root");
     }
 
     #[test]
@@ -1575,6 +2210,14 @@ mod tests {
             zip.start_file("assets/minecraft/textures/blocks/stone.png", opts)
                 .unwrap();
             zip.write_all(b"PNG112STONE").unwrap();
+            zip.start_file("assets/minecraft/textures/blocks/grass_top.png", opts)
+                .unwrap();
+            zip.write_all(b"PNG112GRASS").unwrap();
+            // Old 1.12 recipe schema that MUST NOT overwrite 26.3's `data/minecraft/`!
+            zip.start_file("data/minecraft/recipes/stone.json", opts)
+                .unwrap();
+            zip.write_all(br#"{"type":"crafting_shaped","old_1_12":true}"#)
+                .unwrap();
             zip.finish().unwrap();
         }
 
@@ -1606,26 +2249,44 @@ mod tests {
         .expect("prepare 1.12.2");
         assert!(!prof.full_simulation);
         let ver_root = home.join("versions/1.12.2/resources");
-        assert!(ver_root.join("horizon-resources.json").is_file());
-        // Pre-1.13 `textures/blocks/stone.png` aliased automatically to `textures/block/stone.png`!
+        assert!(has_partial_mojang_root(&ver_root));
+        assert!(has_any_partial_mojang(&home));
+        assert!(!is_ready_root(&ver_root));
+        // Selecting an incomplete version must fail cleanly instead of letting Play hit missing tables!
+        assert!(select_version(&home, "1.12.2").is_err());
+
+        // Pre-1.13 `textures/blocks/stone.png` and `grass_top.png` aliased to modern 26.3 names!
         assert_eq!(
             fs::read(ver_root.join("assets/minecraft/textures/block/stone.png")).unwrap(),
             b"PNG112STONE"
         );
-        // Indexed sound materialized under `assets/minecraft/sounds/random/click.ogg`!
+        assert_eq!(
+            fs::read(ver_root.join("assets/minecraft/textures/block/grass_block_top.png")).unwrap(),
+            b"PNG112GRASS"
+        );
         assert_eq!(
             fs::read(ver_root.join("assets/minecraft/sounds/random/click.ogg")).unwrap(),
             sound_bytes
         );
 
         // 2. Now install a full 26.3 prepared base and verify `upgrade_partial_mojang_versions`
-        //    automatically upgrades 1.12.2 to `full_simulation = true`!
+        //    automatically upgrades 1.12.2 to `full_simulation = true` and `is_ready_root == true`!
         let base_26_3 = home.join("versions/26.3/resources");
         write_simulated_prepared_base(&base_26_3);
         let upgraded = upgrade_partial_mojang_versions(&home, &base_26_3);
         assert_eq!(upgraded, 1);
-        assert!(ver_root.join("registries.json").is_file());
+        assert!(is_ready_root(&ver_root));
+        assert!(!has_any_partial_mojang(&home));
+        assert!(ver_root.join("model-states.json").is_file());
+        assert!(ver_root.join("creative-inventory.json").is_file());
         assert!(ver_root.join("assets/minecraft/items/stone.json").is_file());
+        assert!(!ver_root.join("data/minecraft/recipes/stone.json").exists());
+        // Verify base `horizon-resources.json` was NOT mutated via hardlink (`source_minecraft` absent in base)!
+        let base_manifest: Value = serde_json::from_slice(
+            &fs::read(base_26_3.join("horizon-resources.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(base_manifest.get("source_minecraft").is_none());
 
         // 3. Verify switching active versions updates `import::resources_root` & protocol preference!
         select_version(&home, "1.12.2").unwrap();

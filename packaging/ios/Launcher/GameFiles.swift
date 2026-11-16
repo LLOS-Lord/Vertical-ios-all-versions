@@ -69,12 +69,16 @@ final class GameFilesDownload: NSObject, ObservableObject {
     private var resolvingAutomatic = false
     private var attempt = UUID()
     private var session: URLSession?
+    private var versionJobRunning = false
+    private let versionBridge: ImportArchive
 
     init(importArchive: @escaping ImportArchive = { await Bridge.send($0) },
          automaticSource: @escaping @MainActor () async -> [String: Any] = { await Bridge.send("game-files-source") },
+         versionBridge: @escaping ImportArchive = { await Bridge.send($0) },
          diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) }) {
         self.importArchive = importArchive
         self.automaticSource = automaticSource
+        self.versionBridge = versionBridge
         self.diagnostic = diagnostic
         super.init()
     }
@@ -129,10 +133,14 @@ final class GameFilesDownload: NSObject, ObservableObject {
     /// First-run setup stays in the launcher; it starts no game or renderer.
     func startAutomaticallyIfNeeded() async {
         guard !GameFolder.hasGameFiles, !automaticAttempted, state == .idle, !busy else { return }
-        await startAutomatic()
+        await startAutomaticInternal(explicitUserRequest: false)
     }
 
     func startAutomatic() async {
+        await startAutomaticInternal(explicitUserRequest: true)
+    }
+
+    private func startAutomaticInternal(explicitUserRequest: Bool) async {
         guard !busy else { return }
         automaticAttempted = true
         resourcesOnly = true
@@ -144,11 +152,29 @@ final class GameFilesDownload: NSObject, ObservableObject {
         trace("source_lookup_start")
         let answer = await automaticSource()
         guard generation == attempt else { return }
-        trace("source_lookup_result has_url=\(answer["url"] is String) has_error=\(answer.error != nil)")
+        trace("source_lookup_result has_url=\(answer["url"] is String) has_error=\(answer.error != nil) mode=\(answer["mode"] as? String ?? "url")")
         resolvingAutomatic = false
         guard !Task.isCancelled else { trace("source_lookup_cancelled"); state = .idle; return }
         // A cable/manual import can finish while the source request is pending.
         guard !GameFolder.hasGameFiles else { trace("already_installed"); state = .done("Game files are already installed."); return }
+        if (answer["mode"] as? String) == "mojang_plus_sim_base" {
+            let partial = answer["partial_mojang"] as? Bool ?? false
+            let rawVersion = (answer["version"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "26.3"
+            let targetVersion = rawVersion.isEmpty ? "26.3" : rawVersion
+            if partial {
+                trace("mojang_partial_repair_start version=\(targetVersion)")
+                await runManagedVersionJob(["action": "repair"], generation: generation)
+                return
+            }
+            if explicitUserRequest {
+                trace("mojang_direct_download_start version=\(targetVersion)")
+                await runManagedVersionJob(["action": "download-mojang", "id": targetVersion], generation: generation)
+                return
+            }
+            trace("mojang_mode_awaiting_user_version_selection")
+            state = .idle
+            return
+        }
         guard let text = answer["url"] as? String, let url = URL(string: text),
               ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
             trace("source_lookup_failed detail=\(Diagnostics.redact(answer.error ?? "missing_or_invalid_url"))")
@@ -157,6 +183,64 @@ final class GameFilesDownload: NSObject, ObservableObject {
         }
         // A custom link's token belongs only to that link, never the public source.
         begin(url: url, token: nil)
+    }
+
+    private func runManagedVersionJob(_ payload: [String: Any], generation: UUID) async {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonText = String(data: data, encoding: .utf8) else {
+            state = .failed("Could not start version download.")
+            return
+        }
+        background = UIApplication.shared.beginBackgroundTask(withName: "Horizon version setup") { [weak self] in
+            let download = self
+            Task { @MainActor in download?.trace("background_time_expired"); download?.endBackground() }
+        }
+        defer { endBackground() }
+        versionJobRunning = true
+        defer { if generation == attempt { versionJobRunning = false } }
+
+        let started = await versionBridge("launcher-versions \(jsonText)")
+        guard generation == attempt, !Task.isCancelled else { state = .idle; return }
+        if let err = started.error {
+            trace("managed_job_start_failed detail=\(Diagnostics.redact(err))")
+            state = .failed(err)
+            Haptics.failed()
+            return
+        }
+
+        while !Task.isCancelled, generation == attempt {
+            let snap = await versionBridge(#"launcher-versions {"action":"job"}"#)
+            guard generation == attempt, !Task.isCancelled else { state = .idle; return }
+            let active = snap["active"] as? Bool ?? false
+            let stage = snap["stage"] as? String ?? ""
+            let recv = (snap["received_bytes"] as? NSNumber)?.int64Value ?? 0
+            let tot = (snap["total_bytes"] as? NSNumber)?.int64Value ?? 0
+            let doneFiles = (snap["completed_files"] as? NSNumber)?.int64Value ?? 0
+            let totalFiles = (snap["total_files"] as? NSNumber)?.int64Value ?? 0
+            if !active {
+                if let err = snap["error"] as? String, !err.isEmpty {
+                    trace("managed_job_failed detail=\(Diagnostics.redact(err))")
+                    state = .failed(err)
+                    Haptics.failed()
+                } else {
+                    let vid = (snap["version_id"] as? String) ?? "26.3"
+                    trace("managed_job_complete version=\(vid) files_ready=\(GameFolder.hasGameFiles)")
+                    state = .done("Minecraft \(vid) is installed and ready to play.")
+                    Haptics.done()
+                }
+                return
+            }
+            if stage == "sim-base-install" || stage == "preparing" || stage == "unpacking" {
+                state = .installing
+            } else if tot > 0 {
+                state = .downloading(received: recv, total: tot)
+            } else if totalFiles > 0 {
+                state = .downloading(received: doneFiles * 1024, total: totalFiles * 1024)
+            } else {
+                state = .downloading(received: recv, total: 0)
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
     }
 
     /// Import through the same resource-only validator as automatic setup.
@@ -223,12 +307,18 @@ final class GameFilesDownload: NSObject, ObservableObject {
 
     func cancel() {
         if busy { trace("cancel_requested received=\(receivedBytes) expected=\(expectedBytes)") }
+        let cancelManaged = versionJobRunning
+        versionJobRunning = false
         attempt = UUID()
         resolvingAutomatic = false
         session?.invalidateAndCancel()
         session = nil
         state = .idle
         endBackground()
+        if cancelManaged {
+            let bridge = versionBridge
+            Task { @MainActor in _ = await bridge(#"launcher-versions {"action":"cancel"}"#) }
+        }
     }
 
     private func endBackground() {

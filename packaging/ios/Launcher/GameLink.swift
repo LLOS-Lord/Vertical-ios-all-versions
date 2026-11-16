@@ -10,19 +10,31 @@ enum GameFolder {
     static var resources: URL { documents.appendingPathComponent("resources") }
     static var versions: URL { documents.appendingPathComponent("versions") }
 
-    /// Whether game files exist in `Documents/resources` or any managed `Documents/versions/<id>/resources`.
+    /// True when `horizon-resources.json` exists and does not explicitly mark `full_simulation: false`.
+    static func isPlayableMarker(_ marker: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: marker.path) else { return false }
+        if let data = try? Data(contentsOf: marker),
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let fullSim = json["full_simulation"] as? Bool,
+           fullSim == false {
+            return false
+        }
+        return true
+    }
+
+    /// Whether playable game files exist in `Documents/resources` or any managed `Documents/versions/<id>/resources`.
     static func hasGameFiles(in documents: URL) -> Bool {
         let fm = FileManager.default
-        if fm.fileExists(atPath: documents.appendingPathComponent("resources/horizon-resources.json").path) {
+        if isPlayableMarker(documents.appendingPathComponent("resources/horizon-resources.json")) {
             return true
         }
         let versionsRoot = documents.appendingPathComponent("versions")
         guard let entries = try? fm.contentsOfDirectory(at: versionsRoot, includingPropertiesForKeys: nil) else {
             return false
         }
-        for entry in entries {
+        for entry in entries where !entry.lastPathComponent.hasPrefix(".") {
             let marker = entry.appendingPathComponent("resources/horizon-resources.json")
-            if fm.fileExists(atPath: marker.path) {
+            if isPlayableMarker(marker) {
                 return true
             }
         }
@@ -272,6 +284,11 @@ final class GameLink: ObservableObject {
         let answer = await self.send("launcher-start \(attempt.id.uuidString)")
         guard answer["ok"] as? Bool == true, answer.error == nil else {
             try check(attempt)
+            if answer["needs_files"] as? Bool == true || (answer["phase"] as? String) == "needs_files" {
+                let reason = answer.error ?? "Game files are incomplete."
+                phase = .needsFiles(reason)
+                requestingGameFiles = true
+            }
             throw AccountError(answer.error ?? "The game could not start. Try again.")
         }
         attempt.accepted = true

@@ -50,11 +50,27 @@ impl Loading {
             }
         };
         horizon_client::ui_theme::reset_atlas();
-        // Download them first; the Wi-Fi and cable doors open only if that fails. Once a run: files that
-        // downloaded and still don't load would otherwise be downloaded again and again.
+        let base_already_valid =
+            horizon_client::versions::validate_playable_root(&self.vanilla_root).is_ok();
+        let has_explicit_zip_url = std::env::var("HORIZON_GAME_FILES_URL")
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty());
         let url = horizon_client::import::download::url(horizon_core::VANILLA_VERSION);
         let mut error = None;
-        let download = if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let download = if base_already_valid {
+            log::warn!(
+                "Horizon: playable game files exist at {}, not re-downloading ({reason})",
+                self.vanilla_root.display()
+            );
+            error = Some(format!("Resource load failed: {reason}"));
+            None
+        } else if !has_explicit_zip_url && horizon_ios_launcher::show() {
+            log::info!(
+                "Horizon: returning to native iOS launcher to complete game-file setup ({reason})"
+            );
+            error = Some(reason.clone());
+            None
+        } else if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             log::warn!(
                 "Horizon: the downloaded game files did not load ({reason}); not downloading again"
             );
@@ -79,6 +95,9 @@ impl Loading {
             horizon_ios_launcher::present_download();
             None
         } else {
+            if base_already_valid {
+                let _ = horizon_ios_launcher::show();
+            }
             open_session(&home)
         };
         log::warn!(
@@ -194,16 +213,21 @@ impl Loading {
         let Some(import) = &self.import else {
             return serde_json::json!({ "phase": "done", "progress": self.progress.fraction() });
         };
+        let active_version = horizon_client::versions::active_version_id(&import.home);
         match import.download.as_ref().map(|d| d.stage()) {
             Some(Stage::Downloading { received, total }) => serde_json::json!({
                 "phase": "downloading",
                 "received": received,
                 "total": total,
-                "version": horizon_core::VANILLA_VERSION,
+                "version": active_version,
             }),
-            Some(Stage::Installing) => serde_json::json!({ "phase": "installing" }),
+            Some(Stage::Installing) => serde_json::json!({
+                "phase": "installing",
+                "version": active_version,
+            }),
             None => serde_json::json!({
                 "phase": "failed",
+                "version": active_version,
                 "error": import.error.as_deref().unwrap_or(&import.reason),
             }),
         }

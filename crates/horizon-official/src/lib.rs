@@ -19,6 +19,10 @@ impl Porter for OfficialPorter {
         Some(horizon_addresses::MOBILE_PREPARED_26_3_ZIP)
     }
 
+    fn simulation_base_url(&self) -> Option<&str> {
+        Some(horizon_addresses::MOBILE_SIMULATION_BASE_26_3_ZIP)
+    }
+
     fn catalog_urls(&self) -> Vec<String> {
         horizon_addresses::MOBILE_VERSION_CATALOGS
             .iter()

@@ -185,10 +185,14 @@ pub(super) fn file_command(
 
 fn versions_snapshot(home: &std::path::Path) -> Value {
     use horizon_client::versions;
+    if let Some(base) = versions::find_simulation_base(home) {
+        let _ = versions::upgrade_partial_mojang_versions(home, &base);
+    }
     json!({
         "active": versions::active_version_id(home),
         "older_servers": versions::load_selection(home).older_servers,
         "has_simulation_base": versions::find_simulation_base(home).is_some(),
+        "has_partial_mojang": versions::has_any_partial_mojang(home),
         "versions": versions::list_installed(home),
         "job": versions::job_status(),
     })
@@ -253,6 +257,22 @@ fn handle_launcher_versions(
         "download-mojang" => {
             let id = args["id"].as_str().unwrap_or_default().to_owned();
             match versions::start_mojang_download(home, id) {
+                Ok(job) => json!({ "ok": true, "job": job }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        "repair" => {
+            let id = args["id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let url = args["url"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            match versions::start_repair_versions(home, id, url) {
                 Ok(job) => json!({ "ok": true, "job": job }),
                 Err(e) => json!({ "error": e }),
             }

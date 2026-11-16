@@ -166,6 +166,7 @@ final class VersionStore: ObservableObject {
     @Published private(set) var activeVersion = "26.3"
     @Published private(set) var olderServers = true
     @Published private(set) var hasSimulationBase = false
+    @Published private(set) var hasPartialMojang = false
     @Published private(set) var mirrors: [PreparedMirrorItem] = []
     @Published private(set) var mojangVersions: [MojangVersionItem] = []
     @Published private(set) var mojangTotal = 0
@@ -214,6 +215,11 @@ final class VersionStore: ObservableObject {
         }
         if let rawList = reply["versions"] as? [[String: Any]] {
             installed = rawList.compactMap(InstalledGameVersion.init)
+        }
+        if let partial = reply["has_partial_mojang"] as? Bool {
+            hasPartialMojang = partial
+        } else {
+            hasPartialMojang = installed.contains { !$0.ready }
         }
         if let jobJson = reply["job"] as? [String: Any] {
             job = VersionDownloadJob(jobJson)
@@ -321,6 +327,24 @@ final class VersionStore: ObservableObject {
         ensurePolling(onFinished: onFinished)
     }
 
+    func repairVersions(versionId: String? = nil,
+                        customSimBaseURL: String? = nil,
+                        onFinished: (@MainActor () async -> Void)? = nil) async {
+        issue = nil
+        var payload: [String: Any] = ["action": "repair"]
+        if let versionId, !versionId.isEmpty { payload["id"] = versionId }
+        if let customSimBaseURL, !customSimBaseURL.isEmpty { payload["url"] = customSimBaseURL }
+        let reply = await command(payload)
+        if let err = reply["error"] as? String {
+            issue = err
+            return
+        }
+        if let jobJson = reply["job"] as? [String: Any] {
+            job = VersionDownloadJob(jobJson)
+        }
+        ensurePolling(onFinished: onFinished)
+    }
+
     func cancelDownload() async {
         let reply = await command(["action": "cancel"])
         job = VersionDownloadJob(reply)
@@ -384,6 +408,20 @@ struct VersionBrowserSheet: View {
 
                     if store.job.active {
                         activeJobBanner
+                    } else if store.hasPartialMojang {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("Incomplete Mojang Install Detected", systemImage: "wrench.and.screwdriver.fill")
+                                .font(Theme.sans(13, .semiBold)).foregroundStyle(Theme.warn)
+                            Text("Your Mojang game assets are already on this device, and only need Horizon's compact 26.3 simulation runtime (~45 MB) to become playable.")
+                                .font(Theme.sans(11)).foregroundStyle(Theme.textMuted)
+                            PrimaryButton(title: "Complete Setup (~45 MB)", icon: "arrow.down.circle.fill") {
+                                Task {
+                                    await store.repairVersions { await link.refresh() }
+                                }
+                            }
+                            .accessibilityIdentifier("versions-complete-setup")
+                        }
+                        .padding(14).frame(maxWidth: .infinity, alignment: .leading).card()
                     }
                     if let issue = store.issue {
                         Label(issue, systemImage: "exclamationmark.triangle.fill")
@@ -486,7 +524,19 @@ struct VersionBrowserSheet: View {
                             }
                         }
                         Spacer(minLength: 8)
-                        if ver.ready && !ver.active {
+                        if !ver.ready {
+                            Button("Complete Setup") {
+                                Haptics.tap()
+                                Task {
+                                    await store.repairVersions(versionId: ver.id) { await link.refresh() }
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(Theme.warn)
+                            .controlSize(.small)
+                            .disabled(store.job.active)
+                            .accessibilityIdentifier("version-repair-\(ver.id)")
+                        } else if !ver.active {
                             Button("Use") {
                                 Haptics.tap()
                                 Task {
@@ -532,9 +582,9 @@ struct VersionBrowserSheet: View {
     @ViewBuilder private var mojangSection: some View {
         SectionHeader(title: "Official Mojang Version Server")
         if !store.hasSimulationBase {
-            Label("Install one full Prepared Horizon Base (under Horizon Mirrors or from a PC .zip) so on-device Mojang downloads can link simulation & registry tables automatically.",
-                  systemImage: "info.circle.fill")
-                .font(Theme.sans(11)).foregroundStyle(Theme.warn)
+            Label("Downloading any Mojang version automatically fetches official Mojang assets + audio alongside Horizon's compact 26.3 simulation runtime (~45 MB) — no PC required.",
+                  systemImage: "sparkles")
+                .font(Theme.sans(11)).foregroundStyle(Theme.accentText)
                 .padding(12).frame(maxWidth: .infinity, alignment: .leading).card()
         }
         Picker("Channel", selection: $mojangFilter) {
@@ -639,8 +689,15 @@ struct VersionBrowserSheet: View {
                     Button {
                         Haptics.tap()
                         Task {
-                            await store.startPreparedDownload(url: mirror.url, version: mirror.version, sha256: mirror.sha256) {
-                                await link.refresh()
+                            if mirror.id == "github-sim-base-26.3" || mirror.url.hasSuffix("sim-base-26.3.zip") {
+                                await store.repairVersions(customSimBaseURL: mirror.url) {
+                                    await link.refresh()
+                                    await store.loadCatalog()
+                                }
+                            } else {
+                                await store.startPreparedDownload(url: mirror.url, version: mirror.version, sha256: mirror.sha256) {
+                                    await link.refresh()
+                                }
                             }
                         }
                     } label: {

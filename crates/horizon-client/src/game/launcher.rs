@@ -498,14 +498,27 @@ impl Loading {
                 "game-files-source" => {
                     let home = horizon_client::import::home();
                     let active = horizon_client::versions::active_version_id(&home);
-                    request.answer(
-                        &json!({
-                            "url": horizon_client::import::download::url(&active),
+                    let custom_url = std::env::var("HORIZON_GAME_FILES_URL")
+                        .ok()
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty());
+                    let payload = if custom_url.is_some() {
+                        json!({
+                            "url": horizon_client::import::download::url(horizon_core::VANILLA_VERSION),
                             "version": active,
                             "engine_version": horizon_core::VANILLA_VERSION,
                         })
-                        .to_string(),
-                    );
+                    } else {
+                        json!({
+                            "mode": "mojang_plus_sim_base",
+                            "sim_base_url": horizon_hooks::porter::engine::simulation_base_url(),
+                            "version": active,
+                            "engine_version": horizon_core::VANILLA_VERSION,
+                            "partial_mojang": horizon_client::versions::has_any_partial_mojang(&home),
+                            "has_simulation_base": horizon_client::versions::find_simulation_base(&home).is_some(),
+                        })
+                    };
+                    request.answer(&payload.to_string());
                 }
                 "launcher-start" => {
                     if importing_archive() {
@@ -513,10 +526,34 @@ impl Loading {
                     } else {
                         if horizon_ios_launcher::waiting() {
                             let home = horizon_client::import::home();
+                            if let Some(base) =
+                                horizon_client::versions::find_simulation_base(&home)
+                            {
+                                let _ = horizon_client::versions::upgrade_partial_mojang_versions(
+                                    &home, &base,
+                                );
+                            }
                             self.settings =
                                 horizon_client::settings::Settings::load(&Game::options_path());
                             horizon_client::versions::apply_active_protocol_preference(&home);
                             self.refresh_import_root(&home)?;
+                            if let Err(reason) = horizon_client::versions::validate_playable_root(
+                                &self.vanilla_root,
+                            ) {
+                                let partial =
+                                    horizon_client::versions::has_any_partial_mojang(&home);
+                                request.answer(
+                                    &json!({
+                                        "ok": false,
+                                        "phase": "needs_files",
+                                        "needs_files": true,
+                                        "partial_mojang": partial,
+                                        "error": reason,
+                                    })
+                                    .to_string(),
+                                );
+                                continue;
+                            }
                         }
                         let accepted =
                             horizon_ios_launcher::start_owned(start_owner(&request.line));
