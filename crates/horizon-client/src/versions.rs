@@ -2588,7 +2588,7 @@ mod tests {
     fn prepare_mojang_overwrites_jar_placeholders_and_heals_existing_installs() {
         let home = temp_home("heal-pano");
         let base_26_3 = home.join("versions/.sim-base-26.3/resources");
-        write_fake_prepared_root(&base_26_3, "26.3");
+        write_simulated_prepared_base(&base_26_3);
 
         // Build a synthetic client.jar containing a 150-byte 1x1 placeholder panorama_0.png
         let jar_path = home.join("minecraft/versions/26.3/26.3.jar");
