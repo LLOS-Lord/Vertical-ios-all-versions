@@ -546,7 +546,7 @@ fn prepare_jar_for_porting(jar_path: &Path, stage_dir: &Path) -> Result<Prepared
         zip::ZipArchive::new(raw_file).map_err(|e| format!("{}: {e}", jar_path.display()))?;
     let outer_names: Vec<String> = zip
         .file_names()
-        .map(|n| n.map(str::to_owned))
+        .map(|n| n.map(|s| s.into_owned()))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("{}: {e}", jar_path.display()))?;
     let original_loader = if outer_names.iter().any(|n| n == "META-INF/neoforge.mods.toml") {
@@ -619,7 +619,7 @@ fn prepare_jar_for_porting(jar_path: &Path, stage_dir: &Path) -> Result<Prepared
             let Ok(mut entry) = inner.by_index(j) else {
                 continue;
             };
-            let Ok(name) = entry.name().map(str::to_owned) else {
+            let Ok(name) = entry.name().map(|s| s.into_owned()) else {
                 continue;
             };
             if name.ends_with('/') || flat_entries.contains_key(&name) {
