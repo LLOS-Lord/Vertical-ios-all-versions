@@ -168,7 +168,7 @@ pub(super) fn load_core(
         && horizon_core::prepared_files::open(root).is_none()
         && root.join("horizon-resources.json").is_file()
     {
-        let _ = fs::remove_file(root.join(horizon_core::prepared_files::FILE_NAME));
+        let _ = std::fs::remove_file(root.join(horizon_core::prepared_files::FILE_NAME));
         if horizon_core::prepared_files::write_with_readers(root, 2).is_ok() {
             horizon_core::prepared_files::invalidate(root);
         }
