@@ -349,9 +349,14 @@ fn handle_launcher_mods(line: &str, reply: &Sender<String>) -> Result<Option<Opt
         }
         "horizon-browse" => {
             let query = args["query"].as_str().unwrap_or_default().to_owned();
+            let kind = args["kind"].as_str().map(str::to_owned);
             let reply = reply.clone();
             std::thread::spawn(move || {
-                let answer = match launcher_mods::browse_horizon_registry(&home, &query) {
+                let answer = match launcher_mods::browse_horizon_registry_filtered(
+                    &home,
+                    &query,
+                    kind.as_deref(),
+                ) {
                     Ok(v) => v,
                     Err(e) => json!({ "error": e }),
                 };

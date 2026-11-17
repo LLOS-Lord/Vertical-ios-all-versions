@@ -141,14 +141,23 @@ pub const SPRITE_SIZE: u32 = 16;
 /// The largest sprite array (all layers of the top mip level) when the settings leave it to
 /// Horizon: resource packs with bigger textures are sampled down to fit.
 pub const DEFAULT_TEXTURE_BUDGET: u64 = 256 << 20;
+/// Automatic block sprite array budget when `textureBudgetMiB` is `0`: on iOS, `16 MiB` keeps
+/// vanilla's ~1,300 `16x16` block sprites (plus two `64x64` blocks) at `32x32` (`~7.1 MiB` with
+/// mips) instead of upsampling every `16x16` layer 16x to `64x64` (`28.4 MiB`), cutting mobile
+/// TBDR texture cache bandwidth 4x while leaving `DEFAULT_TEXTURE_BUDGET` intact.
+const AUTO_TEXTURE_BUDGET: u64 = if cfg!(target_os = "ios") {
+    16 << 20
+} else {
+    DEFAULT_TEXTURE_BUDGET
+};
 /// The budget in bytes the next resource load keeps to (`set_texture_budget`).
 static TEXTURE_BUDGET: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DEFAULT_TEXTURE_BUDGET);
+    std::sync::atomic::AtomicU64::new(AUTO_TEXTURE_BUDGET);
 /// The block textures' budget from the `textureBudgetMiB` setting (0 for the default), for
 /// resources loaded from now on.
 pub fn set_texture_budget(mib: u32) {
     let bytes = match mib {
-        0 => DEFAULT_TEXTURE_BUDGET,
+        0 => AUTO_TEXTURE_BUDGET,
         mib => u64::from(mib) << 20,
     };
     TEXTURE_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);

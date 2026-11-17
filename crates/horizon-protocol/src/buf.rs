@@ -403,6 +403,37 @@ impl Codec<String> for Ident {
         w.string(v)
     }
 }
+/// Lenient plugin-channel identifier for `CustomQuery` and `CustomPayload`: normalizes valid
+/// vanilla identifiers without a namespace (`"brand"` -> `"minecraft:brand"`) identically to
+/// [`Ident`], while tolerating legacy/proxy channel names (`"BungeeCord"`, `"FML|HS"`,
+/// `"REGISTER"`, `"MC|Brand"`) so 1.21.1 / Velocity / BungeeCord proxies never drop the session.
+pub struct Channel;
+impl Codec<String> for Channel {
+    fn read(r: &mut Reader) -> Result<String> {
+        let value = r.string(32767)?;
+        let qualified = value.find(':').is_some_and(|i| i > 0);
+        let (namespace, path) = value.split_once(':').unwrap_or(("", &value));
+        let namespace = if namespace.is_empty() {
+            "minecraft"
+        } else {
+            namespace
+        };
+        let valid_ident = namespace
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.-".contains(&c))
+            && path
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"/_.-".contains(&c));
+        if valid_ident && !qualified && !path.is_empty() {
+            Ok(format!("{namespace}:{path}"))
+        } else {
+            Ok(value)
+        }
+    }
+    fn write(v: &String, w: &mut Writer) {
+        w.string(v)
+    }
+}
 /// VarInt-prefixed bytes.
 pub struct Bytes;
 impl Codec<Vec<u8>> for Bytes {

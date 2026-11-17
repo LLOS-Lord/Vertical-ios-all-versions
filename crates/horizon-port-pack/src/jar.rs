@@ -67,6 +67,8 @@ pub fn read(path: &Path) -> Result<JarInfo, String> {
         metadata(&tomls)?
     } else if let Some(t) = text(&mut zip, "fabric.mod.json")? {
         fabric(&t)?
+    } else if let Some(t) = text(&mut zip, "quilt.mod.json")? {
+        quilt(&t)?
     } else if let Some(t) = text(&mut zip, "mcmod.info")? {
         mcmod_info(&t)?
     } else {
@@ -238,6 +240,50 @@ pub fn fabric(text: &str) -> Result<JarInfo, String> {
         mod_id: s("id"),
         name: s("name"),
         version: s("version"),
+        license,
+        depends,
+        census: Census::default(),
+    })
+}
+
+pub fn quilt(text: &str) -> Result<JarInfo, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("quilt.mod.json: {e}"))?;
+    let ql = &v["quilt_loader"];
+    let meta = &ql["metadata"];
+    let license = match &meta["license"] {
+        serde_json::Value::Array(l) => l
+            .iter()
+            .filter_map(|x| x.as_str().or_else(|| x["id"].as_str()))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+        serde_json::Value::Object(o) => o
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        l => l.as_str().unwrap_or("").to_owned(),
+    };
+    let depends = ql["depends"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.as_str().or_else(|| d["id"].as_str()))
+        .filter(|id| {
+            !NOT_MODS.contains(id)
+                && !id.starts_with("quilt")
+                && !id.starts_with("quilted_fabric")
+                && !id.starts_with("fabric")
+        })
+        .map(str::to_owned)
+        .collect();
+    let mod_id = ql["id"].as_str().unwrap_or("").to_owned();
+    let name = meta["name"].as_str().unwrap_or(&mod_id).to_owned();
+    let version = ql["version"].as_str().unwrap_or("").to_owned();
+    Ok(JarInfo {
+        mod_id,
+        name,
+        version,
         license,
         depends,
         census: Census::default(),

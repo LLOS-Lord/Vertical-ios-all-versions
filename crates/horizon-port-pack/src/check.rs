@@ -75,6 +75,66 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Counts carried data-driven entries beyond blocks/items/recipes/loot/worldgen (custom
+/// enchantments, dimensions, jukebox songs, variants, trims, advancements, functions, and tags)
+/// so pure data-driven 1.21+ / 26.x mods are recognized as working content mods.
+fn count_carried_data_entries(data_root: &Path) -> usize {
+    fn walk(dir: &Path, rel: &str, count: &mut usize) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let next = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if path.is_dir() {
+                walk(&path, &next, count);
+            } else if path.is_file() {
+                let mut parts = next.split('/');
+                let _ns = parts.next();
+                if let Some(kind) = parts.next()
+                    && matches!(
+                        kind,
+                        "enchantment"
+                            | "enchantment_provider"
+                            | "dimension"
+                            | "dimension_type"
+                            | "jukebox_song"
+                            | "painting_variant"
+                            | "wolf_variant"
+                            | "cat_variant"
+                            | "frog_variant"
+                            | "pig_variant"
+                            | "cow_variant"
+                            | "chicken_variant"
+                            | "trim_pattern"
+                            | "trim_material"
+                            | "banner_pattern"
+                            | "damage_type"
+                            | "chat_type"
+                            | "instrument"
+                            | "trial_spawner"
+                            | "function"
+                            | "advancement"
+                            | "tags"
+                    )
+                {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let mut count = 0;
+    walk(data_root, "", &mut count);
+    count
+}
+
 /// Checks `jar` and carries it over into `out/carry/` (`out/check.json`,
 /// `out/carry-report.json` beside it). The carry is the folder mod an
 /// install copies.
@@ -159,14 +219,23 @@ pub fn check(jar_path: &Path, out: &Path) -> Result<Check, String> {
         .recipes_upgraded
         .saturating_sub(report.recipes_unregistered.len());
     let loot = c.loot_tables + report.loot_tables_added;
-    let content =
-        report.blocks.len() + report.items + recipes + loot + report.worldgen + c.structures;
+    // Count data-driven 1.21+ / 26.x registries (enchantments, dimensions, jukebox songs,
+    // variants, trims, functions, advancements, and tag packs) carried inside `out/carry/data/`.
+    let data_entries = count_carried_data_entries(&out.join("carry/data"));
+    let content = report.blocks.len()
+        + report.items
+        + recipes
+        + loot
+        + report.worldgen
+        + c.structures
+        + data_entries;
     for (n, one, many) in [
         (report.blocks.len(), "block", "blocks"),
         (report.items, "item", "items"),
         (recipes, "recipe", "recipes"),
         (loot, "loot table", "loot tables"),
         (report.worldgen, "worldgen file", "worldgen files"),
+        (data_entries, "data pack entry", "data pack entries"),
         (c.textures, "texture", "textures"),
     ] {
         if n > 0 {

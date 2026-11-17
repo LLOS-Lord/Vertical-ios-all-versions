@@ -7184,6 +7184,12 @@ impl Renderer {
         self.world_post.taa = taa;
         self.world_post.upscale = if taa { upscale.clamp(1.0, 4.0) } else { 1.0 };
     }
+    /// Adjusts only the dynamic world render scale without invalidating UI presentation geometry,
+    /// so automatic background resolution steps never cancel active touch gestures or drop
+    /// pointer capture mid-turn.
+    pub fn set_dynamic_world_scale(&mut self, scale: f32) {
+        self.world_post.scale = scale.clamp(0.25, 2.0);
+    }
     /// Runs `post` over the world from now on (`None`: no pack), for the dimension `dimension`;
     /// `block_ids` gives each source state its model and fluid material ids (two values
     /// per state); emission and ownership come from the mesher's quad records.

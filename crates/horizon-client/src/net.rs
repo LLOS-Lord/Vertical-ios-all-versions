@@ -22,12 +22,12 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use horizon_hooks::tunnel;
@@ -820,21 +820,56 @@ pub fn older_servers_enabled() -> bool {
     }
 }
 
-/// The older release a server speaks, by its status ping (falling back to the active profile's
-/// preferred protocol when status ping is proxied or blocked), when Horizon can translate it.
+/// Cache of recent status-ping protocols (`normalized_address -> (protocol, seen_at)`), so
+/// joining a server from the Multiplayer list on `26.3` reuses the already-probed protocol
+/// instead of opening a second back-to-back TCP socket that trips Paper/Spigot's
+/// `connection-throttle: 4000` ms kick.
+fn recent_server_protocols() -> &'static Mutex<HashMap<String, (i32, Instant)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (i32, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_server_protocol(address: &str, protocol: i32) {
+    if let Ok(mut map) = recent_server_protocols().lock() {
+        let now = Instant::now();
+        map.retain(|_, (_, seen)| now.duration_since(*seen) < Duration::from_secs(300));
+        map.insert(address.trim().to_ascii_lowercase(), (protocol, now));
+    }
+}
+
+fn cached_server_protocol(address: &str) -> Option<i32> {
+    let map = recent_server_protocols().lock().ok()?;
+    let (proto, seen) = map.get(&address.trim().to_ascii_lowercase())?;
+    (seen.elapsed() < Duration::from_secs(180)).then_some(*proto)
+}
+
+/// The older release a server speaks:
+/// - When an older version profile (such as `1.21.1`) is explicitly active in the launcher, speak
+///   that profile's exact protocol directly without opening a pre-login `ping()` socket (avoiding
+///   both ViaVersion/Velocity status overrides and Paper/Spigot `connection-throttle` kicks).
+/// - Otherwise (`26.3` with multi-version server translation enabled), consult the Multiplayer
+///   screen's recent ping cache first, falling back to a status probe for Direct Connect.
 fn older_server(address: &str) -> Option<horizon_protocol::adapter::ServerVersion> {
     use horizon_protocol::adapter::{ServerVersion, preferred_server_version};
     if !older_servers_enabled() {
         return None;
     }
-    if let Ok((json, _)) = ping(address, Duration::from_secs(5))
+    if let Some(preferred) = preferred_server_version().filter(|v| *v != ServerVersion::Current) {
+        return Some(preferred);
+    }
+    if let Some(protocol) = cached_server_protocol(address)
+        && let Some(ver) = ServerVersion::from_protocol(protocol)
+    {
+        return (ver != ServerVersion::Current).then_some(ver);
+    }
+    if let Ok((json, _)) = ping(address, Duration::from_secs(3))
         && let Some(raw) = json["version"]["protocol"].as_i64()
         && let Ok(protocol) = i32::try_from(raw)
         && let Some(ver) = ServerVersion::from_protocol(protocol)
     {
         return (ver != ServerVersion::Current).then_some(ver);
     }
-    preferred_server_version().filter(|v| *v != ServerVersion::Current)
+    None
 }
 
 /// `Connection.exceptionCaught`: a read that timed out ends with
@@ -1565,9 +1600,11 @@ pub fn ping(address: &str, timeout: Duration) -> Result<(serde_json::Value, u128
         .set_read_timeout(Some(timeout))
         .map_err(|e| e.to_string())?;
     let e = |e: horizon_protocol::Error| e.to_string();
+    let status_protocol = horizon_protocol::adapter::preferred_server_version()
+        .map_or(PROTOCOL_VERSION, |v| v.protocol());
     c.send(
         &handshake::Serverbound::Intention(handshake::Intention {
-            protocol: PROTOCOL_VERSION,
+            protocol: status_protocol,
             host: host.clone(),
             port,
             intent: handshake::STATUS,
@@ -1575,20 +1612,33 @@ pub fn ping(address: &str, timeout: Duration) -> Result<(serde_json::Value, u128
         .encode(),
     )
     .map_err(e)?;
+    let status_start = std::time::Instant::now();
     c.send(&status::Serverbound::StatusRequest(Empty).encode())
         .map_err(e)?;
     let (id, payload) = c.recv().map_err(e)?;
-    let json = match status::Clientbound::decode(id, &payload).map_err(e)? {
+    let status_rtt = status_start.elapsed().as_millis();
+    let json: serde_json::Value = match status::Clientbound::decode(id, &payload).map_err(e)? {
         status::Clientbound::StatusResponse(s) => {
             serde_json::from_str(&s.json).map_err(|e| e.to_string())?
         }
         _ => return Err("unexpected status reply".into()),
     };
+    if let Some(raw) = json["version"]["protocol"].as_i64()
+        && let Ok(protocol) = i32::try_from(raw)
+    {
+        cache_server_protocol(address, protocol);
+    }
     let start = std::time::Instant::now();
-    c.send(&status::Serverbound::PingRequest(status::Ping { time: 1 }).encode())
-        .map_err(e)?;
-    let _ = c.recv().map_err(e)?;
-    Ok((json, start.elapsed().as_millis()))
+    let rtt = match c
+        .send(&status::Serverbound::PingRequest(status::Ping { time: 1 }).encode())
+        .and_then(|()| c.recv())
+    {
+        Ok(_) => start.elapsed().as_millis(),
+        // Many status proxies / DDoS shields close the socket immediately after `StatusResponse`
+        // without answering `PingRequest`; keep the valid status JSON and fall back to status RTT.
+        Err(_) => status_rtt,
+    };
+    Ok((json, rtt))
 }
 
 /// What a server that answers only the legacy ping reports

@@ -269,6 +269,23 @@ fn partial_mojang_install_blocks_broken_launch_and_repairs_via_compact_sim_base(
         fs::read(ver_root.join("assets/minecraft/sounds/ui/button/click.ogg")).unwrap(),
         sound_bytes
     );
+    // On-device multi-version repair also writes a single-handle `horizon-data.bin` acceleration
+    // cache so launching 1.20.4 / 1.21.1 never suffers ~22,000 loose APFS file opens or mid-game background writes.
+    assert!(
+        ver_root.join(horizon_core::prepared_files::FILE_NAME).is_file(),
+        "repaired version must prebuild horizon-data.bin"
+    );
+    assert!(
+        horizon_core::prepared_files::open(&ver_root).is_some(),
+        "horizon-data.bin must match canonical version root"
+    );
+    assert_eq!(
+        horizon_core::prepared_files::read(
+            &ver_root.join("assets/minecraft/textures/block/cobblestone.png")
+        )
+        .unwrap(),
+        b"COBBLESTONE_1_20_4"
+    );
 
     let _ = fs::remove_dir_all(&home);
 }

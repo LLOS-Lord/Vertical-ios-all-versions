@@ -60,9 +60,11 @@ struct InstalledModItem: Identifiable, Equatable {
     }
 }
 
-/// Content mod listing from Horizon's official signed registry (`horizon-rust.github.io/horizon-mods`).
+/// Package listing from Horizon's official signed registry (`horizon-rust.github.io/horizon-mods`).
 struct HorizonRegistryMod: Identifiable, Equatable {
     let id: String
+    let kind: String
+    let installable: Bool
     let title: String
     let summary: String
     let authors: [String]
@@ -75,6 +77,8 @@ struct HorizonRegistryMod: Identifiable, Equatable {
     init?(_ json: [String: Any]) {
         guard let id = json["id"] as? String, !id.isEmpty else { return nil }
         self.id = id
+        kind = json["kind"] as? String ?? "mod"
+        installable = json["installable"] as? Bool ?? true
         title = json["title"] as? String ?? id
         summary = json["summary"] as? String ?? ""
         authors = json["authors"] as? [String] ?? []
@@ -83,6 +87,34 @@ struct HorizonRegistryMod: Identifiable, Equatable {
         downloads = (json["downloads"] as? NSNumber)?.intValue ?? 0
         installedVersion = json["installed_version"] as? String
         updateAvailable = json["update_available"] as? Bool ?? false
+    }
+
+    var kindLabel: String {
+        switch kind {
+        case "shader", "shaderpack": return "Shader"
+        case "resourcepack": return "Resource Pack"
+        case "modpack": return "Modpack"
+        case "native-mod": return "Desktop Mixin"
+        default: return "Content Mod"
+        }
+    }
+
+    var kindIcon: String {
+        switch kind {
+        case "shader", "shaderpack": return "sun.max.fill"
+        case "resourcepack": return "paintbrush.pointed.fill"
+        case "modpack": return "shippingbox.fill"
+        case "native-mod": return "desktopcomputer"
+        default: return "cube.box.fill"
+        }
+    }
+
+    var kindTone: Chip.Tone {
+        if !installable { return .quiet }
+        switch kind {
+        case "shader", "shaderpack": return .warn
+        default: return .good
+        }
     }
 }
 
@@ -210,7 +242,8 @@ final class ModStore: ObservableObject {
         return nil
     }
 
-    func search(source: CatalogSource, query: String, loader: String = "all", version: String = "compatible") async {
+    func search(source: CatalogSource, query: String, loader: String = "all",
+                horizonKind: String = "installable", version: String = "compatible") async {
         searchRevision &+= 1
         let rev = searchRevision
         searching = true
@@ -219,7 +252,7 @@ final class ModStore: ObservableObject {
 
         switch source {
         case .horizon:
-            let reply = await command(["action": "horizon-browse", "query": query])
+            let reply = await command(["action": "horizon-browse", "query": query, "kind": horizonKind])
             guard rev == searchRevision, !Task.isCancelled else { return }
             if let err = reply["error"] as? String {
                 failed = err
@@ -259,6 +292,9 @@ final class ModStore: ObservableObject {
             installed = raw.compactMap(InstalledModItem.init)
         } else {
             await reloadInstalled()
+        }
+        if let msg = reply["message"] as? String, !msg.isEmpty {
+            return .success(msg)
         }
         let ver = reply["version"] as? String ?? mod.version
         let verified = (reply["verified"] as? Bool ?? false) ? " (Ed25519 verified)" : ""
@@ -344,6 +380,7 @@ struct ModsSectionView: View {
     @State private var source: ModStore.CatalogSource = .horizon
     @State private var query = ""
     @State private var loader = "all"
+    @State private var horizonKind = "installable"
     @State private var importingFile = false
     @State private var notice: String?
     @State private var inspectingProject: ModrinthModItem?
@@ -384,20 +421,31 @@ struct ModsSectionView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: loader) { _ in
-                    Task { await store.search(source: source, query: query, loader: loader) }
+                    Task { await store.search(source: source, query: query, loader: loader, horizonKind: horizonKind) }
                 }
-                Text("Horizon's pure-Rust porter scans Fabric / NeoForge / Forge / Quilt .jar files on your device (zero JVM/JIT) and converts blocks, items, recipes, loot, structures and worldgen into native Horizon content mods.")
+                Text("Horizon's pure-Rust porter unpacks Fabric / NeoForge / Forge / Quilt .jar mods (including nested Jar-in-Jar, 1.20–26.3 data, tools, foods, Creative tabs, and visual/audio resource bundles) directly on your iPhone.")
                     .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
             } else {
-                Text("Official Horizon content mods (.hmod), verified with Ed25519 signatures and SHA-256 checksums.")
+                Picker("Category", selection: $horizonKind) {
+                    Text("Installable").tag("installable")
+                    Text("Mods").tag("mod")
+                    Text("Shaders").tag("shader")
+                    Text("Packs").tag("pack")
+                    Text("All").tag("all")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: horizonKind) { _ in
+                    Task { await store.search(source: source, query: query, loader: loader, horizonKind: horizonKind) }
+                }
+                Text("Official Horizon packages (.hmod content mods, .hshader Metal shaders, resource packs & modpack bundles), verified with Ed25519 signatures and SHA-256 checksums.")
                     .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
             }
 
             Field(title: "SEARCH MODS",
-                  placeholder: source == .horizon ? "Search Horizon Registry mods…" : "Terralith, Farmer's Delight, Towns and Towers…",
+                  placeholder: source == .horizon ? "Search Horizon mods, shaders, packs…" : "Terralith, Farmer's Delight, Towns and Towers…",
                   text: $query, keyboard: .default)
                 .onSubmit {
-                    Task { await store.search(source: source, query: query, loader: loader) }
+                    Task { await store.search(source: source, query: query, loader: loader, horizonKind: horizonKind) }
                 }
 
             if let failed = store.failed {
@@ -412,12 +460,13 @@ struct ModsSectionView: View {
         }
         .task(id: source) {
             await store.reloadInstalled()
-            await store.search(source: source, query: query, loader: loader)
+            await store.search(source: source, query: query, loader: loader, horizonKind: horizonKind)
         }
         .fileImporter(
             isPresented: $importingFile,
             allowedContentTypes: [
                 UTType(filenameExtension: "hmod") ?? .data,
+                UTType(filenameExtension: "hshader") ?? .data,
                 UTType(filenameExtension: "jar") ?? .zip,
                 .zip,
                 .data,
@@ -525,7 +574,7 @@ struct ModsSectionView: View {
                 VStack(spacing: 0) {
                     ForEach(store.horizonResults) { mod in
                         HStack(alignment: .top, spacing: 12) {
-                            Image(systemName: "cube.box.fill")
+                            Image(systemName: mod.kindIcon)
                                 .font(.system(size: 22))
                                 .foregroundStyle(Theme.accent)
                                 .frame(width: 44, height: 44)
@@ -534,6 +583,7 @@ struct ModsSectionView: View {
                                 HStack(spacing: 6) {
                                     Text(mod.title).font(Theme.sans(15, .semiBold)).foregroundStyle(Theme.text).lineLimit(1)
                                     Text(mod.version).font(Theme.mono(10)).foregroundStyle(Theme.textMuted)
+                                    Chip(tone: mod.kindTone, text: mod.kindLabel)
                                 }
                                 Text(mod.summary).font(Theme.sans(11)).foregroundStyle(Theme.textMuted).lineLimit(2)
                                 HStack(spacing: 6) {
@@ -545,6 +595,8 @@ struct ModsSectionView: View {
                             Spacer(minLength: 6)
                             if store.busyIds.contains(mod.id) {
                                 ProgressView().tint(Theme.accentText).frame(width: 44, height: 44)
+                            } else if !mod.installable {
+                                Chip(tone: .quiet, text: "Desktop Only")
                             } else if mod.installedVersion != nil && !mod.updateAvailable {
                                 Chip(tone: .good, text: "Installed")
                             } else {
@@ -555,7 +607,7 @@ struct ModsSectionView: View {
                                         case let .success(msg): Haptics.done(); notice = msg
                                         case let .failure(err): Haptics.failed(); notice = err.message
                                         }
-                                        await store.search(source: .horizon, query: query)
+                                        await store.search(source: .horizon, query: query, loader: loader, horizonKind: horizonKind)
                                     }
                                 } label: {
                                     Image(systemName: mod.updateAvailable ? "arrow.up.circle.fill" : "arrow.down.circle.fill")

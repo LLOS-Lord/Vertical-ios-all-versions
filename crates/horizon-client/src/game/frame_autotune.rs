@@ -55,7 +55,7 @@ pub(super) fn observe(
         {
             // Debug only: it changes as often as the scene does, which would flood the log.
             log::debug!("Horizon: Dynamic Resolution sets the world to {scale}%");
-            apply_world_post(r, g, scale);
+            r.set_dynamic_world_scale(scale as f32 / 100.0);
         }
     }
 }

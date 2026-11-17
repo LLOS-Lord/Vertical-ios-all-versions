@@ -3,8 +3,8 @@
 use crate::{
     Result,
     buf::{
-        Bool, Byte, Codec, Ident, Int, List, Long, Nbt, Opt, Reader, Rest, Str, StrN, UByte, Uuid,
-        VarInt, Writer,
+        Bool, Byte, Channel, Codec, Ident, Int, List, Long, Nbt, Opt, Reader, Rest, Str, StrN,
+        UByte, Uuid, VarInt, Writer,
     },
     packet, packet_enum,
     packets::Empty,
@@ -12,7 +12,7 @@ use crate::{
 use horizon_world::nbt::Tag;
 
 packet!(CookieRequest { key: String => Ident });
-packet!(CustomPayload { channel: String => Ident, data: Vec<u8> => Rest });
+packet!(CustomPayload { channel: String => Channel, data: Vec<u8> => Rest });
 packet!(
     /// Common disconnect: a chat component (NBT).
     Disconnect { reason: Tag => Nbt }

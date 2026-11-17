@@ -103,10 +103,15 @@ pub(super) struct TouchInput {
     menu_toggled: BTreeSet<u16>,
     /// Controls let go after the tick that last saw them: the game samples keys once a tick, so a
     /// tap pressed and released in the same frame would otherwise be invisible to it (a double
-    /// tap of forward to sprint).
-    late_keys: Vec<(Control, u64)>,
-    /// When each held control went down, in ticks.
-    pressed_at: std::collections::BTreeMap<Control, u64>,
+    /// tap of forward to sprint). Stores `(control, pressed_tick, press_seq)`.
+    late_keys: Vec<(Control, u64, u64)>,
+    /// When each held control went down: `(pressed_tick, press_seq)`.
+    pressed_at: std::collections::BTreeMap<Control, (u64, u64)>,
+    /// Monotonic counter distinguishing rapid same-tick presses (e.g. double-tap Forward).
+    next_press_seq: u64,
+    /// Keys pressed by touch under `Source::Keyboard`, so `cancel_touch_for_reload` releases
+    /// touch-held movement keys without disturbing physical keyboard holds.
+    held_keyboard_keys: BTreeSet<KeyCode>,
     /// The hide-HUD button was tapped: the HUD and this overlay are not drawn, but the buttons stay
     /// where they were, so a finger that remembers them can bring the HUD back.
     pub(super) hud_hidden: bool,
@@ -191,11 +196,21 @@ impl Game<'_> {
     /// boundary has already let go of gameplay holds and the screen's drag state.
     pub(super) fn cancel_touch_for_reload(&mut self) {
         self.touch.fingers.release_all();
+        let held_keys = std::mem::take(&mut self.touch.held_keyboard_keys);
+        for key in held_keys {
+            let _ = self.mapped_key(key, false, false, key, Source::Keyboard);
+            self.keys.release(&key, Source::Keyboard);
+        }
+        if let Some(button) = self.touch.holding.take() {
+            let _ = self.play_mouse(button, false);
+        }
+        for (button, _) in std::mem::take(&mut self.touch.late) {
+            let _ = self.play_mouse(button, false);
+        }
         self.touch.menu = None;
         self.touch.studio = None;
-        self.touch.late.clear();
-        self.touch.holding = None;
         self.touch.late_keys.clear();
+        self.touch.pressed_at.clear();
         self.touch.custom_keys.clear();
         self.touch.toggled.clear();
         self.touch.menu_custom_keys.clear();
@@ -543,7 +558,7 @@ impl Game<'_> {
                     .fingers
                     .moved(touch.id, at, &layout, &self.settings.touch.swipes())
             }
-            TouchPhase::Ended => self.touch.fingers.end(touch.id),
+            TouchPhase::Ended => self.touch.fingers.end_at(touch.id, at),
             TouchPhase::Cancelled => self.touch.fingers.cancel(touch.id),
         };
         self.touch_act(event_loop, out, batch.scale)
@@ -605,7 +620,7 @@ impl Game<'_> {
         self.touch.late = keep;
         let (keys_due, keys_keep) = std::mem::take(&mut self.touch.late_keys)
             .into_iter()
-            .partition(|(_, at)| ticks > *at || !playing);
+            .partition(|(_, at, _)| ticks > *at || !playing);
         self.touch.late_keys = keys_keep;
         let scale = self.touch_batch().map_or(1.0, |b| b.scale);
         let result = due
@@ -614,7 +629,7 @@ impl Game<'_> {
             .and_then(|()| {
                 keys_due
                     .into_iter()
-                    .try_for_each(|(control, at)| self.touch_release_late(event_loop, control, at))
+                    .try_for_each(|(control, _at, seq)| self.touch_release_late(event_loop, control, seq))
             })
             .and_then(|()| self.touch_act(event_loop, out, scale));
         if let Err(e) = result {
@@ -701,15 +716,14 @@ impl Game<'_> {
                 Out::Press(control) | Out::Release(control) => {
                     let pressed = matches!(o, Out::Press(_));
                     if pressed {
-                        self.touch.pressed_at.insert(control, self.ticks);
-                    } else if self
-                        .touch
-                        .pressed_at
-                        .get(&control)
-                        .is_some_and(|&at| at == self.ticks)
+                        self.touch.next_press_seq = self.touch.next_press_seq.wrapping_add(1);
+                        let seq = self.touch.next_press_seq;
+                        self.touch.pressed_at.insert(control, (self.ticks, seq));
+                    } else if let Some(&(at, seq)) = self.touch.pressed_at.get(&control)
+                        && at == self.ticks
                     {
                         // Down and up before a tick could sample it: let go after the next one.
-                        self.touch.late_keys.push((control, self.ticks));
+                        self.touch.late_keys.push((control, at, seq));
                         continue;
                     } else {
                         self.touch.pressed_at.remove(&control);
@@ -720,6 +734,11 @@ impl Game<'_> {
                         }
                         _ => {
                             if let Some(key) = key_of(control) {
+                                if pressed {
+                                    self.touch.held_keyboard_keys.insert(key);
+                                } else {
+                                    self.touch.held_keyboard_keys.remove(&key);
+                                }
                                 self.mapped_key(key, pressed, false, key, Source::Keyboard)?;
                             }
                         }
@@ -791,9 +810,9 @@ impl Game<'_> {
         &mut self,
         event_loop: &dyn EventLoopCtl,
         control: Control,
-        at: u64,
+        seq: u64,
     ) -> Result<()> {
-        if self.touch.pressed_at.get(&control) != Some(&at) {
+        if self.touch.pressed_at.get(&control).map(|&(_, s)| s) != Some(seq) {
             // Pressed again since: that press's own release lets go.
             return Ok(());
         }
@@ -802,7 +821,10 @@ impl Game<'_> {
             // The same path as a live release: a toggle button ignores it.
             Control::Custom(id) => self.touch_custom_key(event_loop, id, false),
             _ => match key_of(control) {
-                Some(key) => self.mapped_key(key, false, false, key, Source::Keyboard),
+                Some(key) => {
+                    self.touch.held_keyboard_keys.remove(&key);
+                    self.mapped_key(key, false, false, key, Source::Keyboard)
+                }
                 None => Ok(()),
             },
         }
@@ -968,7 +990,14 @@ impl Game<'_> {
         state: ElementState,
     ) -> Result<()> {
         match key {
-            touch::CustomKey::Key(key) => self.synthetic_key(event_loop, key, state),
+            touch::CustomKey::Key(key) => {
+                if state == ElementState::Pressed {
+                    self.touch.held_keyboard_keys.insert(key);
+                } else {
+                    self.touch.held_keyboard_keys.remove(&key);
+                }
+                self.synthetic_key(event_loop, key, state)
+            }
             // Directly, as a tap does: a touch screen never captures the pointer, so a `MouseInput`
             // event would be taken for a first click that only grabs and would act on nothing.
             touch::CustomKey::Mouse(button) => {

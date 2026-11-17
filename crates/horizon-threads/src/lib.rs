@@ -91,7 +91,7 @@ pub fn par_chunks_mut_with<T: Send>(
         }
     };
     std::thread::scope(|scope| {
-        let helpers = worker_count().saturating_sub(1).clamp(1, count - 1);
+        let helpers = default_workers().clamp(1, count - 1);
         let threads: Vec<_> = (0..helpers)
             .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, work).ok())
             .collect();
@@ -161,19 +161,23 @@ pub fn default_workers() -> usize {
     workers_for(worker_count(), performance_cores)
 }
 
-/// iPhones pair 2 performance cores with 4 efficiency cores (`hw.perflevel0.physicalcpu == 2`).
-/// Counting only performance cores left a single worker thread (`2 - 1 = 1`) for all chunk
-/// generation, lighting and meshing while 4 efficiency cores sat idle. Because [`behind`] places
-/// iOS pool workers in `QOS_CLASS_UTILITY` (behind the `QOS_CLASS_USER_INTERACTIVE` render and
-/// server threads), half the machine's cores (`3` on a 6-core iPhone) run in parallel on the
-/// efficiency cluster without preempting frame or tick work.
+/// iPhones pair 2 performance cores with 4 efficiency cores (`hw.perflevel0.physicalcpu == 2`,
+/// or `None` on Apple A11 / older iOS kernels that omit `hw.perflevel0.*`). Keeping 2 utility
+/// workers (`QOS_CLASS_UTILITY`) on 6-core iPhones runs chunk generation, lighting and meshing
+/// strictly inside the 4 efficiency cores while leaving both performance cores dedicated to the
+/// `QOS_CLASS_USER_INTERACTIVE` render and server threads — preventing the 5-worker Monsoon
+/// preemption spikes seen on Apple A11 when `performance_cores()` returned `None`.
 #[cfg(any(target_os = "ios", test))]
 fn ios_workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
-    let base = workers_for(cores, performance);
-    if cores >= 4 && base < 2 {
-        (cores / 2).clamp(2, 4)
-    } else {
-        base
+    match performance().filter(|&n| n > 0) {
+        Some(fast) => {
+            let base = workers_for(cores, || Some(fast));
+            if cores >= 4 && base < 2 { 2 } else { base }
+        }
+        // Older iPhones/iPads (e.g. 6-core Apple A11 on iOS 16.7) report total cores without
+        // `hw.perflevel0.physicalcpu`: cap at a third of cores (2 on 6-core A11, up to 4 on
+        // larger tablets) instead of `cores - 1` (5).
+        None => (cores / 3).clamp(1, 4),
     }
 }
 
@@ -806,8 +810,10 @@ mod tests {
         // Never fewer than one worker.
         assert_eq!(workers_for(1, || None), 1);
         assert_eq!(workers_for(2, || Some(1)), 1);
-        // 6-core iPhones (2P + 4E, e.g. Apple A11..A18) get 3 utility workers instead of 1.
-        assert_eq!(super::ios_workers_for(6, || Some(2)), 3);
+        // 6-core iPhones (2P + 4E, e.g. Apple A11..A18) get 2 utility workers whether XNU
+        // reports `hw.perflevel0.physicalcpu == 2` or omits it (`None` on Apple A11 iOS 16.7).
+        assert_eq!(super::ios_workers_for(6, || Some(2)), 2);
+        assert_eq!(super::ios_workers_for(6, || None), 2);
         // iPad M-series (4P + 4E / 4P + 6E) keeps its performance-core worker count.
         assert_eq!(super::ios_workers_for(8, || Some(4)), 3);
         assert_eq!(super::ios_workers_for(10, || Some(4)), 3);

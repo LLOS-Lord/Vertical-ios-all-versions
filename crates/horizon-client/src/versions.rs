@@ -403,6 +403,33 @@ fn write_profile(resources_dir: &Path, profile: &VersionProfile) -> Result<(), S
         .map_err(|e| format!("{}: {e}", resources_dir.display()))
 }
 
+/// Pre-build `horizon-data.bin` at install time so the very first launch of `1.21.1` (or an
+/// imported `26.3` archive whose embedded desktop path doesn't match the iPhone sandbox) reads
+/// from a single indexed file and never spawns a 120 MB background disk writer mid-gameplay.
+fn build_prepared_data_cache(resources_dir: &Path) {
+    if !resources_dir.join("horizon-resources.json").is_file() {
+        return;
+    }
+    let _ = fs::remove_file(resources_dir.join(horizon_core::prepared_files::FILE_NAME));
+    match horizon_core::prepared_files::write_with_readers(resources_dir, 2) {
+        Ok(()) => {
+            horizon_core::prepared_files::invalidate(resources_dir);
+            log::info!(
+                "Versions: indexed {} at {}",
+                horizon_core::prepared_files::FILE_NAME,
+                resources_dir.display()
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "Versions: could not pre-index {} at {}: {e}",
+                horizon_core::prepared_files::FILE_NAME,
+                resources_dir.display()
+            );
+        }
+    }
+}
+
 /// List all installed versions under `home/versions/*/resources` plus legacy `home/resources`.
 /// Includes partial Mojang installs (`ready: false`) so the launcher can repair or remove them,
 /// while only marking genuinely playable (`ready: true`) versions as `active` for engine launch.
@@ -791,6 +818,7 @@ fn populate_from_simulation_base(base: &Path, target_resources: &Path, version_i
     if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
         let _ = write_unlinked(&target_resources.join("horizon-resources.json"), &bytes);
     }
+    build_prepared_data_cache(target_resources);
     linked
 }
 
@@ -1529,6 +1557,7 @@ fn run_prepared_download(
         notes: "Prepared Horizon runtime & assets.".into(),
     };
     write_profile(&installed.path, &profile)?;
+    build_prepared_data_cache(&installed.path);
     let _ = upgrade_partial_mojang_versions(home, &installed.path);
 
     let mut sel = load_selection(home);
@@ -1756,6 +1785,7 @@ fn run_repair_versions(
                 notes: "Horizon 26.3 compact simulation runtime.".into(),
             };
             let _ = write_profile(&v26_dir, &prof);
+            build_prepared_data_cache(&v26_dir);
         }
         let mut sel = load_selection(home);
         sel.active = horizon_core::VANILLA_VERSION.to_owned();
@@ -2358,6 +2388,9 @@ pub fn prepare_mojang_on_device(
         return Err(format!("{}: {e}", final_root.display()));
     }
     let _ = fs::remove_dir_all(&backup);
+    if full_simulation {
+        build_prepared_data_cache(&final_root);
+    }
 
     Ok(profile)
 }

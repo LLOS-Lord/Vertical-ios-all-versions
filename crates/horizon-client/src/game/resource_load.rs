@@ -158,6 +158,21 @@ pub(super) fn load_core(
     progress: &Progress,
     launch_world: Option<&str>,
 ) -> std::result::Result<std::result::Result<CoreTables, String>, String> {
+    // Ensure mobile installs (including already-installed 1.21.1 profiles or imported PC
+    // `resources.zip` bundles whose embedded path differs from the iOS sandbox) have a valid
+    // `horizon-data.bin` before reading ~22,000 files, preventing background 120 MB disk writes
+    // from running mid-gameplay.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    if !headless
+        && std::env::var_os("HORIZON_NO_DATA_FILE").is_none()
+        && horizon_core::prepared_files::open(root).is_none()
+        && root.join("horizon-resources.json").is_file()
+    {
+        let _ = fs::remove_file(root.join(horizon_core::prepared_files::FILE_NAME));
+        if horizon_core::prepared_files::write_with_readers(root, 2).is_ok() {
+            horizon_core::prepared_files::invalidate(root);
+        }
+    }
     // The model library reads every file under `assets/` and needs no
     // block registry, so it is parsed beside `Assets::load` rather than
     // after it. It used to sit inside `reload` behind both the registry

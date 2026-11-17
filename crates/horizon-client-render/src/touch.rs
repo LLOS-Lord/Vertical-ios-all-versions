@@ -1404,6 +1404,39 @@ impl Touches {
         out
     }
 
+    /// A finger lifted at `at`: flush any final coalesced look movement before ending so fast
+    /// iOS flicks whose movement UIKit coalesced into `touchesEnded` still turn the camera
+    /// instead of dropping the delta or misfiring `Out::Tap`.
+    pub fn end_at(&mut self, id: u64, at: (f32, f32)) -> Vec<Out> {
+        let mut out = Vec::new();
+        if let Some(f) = self.fingers.iter_mut().find(|f| f.id == id) {
+            let step = (at.0 - f.last.0, at.1 - f.last.1);
+            let moved_step = step.0.abs() > 1e-4 || step.1.abs() > 1e-4;
+            match &mut f.kind {
+                Kind::World { dragged, .. } => {
+                    let total = (at.0 - f.start.0).hypot(at.1 - f.start.1);
+                    if !*dragged && total > SLOP {
+                        *dragged = true;
+                    }
+                    if *dragged && moved_step {
+                        out.push(Out::Look(step.0, step.1));
+                    }
+                    f.last = at;
+                }
+                Kind::Button(control) if !control.moves() => {
+                    let total = (at.0 - f.start.0).hypot(at.1 - f.start.1);
+                    if total > SLOP && moved_step {
+                        out.push(Out::Look(step.0, step.1));
+                    }
+                    f.last = at;
+                }
+                _ => {}
+            }
+        }
+        out.extend(self.end(id));
+        out
+    }
+
     /// A finger lifted.
     pub fn end(&mut self, id: u64) -> Vec<Out> {
         let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
@@ -2416,5 +2449,21 @@ mod tests {
         assert_eq!(s.movement, Movement::DPad);
         assert_eq!(s.stick_scale, MAX_SCALE);
         assert_eq!(s.stick_opacity, 1.0);
+    }
+
+    #[test]
+    fn end_at_flushes_coalesced_flick_look_without_misfiring_tap() {
+        let l = TouchSettings::default().layout(460.0, 258.0);
+        let mut t = Touches::default();
+        assert_eq!(t.start(9, (311.0, 146.0), 0.0, &l, NO_SWIPES), []);
+        // UIKit coalesced a fast swipe straight into touchesEnded with zero intermediate Moved:
+        assert_eq!(
+            t.end_at(9, (221.0, 166.0)),
+            [Out::Look(-90.0, 20.0)],
+            "coalesced flick must turn the camera and not fire Out::Tap"
+        );
+        // A genuine stationary tap within SLOP still fires Out::Tap:
+        assert_eq!(t.start(10, (311.0, 146.0), 1.0, &l, NO_SWIPES), []);
+        assert_eq!(t.end_at(10, (313.0, 147.0)), [Out::Tap]);
     }
 }

@@ -144,11 +144,29 @@ impl Session {
         };
         if self.version.at_most(ServerVersion::V1_21_1) && state == State::Play && id == recipe_book
         {
-            return translate::v1_21_1::recipes::recipe_book(self, &payload).map(Some);
+            return match translate::v1_21_1::recipes::recipe_book(self, &payload) {
+                Ok(pkt) => Ok(Some(pkt)),
+                Err(e) => {
+                    log::warn!(
+                        "Horizon: could not translate {} recipe_book packet: {e}",
+                        self.version.name()
+                    );
+                    Ok(None)
+                }
+            };
         }
         // Vanilla 1.21.4's separate add_experience_orb (id 2) became AddEntity plus metadata.
         if self.version.at_most(ServerVersion::V1_21_4) && state == State::Play && id == 2 {
-            return translate::old_experience_orb(self, &payload).map(Some);
+            return match translate::old_experience_orb(self, &payload) {
+                Ok(pkt) => Ok(Some(pkt)),
+                Err(e) => {
+                    log::warn!(
+                        "Horizon: could not translate {} experience_orb packet: {e}",
+                        self.version.name()
+                    );
+                    Ok(None)
+                }
+            };
         }
         let Some(pinned) = self.version.clientbound_id(state, id) else {
             return Ok(None);

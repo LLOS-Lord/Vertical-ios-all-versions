@@ -174,7 +174,16 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("facing", "minecraft:carved_pumpkin"),
     ("facing,lit", "minecraft:furnace"),
     ("lit", "minecraft:redstone_lamp"),
-    ("waterlogged", "minecraft:chain"),
+    ("waterlogged", "minecraft:conduit"),
+    ("axis,waterlogged", "minecraft:iron_chain"),
+    ("hanging,waterlogged", "minecraft:lantern"),
+    ("candles,lit,waterlogged", "minecraft:candle"),
+    ("facing,lit,signal_fire,waterlogged", "minecraft:campfire"),
+    ("facing,waterlogged", "minecraft:ladder"),
+    ("rotation,waterlogged", "minecraft:oak_sign"),
+    ("attachment,facing,powered", "minecraft:bell"),
+    ("layers", "minecraft:snow"),
+    ("bites", "minecraft:cake"),
     ("age", "minecraft:wheat"),
     ("distance,persistent,waterlogged", "minecraft:oak_leaves"),
     ("stage", "minecraft:oak_sapling"),
@@ -1239,6 +1248,13 @@ pub fn carry(
                 if let Ok(v) = serde_json::from_slice(&bytes) {
                     blockstates.insert(b.to_owned(), v);
                 }
+            } else if let Some(item_def) = rel
+                .strip_prefix("items/")
+                .and_then(|m| m.strip_suffix(".json"))
+                .filter(|_| own && name.starts_with("assets/"))
+            {
+                // 1.21.4+ / 26.3 mods declare items directly via `assets/<id>/items/<name>.json`.
+                item_models.insert(item_def.to_owned());
             } else if let Some(m) = rel
                 .strip_prefix("models/item/")
                 .and_then(|m| m.strip_suffix(".json"))

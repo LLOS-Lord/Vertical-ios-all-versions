@@ -220,7 +220,12 @@ impl Game<'_> {
                     if let Some(r) = self.remote.as_mut()
                         && r.session.address != "local"
                     {
-                        r.transfer = Some(format!("{host}:{port}"));
+                        let target = if host.contains(':') && !host.starts_with('[') {
+                            format!("[{host}]:{port}")
+                        } else {
+                            format!("{host}:{port}")
+                        };
+                        r.transfer = Some(target);
                     }
                 }
                 Event::PackPush(p) => self.handle_pack_push(p),

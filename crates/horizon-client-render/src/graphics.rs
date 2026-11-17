@@ -965,17 +965,9 @@ impl Default for Graphics {
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
             gpu_culling: GpuCullingMode::Off,
-            entity_culling: if cfg!(target_os = "ios") {
-                EntityCullingMode::Asynchronous
-            } else {
-                EntityCullingMode::Off
-            },
+            entity_culling: EntityCullingMode::Off,
             entity_culling_precheck: 64,
-            particle_culling: if cfg!(target_os = "ios") {
-                ParticleCullingMode::Asynchronous
-            } else {
-                ParticleCullingMode::Off
-            },
+            particle_culling: ParticleCullingMode::Off,
             leaf_culling: if cfg!(target_os = "ios") {
                 LeafCullingMode::Hidden
             } else {
@@ -1004,16 +996,16 @@ impl Default for Graphics {
             parallel_tick: ParallelTickMode::Off,
             overlay: Overlay::Off,
             // A phone's GPU is fill-bound at its screen's resolution (a Mali-G51 at 2340x1080: 27 fps with
-            // 14 ms of CPU a frame, and an Apple A11 at 2208x1242 @3x Retina); the HUD stays at the
-            // screen's own resolution, while Dynamic Resolution lifts faster iOS GPUs up to 100% at 60 fps.
+            // 14 ms of CPU a frame, and an Apple A11 at 2208x1242 @3x Retina); a steady 75% world scale
+            // keeps the HUD at native Retina while avoiding per-second Metal render-target reallocations.
             resolution_scale: if cfg!(target_os = "android") {
                 50
             } else if cfg!(target_os = "ios") {
-                55
+                75
             } else {
                 100
             },
-            dynamic_resolution: cfg!(target_os = "ios"),
+            dynamic_resolution: false,
             target_fps: 60,
             fxaa: false,
             taa: false,
@@ -1072,6 +1064,35 @@ impl Graphics {
             log::warn!(
                 "the last start ended before HDR output showed a frame; HDR output stays off with that graphics driver until the HDR mode is changed (graphics option hdrFailedStart, in {FILE})"
             );
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let mig = dir.join(".ios-gfx-migrated-v9");
+            if !mig.exists() {
+                let mut changed = false;
+                if dir.join(FILE).is_file() {
+                    if settings.dynamic_resolution && settings.resolution_scale == 55 {
+                        settings.dynamic_resolution = false;
+                        settings.resolution_scale = 75;
+                        changed = true;
+                    }
+                    if settings.entity_culling == EntityCullingMode::Asynchronous {
+                        settings.entity_culling = EntityCullingMode::Off;
+                        changed = true;
+                    }
+                    if settings.particle_culling == ParticleCullingMode::Asynchronous {
+                        settings.particle_culling = ParticleCullingMode::Off;
+                        changed = true;
+                    }
+                    if changed {
+                        settings.save(dir);
+                        log::info!(
+                            "Horizon: migrated iOS graphics settings to steady 75% world scale and zero-thread culling defaults"
+                        );
+                    }
+                }
+                let _ = fs::write(&mig, b"1\n");
+            }
         }
         settings
     }

@@ -1,7 +1,7 @@
 //! Login state: offline/online hello, encryption request, compression,
 //! login plugin queries and the finished game profile.
 use crate::{
-    buf::{Bool, Bytes, Ident, Opt, RestN, Str, StrN, Uuid, VarInt},
+    buf::{Bool, Bytes, Channel, Ident, Opt, RestN, Str, StrN, Uuid, VarInt},
     packet, packet_enum,
     packets::Empty,
 };
@@ -35,7 +35,7 @@ packet!(Compression { threshold: i32 => VarInt });
 pub const MAX_QUERY_PAYLOAD: usize = 1_048_576;
 packet!(CustomQuery {
     transaction: i32 => VarInt,
-    channel: String => Ident,
+    channel: String => Channel,
     data: Vec<u8> => RestN<MAX_QUERY_PAYLOAD>,
 });
 packet!(CookieRequest { key: String => Ident });

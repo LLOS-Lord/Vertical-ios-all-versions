@@ -267,7 +267,46 @@ fn clean_mod_id(raw: &str) -> Option<&str> {
     .then_some(trimmed)
 }
 
-/// Enable or disable an installed mod in `Documents/horizon-mods.txt`.
+/// Enable or disable `"file/<zip_name>"` inside `home/options.txt`'s `resourcePacks:[...]` list.
+fn sync_resource_pack_in_options(home: &Path, zip_name: &str, enabled: bool) {
+    let options_path = home.join("options.txt");
+    let entry = format!("file/{zip_name}");
+    let existing = fs::read_to_string(&options_path).unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    let mut found = false;
+    for line in existing.lines() {
+        if let Some(rest) = line.strip_prefix("resourcePacks:") {
+            found = true;
+            let mut list: Vec<String> = serde_json::from_str(rest.trim()).unwrap_or_default();
+            list.retain(|x| x != &entry);
+            if enabled {
+                if list.is_empty() {
+                    list.push("vanilla".into());
+                }
+                list.push(entry.clone());
+            }
+            if let Ok(serialized) = serde_json::to_string(&list) {
+                lines.push(format!("resourcePacks:{serialized}"));
+            }
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if !found && enabled {
+        let list = vec!["vanilla".to_owned(), entry];
+        if let Ok(serialized) = serde_json::to_string(&list) {
+            lines.push(format!("resourcePacks:{serialized}"));
+        }
+    }
+    if !lines.is_empty() {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        let _ = fs::write(&options_path, out);
+    }
+}
+
+/// Enable or disable an installed mod in `Documents/horizon-mods.txt` (and any companion
+/// `Documents/resourcepacks/mod-<id>.zip` bridged from a visual/audio `.jar`).
 pub fn set_enabled(
     home: &Path,
     mod_id: &str,
@@ -282,11 +321,15 @@ pub fn set_enabled(
         list.enabled.remove(id);
     }
     list.save(home);
+    let companion_zip = format!("mod-{id}.zip");
+    if home.join("resourcepacks").join(&companion_zip).is_file() {
+        sync_resource_pack_in_options(home, &companion_zip, enabled);
+    }
     Ok(list_installed(home))
 }
 
-/// Remove an installed mod (`.hmod` or folder), its `.sources/<id>.json` metadata, and its entry
-/// in `horizon-mods.txt` and `mod-browser.json`.
+/// Remove an installed mod (`.hmod` or folder), its `.sources/<id>.json` metadata, any companion
+/// `resourcepacks/mod-<id>.zip`, and its entry in `horizon-mods.txt` and `mod-browser.json`.
 pub fn delete_mod(home: &Path, mod_id: &str) -> Result<Vec<InstalledModRow>, String> {
     let id = clean_mod_id(mod_id).ok_or("invalid mod id")?;
     let dir = mods_dir(home);
@@ -305,6 +348,12 @@ pub fn delete_mod(home: &Path, mod_id: &str) -> Result<Vec<InstalledModRow>, Str
         return Err(format!("Mod {id} is not installed"));
     }
     let _ = fs::remove_file(dir.join(".sources").join(format!("{id}.json")));
+    let companion_zip = format!("mod-{id}.zip");
+    let companion_path = home.join("resourcepacks").join(&companion_zip);
+    if companion_path.is_file() {
+        let _ = fs::remove_file(&companion_path);
+        sync_resource_pack_in_options(home, &companion_zip, false);
+    }
 
     let mut list = ModList::load(home);
     list.enabled.remove(id);
@@ -325,87 +374,315 @@ pub fn delete_mod(home: &Path, mod_id: &str) -> Result<Vec<InstalledModRow>, Str
     Ok(list_installed(home))
 }
 
-/// Browse content mods from the official signed Horizon Registry.
+/// Browse packages from the official signed Horizon Registry:
+/// - Default (`kind_filter` is `None` or `"installable"`): lists all installable Horizon packages
+///   for this build — `.hmod` content mods, native `.hshader` / `.zip` shader packs, `.zip`
+///   resource packs, and `.hpack` modpack bundles (27 official packages instead of 11).
+/// - `"mod"`, `"shader"`, `"pack"`: filters to that category.
+/// - `"all"`: also shows desktop compile-time `.hnmod` Rust source mixins (`installable: false`)
+///   so users searching for projects like `zoom`, `jade`, or `jei` see the entire 165-project
+///   Horizon ecosystem with clear platform guidance.
 pub fn browse_horizon_registry(home: &Path, query: &str) -> Result<Value, String> {
+    browse_horizon_registry_filtered(home, query, None)
+}
+
+pub fn browse_horizon_registry_filtered(
+    home: &Path,
+    query: &str,
+    kind_filter: Option<&str>,
+) -> Result<Value, String> {
+    use horizon_mods::index::Kind;
     let at = mod_registry::location();
     let index = mod_registry::load_index(home, &at)?;
-    let listings = mod_registry::listings(&index, home);
     let q = query.trim().to_ascii_lowercase();
+    let filter = kind_filter.unwrap_or("installable").trim().to_ascii_lowercase();
 
-    let hits: Vec<Value> = listings
+    let installed_mods: BTreeMap<String, String> = list_installed(home)
         .into_iter()
-        .filter(|item| item.matches(&q))
-        .map(|item| {
-            let update_available = item.has_update();
+        .map(|m| (m.id, m.version))
+        .collect();
+
+    let mut hits: Vec<(u64, String, Value)> = Vec::new();
+    for p in &index.projects {
+        let Some(v) = index.installable(p, mod_registry::GAME, horizon_mods::api_level::LEVEL)
+        else {
+            continue;
+        };
+        let legacy_wasm = v.file.name.ends_with(".hmod")
+            && v.capabilities
+                .iter()
+                .any(|c| *c != horizon_mods::Capability::Registries);
+        if legacy_wasm {
+            continue;
+        }
+        let is_installable = matches!(
+            p.kind,
+            Kind::Mod | Kind::Shader | Kind::ShaderPack | Kind::ResourcePack | Kind::Modpack
+        );
+        let matches_kind = match filter.as_str() {
+            "mod" | "mods" => p.kind == Kind::Mod,
+            "shader" | "shaders" => matches!(p.kind, Kind::Shader | Kind::ShaderPack),
+            "pack" | "packs" => matches!(p.kind, Kind::ResourcePack | Kind::Modpack),
+            "all" => is_installable || p.kind == Kind::NativeMod,
+            _ => is_installable,
+        };
+        if !matches_kind {
+            continue;
+        }
+        if !q.is_empty() {
+            let hay_match = p.id.to_ascii_lowercase().contains(&q)
+                || p.name.to_ascii_lowercase().contains(&q)
+                || p.summary.to_ascii_lowercase().contains(&q)
+                || p.categories
+                    .iter()
+                    .any(|c| c.to_ascii_lowercase().contains(&q))
+                || p.tags.iter().any(|t| t.to_ascii_lowercase().contains(&q));
+            if !hay_match {
+                continue;
+            }
+        }
+
+        let installed_ver: Option<String> = match p.kind {
+            Kind::Mod => installed_mods.get(&p.id).cloned(),
+            Kind::Shader | Kind::ShaderPack => home
+                .join("shaderpacks")
+                .join(&v.file.name)
+                .is_file()
+                .then(|| v.version.clone()),
+            Kind::ResourcePack => home
+                .join("resourcepacks")
+                .join(&v.file.name)
+                .is_file()
+                .then(|| v.version.clone()),
+            Kind::Modpack => {
+                let req_mods: Vec<&str> = v
+                    .requires
+                    .iter()
+                    .filter(|r| {
+                        index
+                            .project(&r.id)
+                            .is_some_and(|rp| rp.kind == Kind::Mod)
+                    })
+                    .map(|r| r.id.as_str())
+                    .collect();
+                (!req_mods.is_empty()
+                    && req_mods.iter().all(|id| installed_mods.contains_key(*id)))
+                .then(|| v.version.clone())
+            }
+            _ => None,
+        };
+        let update_available = installed_ver
+            .as_deref()
+            .is_some_and(|iv| iv != v.version.as_str());
+
+        hits.push((
+            p.downloads,
+            p.name.clone(),
             json!({
-                "id": item.id,
-                "title": item.name,
-                "summary": item.summary,
-                "description": item.description,
-                "authors": item.authors,
-                "license": item.license,
-                "categories": item.categories,
-                "tags": item.tags,
-                "version": item.version,
-                "published": item.published,
-                "downloads": item.downloads,
-                "page": item.page,
-                "installed_version": item.installed,
+                "id": p.id,
+                "kind": p.kind.name(),
+                "installable": is_installable,
+                "title": p.name,
+                "summary": p.summary,
+                "description": p.description,
+                "authors": p.authors,
+                "license": p.license,
+                "categories": p.categories,
+                "tags": p.tags,
+                "version": v.version,
+                "file_name": v.file.name,
+                "published": v.published,
+                "downloads": p.downloads,
+                "page": format!("{}/{}", mod_registry::SITE, p.id),
+                "installed_version": installed_ver,
                 "update_available": update_available,
                 "source": "horizon",
-            })
-        })
-        .collect();
+            }),
+        ));
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let hits_json: Vec<Value> = hits.into_iter().map(|(_, _, v)| v).collect();
 
     Ok(json!({
         "source": "horizon",
-        "total_hits": hits.len(),
-        "hits": hits,
+        "total_hits": hits_json.len(),
+        "hits": hits_json,
     }))
 }
 
-/// Install or update a content mod from the Horizon Registry and enable it in `horizon-mods.txt`.
+fn download_and_verify_registry_asset(
+    index: &horizon_mods::index::Index,
+    home: &Path,
+    p: &horizon_mods::index::Project,
+    v: &horizon_mods::index::Version,
+) -> Result<(PathBuf, bool), String> {
+    let bytes = mod_registry::download(&v.file.url, v.file.size)?;
+    let stage_dir = home.join("mod-browser/downloads");
+    fs::create_dir_all(&stage_dir).map_err(|e| format!("{}: {e}", stage_dir.display()))?;
+    let staged = stage_dir.join(format!(".{}-{}.verify", p.id, std::process::id()));
+    fs::write(&staged, &bytes).map_err(|e| format!("{}: {e}", staged.display()))?;
+    match horizon_mods::index::check_file(index, p, v, &staged) {
+        Ok(trust) => Ok((staged, trust == horizon_mods::index::Trust::Verified)),
+        Err(err) => {
+            let _ = fs::remove_file(&staged);
+            Err(err)
+        }
+    }
+}
+
+/// Install or update a package from the Horizon Registry:
+/// - `Kind::Mod` -> `Documents/horizon-mods/<id>.hmod` + enabled in `horizon-mods.txt`
+/// - `Kind::Shader` / `Kind::ShaderPack` -> `Documents/shaderpacks/<file>` + activated in `horizon-graphics.txt`
+/// - `Kind::ResourcePack` -> `Documents/resourcepacks/<file>` + enabled in `options.txt`
+/// - `Kind::Modpack` -> installs & enables every content `Kind::Mod` bundled in the modpack
 pub fn install_from_horizon_registry(home: &Path, mod_id: &str) -> Result<Value, String> {
+    use horizon_mods::index::Kind;
+    let id = mod_id.trim();
     let at = mod_registry::location();
     let index = mod_registry::load_index(home, &at)?;
-    let done = mod_registry::install(&index, home, mod_id.trim(), &mod_registry::download)?;
-    write_source_meta(
-        home,
-        &StoredSourceMeta {
-            mod_id: done.id.clone(),
-            name: index
-                .project(&done.id)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| done.id.clone()),
-            version: done.version.clone(),
-            loader: "horizon".into(),
-            origin: "horizon".into(),
-            verdict: if done.verified {
-                "verified".into()
-            } else {
-                "works".into()
-            },
-            summary: if done.verified {
-                "Signed Horizon native content package (Ed25519 + SHA-256 verified).".into()
-            } else {
-                "Horizon content package (SHA-256 verified).".into()
-            },
-            ports: Vec::new(),
-            skipped: Vec::new(),
-            namespaces: vec![done.id.clone()],
-            project_id: Some(done.id.clone()),
-            version_id: Some(done.version.clone()),
-            icon_url: None,
-        },
-    );
-    let installed = set_enabled(home, &done.id, true)?;
-    Ok(json!({
-        "ok": true,
-        "mod_id": done.id,
-        "version": done.version,
-        "verified": done.verified,
-        "installed": installed,
-    }))
+    let project = index
+        .project(id)
+        .ok_or_else(|| format!("{id} isn't in Horizon's registry"))?;
+    let ver = index
+        .installable(project, mod_registry::GAME, horizon_mods::api_level::LEVEL)
+        .ok_or_else(|| format!("{} has no compatible {} release", project.name, mod_registry::GAME))?;
+
+    match project.kind {
+        Kind::Mod => {
+            let done = mod_registry::install(&index, home, id, &mod_registry::download)?;
+            write_source_meta(
+                home,
+                &StoredSourceMeta {
+                    mod_id: done.id.clone(),
+                    name: project.name.clone(),
+                    version: done.version.clone(),
+                    loader: "horizon".into(),
+                    origin: "horizon".into(),
+                    verdict: if done.verified {
+                        "verified".into()
+                    } else {
+                        "works".into()
+                    },
+                    summary: if done.verified {
+                        "Signed Horizon native content package (Ed25519 + SHA-256 verified).".into()
+                    } else {
+                        "Horizon content package (SHA-256 verified).".into()
+                    },
+                    ports: Vec::new(),
+                    skipped: Vec::new(),
+                    namespaces: vec![done.id.clone()],
+                    project_id: Some(done.id.clone()),
+                    version_id: Some(done.version.clone()),
+                    icon_url: project.icon.clone(),
+                },
+            );
+            let installed = set_enabled(home, &done.id, true)?;
+            Ok(json!({
+                "ok": true,
+                "kind": "mod",
+                "mod_id": done.id,
+                "version": done.version,
+                "verified": done.verified,
+                "message": format!("{} {} installed & enabled.", project.name, done.version),
+                "installed": installed,
+            }))
+        }
+        Kind::Shader | Kind::ShaderPack => {
+            let (staged, verified) = download_and_verify_registry_asset(&index, home, project, ver)?;
+            let shaders_dir = home.join("shaderpacks");
+            fs::create_dir_all(&shaders_dir)
+                .map_err(|e| format!("{}: {e}", shaders_dir.display()))?;
+            let dest = shaders_dir.join(&ver.file.name);
+            if fs::rename(&staged, &dest).is_err() {
+                fs::copy(&staged, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+                let _ = fs::remove_file(&staged);
+            }
+            let mut gfx = horizon_client_render::graphics::Graphics::load(home);
+            gfx.shader_pack = ver.file.name.clone();
+            gfx.save(home);
+            Ok(json!({
+                "ok": true,
+                "kind": project.kind.name(),
+                "mod_id": project.id,
+                "version": ver.version,
+                "verified": verified,
+                "message": format!("{} {} verified, installed into shaderpacks/, and activated!", project.name, ver.version),
+                "installed": list_installed(home),
+            }))
+        }
+        Kind::ResourcePack => {
+            let (staged, verified) = download_and_verify_registry_asset(&index, home, project, ver)?;
+            let rp_dir = home.join("resourcepacks");
+            fs::create_dir_all(&rp_dir).map_err(|e| format!("{}: {e}", rp_dir.display()))?;
+            let dest = rp_dir.join(&ver.file.name);
+            if fs::rename(&staged, &dest).is_err() {
+                fs::copy(&staged, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+                let _ = fs::remove_file(&staged);
+            }
+            sync_resource_pack_in_options(home, &ver.file.name, true);
+            Ok(json!({
+                "ok": true,
+                "kind": "resourcepack",
+                "mod_id": project.id,
+                "version": ver.version,
+                "verified": verified,
+                "message": format!("{} {} verified, installed into resourcepacks/, and enabled!", project.name, ver.version),
+                "installed": list_installed(home),
+            }))
+        }
+        Kind::Modpack => {
+            let (staged, verified) = download_and_verify_registry_asset(&index, home, project, ver)?;
+            let _ = fs::remove_file(&staged);
+            let mut bundled_installed = 0usize;
+            for req in &ver.requires {
+                if let Some(rp) = index.project(&req.id)
+                    && rp.kind == Kind::Mod
+                    && mod_registry::installable(&index, rp).is_some()
+                    && let Ok(done) =
+                        mod_registry::install(&index, home, &rp.id, &mod_registry::download)
+                {
+                    write_source_meta(
+                        home,
+                        &StoredSourceMeta {
+                            mod_id: done.id.clone(),
+                            name: rp.name.clone(),
+                            version: done.version.clone(),
+                            loader: "horizon".into(),
+                            origin: "horizon".into(),
+                            verdict: if done.verified {
+                                "verified".into()
+                            } else {
+                                "works".into()
+                            },
+                            summary: format!("Bundled with Horizon modpack {}.", project.name),
+                            ports: Vec::new(),
+                            skipped: Vec::new(),
+                            namespaces: vec![done.id.clone()],
+                            project_id: Some(done.id.clone()),
+                            version_id: Some(done.version.clone()),
+                            icon_url: rp.icon.clone(),
+                        },
+                    );
+                    let _ = set_enabled(home, &done.id, true);
+                    bundled_installed += 1;
+                }
+            }
+            Ok(json!({
+                "ok": true,
+                "kind": "modpack",
+                "mod_id": project.id,
+                "version": ver.version,
+                "verified": verified,
+                "message": format!("{} {}: installed & enabled {} bundled Horizon content mods!", project.name, ver.version, bundled_installed),
+                "installed": list_installed(home),
+            }))
+        }
+        Kind::NativeMod => Err(format!(
+            "{} is a compile-time Rust source mixin (.hnmod) built into custom desktop executables; on iOS, install Horizon .hmod content mods, .hshader shaders, resource packs, or Modrinth mods.",
+            project.name
+        )),
+        _ => Err(format!("{} cannot be installed on this device.", project.name)),
+    }
 }
 
 /// Search Modrinth via the registered `horizon-official` pure-Rust porter.
@@ -555,7 +832,31 @@ pub fn import_local_mod_file(home: &Path, source_path: &Path) -> Result<Value, S
                 "installed": installed,
             }))
         }
-        _ => Err("Unsupported mod file extension: select a .hmod or .jar file.".into()),
+        "hshader" => {
+            let file_name = source_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("invalid .hshader file name")?
+                .to_owned();
+            let shaders_dir = home.join("shaderpacks");
+            fs::create_dir_all(&shaders_dir)
+                .map_err(|e| format!("{}: {e}", shaders_dir.display()))?;
+            let dest = shaders_dir.join(&file_name);
+            fs::copy(source_path, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+            let mut gfx = horizon_client_render::graphics::Graphics::load(home);
+            gfx.shader_pack = file_name.clone();
+            gfx.save(home);
+            Ok(json!({
+                "ok": true,
+                "mod_id": file_name,
+                "name": file_name,
+                "version": "",
+                "verdict": "works",
+                "summary": "Installed .hshader into shaderpacks/ and activated it.",
+                "installed": list_installed(home),
+            }))
+        }
+        _ => Err("Unsupported file extension: select a .hmod, .jar, or .hshader file.".into()),
     }
 }
 
@@ -631,6 +932,38 @@ mod tests {
         let after_del = delete_mod(&home, "amber_extra").unwrap();
         assert_eq!(after_del.len(), 1);
         assert_eq!(after_del[0].id, "amber_lamps");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn companion_resourcepack_and_local_hshader_sync_cleanly() {
+        let home = temp_home("companion-and-shader");
+        let hmod_a = home.join("fresh_pack.hmod");
+        write_hmod(&hmod_a, "fresh_pack", "Fresh Pack", &[]);
+        fs::create_dir_all(home.join("resourcepacks")).unwrap();
+        let companion = home.join("resourcepacks/mod-fresh_pack.zip");
+        fs::write(&companion, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+
+        import_local_mod_file(&home, &hmod_a).expect("import fresh_pack");
+        let opts_on = fs::read_to_string(home.join("options.txt")).unwrap();
+        assert!(opts_on.contains("mod-fresh_pack.zip"), "{opts_on}");
+
+        set_enabled(&home, "fresh_pack", false).unwrap();
+        let opts_off = fs::read_to_string(home.join("options.txt")).unwrap();
+        assert!(!opts_off.contains("mod-fresh_pack.zip"), "{opts_off}");
+
+        delete_mod(&home, "fresh_pack").unwrap();
+        assert!(!companion.exists(), "delete_mod removes companion mod-<id>.zip");
+
+        let shader = home.join("horizon_bloom.hshader");
+        fs::write(&shader, b"HSHADER").unwrap();
+        let sh_res = import_local_mod_file(&home, &shader).expect("import .hshader");
+        assert_eq!(sh_res["ok"], true);
+        assert!(home.join("shaderpacks/horizon_bloom.hshader").is_file());
+        assert_eq!(
+            horizon_client_render::graphics::Graphics::load(&home).shader_pack,
+            "horizon_bloom.hshader"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 }

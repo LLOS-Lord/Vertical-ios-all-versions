@@ -216,4 +216,76 @@ final class VersionsAndModsTests: XCTestCase {
         XCTAssertNil(toggleErr)
         XCTAssertEqual(store.installed.first?.enabled, false)
     }
+
+    @MainActor
+    func testHorizonRegistryCategoryFilterAndMultiKindMetadata() async {
+        var seenKinds: [String] = []
+        let store = ModStore { line in
+            let raw = String(line.dropFirst("launcher-mods ".count))
+            let json = (try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any]) ?? [:]
+            switch json["action"] as? String {
+            case "horizon-browse":
+                seenKinds.append(json["kind"] as? String ?? "")
+                return [
+                    "hits": [
+                        [
+                            "id": "sky_lanterns",
+                            "title": "Sky Lanterns",
+                            "version": "0.1.0",
+                            "summary": "Warm paper lanterns",
+                            "authors": ["Horizon"],
+                            "kind": "mod",
+                            "installable": true,
+                        ],
+                        [
+                            "id": "warm_evening",
+                            "title": "Warm Evening",
+                            "version": "0.1.0",
+                            "summary": "Golden hour sky shader",
+                            "authors": ["Horizon"],
+                            "kind": "shader",
+                            "installable": true,
+                        ],
+                        [
+                            "id": "ferrite_core_hz",
+                            "title": "FerriteCore",
+                            "version": "0.1.0",
+                            "summary": "Desktop mixin",
+                            "authors": ["Horizon"],
+                            "kind": "native-mod",
+                            "installable": false,
+                        ],
+                    ],
+                ]
+            case "horizon-install":
+                return [
+                    "ok": true,
+                    "kind": "shader",
+                    "mod_id": "warm_evening",
+                    "version": "0.1.0",
+                    "verified": true,
+                    "message": "Warm Evening 0.1.0 verified, installed into shaderpacks/, and activated!",
+                    "installed": [],
+                ]
+            default:
+                return ["mods": []]
+            }
+        }
+
+        await store.search(source: .horizon, query: "", horizonKind: "all")
+        XCTAssertEqual(seenKinds, ["all"])
+        XCTAssertEqual(store.horizonResults.count, 3)
+        XCTAssertEqual(store.horizonResults[0].title, "Sky Lanterns")
+        XCTAssertEqual(store.horizonResults[0].kindLabel, "Content Mod")
+        XCTAssertEqual(store.horizonResults[1].kindLabel, "Shader")
+        XCTAssertEqual(store.horizonResults[2].kindLabel, "Desktop Mixin")
+        XCTAssertFalse(store.horizonResults[2].installable)
+
+        let res = await store.installHorizon(store.horizonResults[1])
+        if case let .success(msg) = res {
+            XCTAssertTrue(msg.contains("shaderpacks/"))
+        } else {
+            XCTFail("Expected shader install success")
+        }
+    }
 }
