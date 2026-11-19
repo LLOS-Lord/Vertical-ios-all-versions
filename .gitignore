@@ -1,5 +1,7 @@
 /.local/
 /target/
+# The standalone iOS-runtime crate has its own workspace and build output.
+/crates/horizon-ios-runtime/target/
 **/__pycache__/
 *.py[cod]
 /.venv/

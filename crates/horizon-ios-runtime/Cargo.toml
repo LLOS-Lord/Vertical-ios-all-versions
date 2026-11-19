@@ -1,0 +1,18 @@
+[package]
+name = "horizon-ios-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Fail-closed version bindings, mod activation, frame-generation governor, jetsam-aware memory manager, priority scheduler, visibility/GPU budget and touch resampling for Horizon on iOS/iPadOS"
+
+# Standalone workspace: this crate must be buildable and testable on Linux CI without
+# pulling in the 60-crate engine (wgpu/naga/winit/Metal). The parent workspace lists
+# `crates/horizon-ios-runtime` in `exclude` accordingly.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

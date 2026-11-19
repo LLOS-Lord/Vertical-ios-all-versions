@@ -20,7 +20,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -40,6 +40,9 @@ const PROFILE_FILE: &str = "version-profile.json";
 const MANIFEST_CACHE_FILE: &str = "versions/mojang-manifest-cache.json";
 const SIM_BASE_DIR_NAME: &str = ".sim-base-26.3";
 const SCHEMA_VERSION: u32 = 7;
+const VERSION_PACK_FILE: &str = "version-pack.json";
+const VERSION_PACK_SCHEMA: u64 = 1;
+const VERSION_PACK_PRODUCER: &str = "tools/prepare_version_pack.py";
 
 /// Complete list of required top-level simulation/datagen files produced by `horizon-prepare`
 /// (`SCHEMA = 7`, `OUTPUT_VERSION = 4`) and read by `load_resources_with_access`, `Assets::load`,
@@ -85,6 +88,11 @@ const REQUIRED_NESTED_FILES: &[&str] = &[
 
 /// Top-level simulation folders linked from the prepared Horizon base.
 const BASE_SIMULATION_DIRS: &[&str] = &["worldgen", "biome-parameters", "packs"];
+
+/// Cosmetic-only asset subtrees that may fill missing files in a foreign version. Schema-bound
+/// `items/`, `models/`, `blockstates/`, `font/`, `shaders/`, `data/` and simulation tables are
+/// deliberately absent: a 26.3 file in one of those paths is not a foreign-version registry.
+const COSMETIC_ASSET_DIRS: &[&str] = &["assets/minecraft/textures", "assets/minecraft/sounds"];
 
 /// Active version & cross-version protocol preference stored in `Documents/versions/active.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -283,11 +291,12 @@ pub fn save_selection(home: &Path, selection: &ActiveSelection) -> Result<(), St
     fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Validate that `resources_dir` contains a complete, engine-loadable Horizon prepared tree:
-/// - `horizon-resources.json` exists, parses as JSON, is not marked `full_simulation: false`,
-///   and matches `horizon_world::DATA_VERSION`.
-/// - Every required `horizon-prepare` simulation table (`REQUIRED_SIMULATION_FILES`) and nested
-///   worldgen/font file (`REQUIRED_NESTED_FILES`) exists on disk.
+/// Validate that `resources_dir` contains a complete, engine-loadable prepared tree.
+///
+/// For the pinned 26.3 engine this means the 26.3 data version and all required tables. For any
+/// other selected version it means a *real*, parity-verified per-version Rust pack: a 26.3
+/// `data_version`, registry or hard-linked table under a foreign label is refused instead of
+/// being shown as playable.
 pub fn validate_playable_root(resources_dir: &Path) -> Result<(), String> {
     let manifest_path = resources_dir.join("horizon-resources.json");
     if !manifest_path.is_file() {
@@ -304,16 +313,42 @@ pub fn validate_playable_root(resources_dir: &Path) -> Result<(), String> {
             .and_then(Value::as_str)
             .unwrap_or("selected version");
         return Err(format!(
-            "Minecraft {ver} was downloaded without Horizon's simulation runtime tables. Tap Complete Setup in Game Versions to finish installing (~45 MB)."
+            "Minecraft {ver} is not fully prepared. A real per-version Rust version pack is required; 26.3 tables are not a substitute."
         ));
     }
-    let expected_dv = i64::from(horizon_world::DATA_VERSION);
+    let pinned = horizon_core::VANILLA_VERSION;
+    let selected = version_id_for_root(resources_dir);
+    let manifest_mc = manifest
+        .get("minecraft")
+        .and_then(Value::as_str)
+        .unwrap_or(pinned);
+    if let Some(src) = manifest.get("source_minecraft").and_then(Value::as_str)
+        && src != manifest_mc
+    {
+        return Err(format!(
+            "fake version display: source_minecraft={src}, but minecraft={manifest_mc}; refusing to run 26.3 tables under a foreign label"
+        ));
+    }
+    let expected_dv = if selected == pinned {
+        if manifest_mc != pinned {
+            return Err(format!(
+                "fake version display: selected Minecraft {selected} does not match manifest {manifest_mc}"
+            ));
+        }
+        i64::from(horizon_world::DATA_VERSION)
+    } else {
+        if manifest_mc != selected {
+            return Err(format!(
+                "fake version display: selected Minecraft {selected} does not match manifest {manifest_mc}; a real version pack is required"
+            ));
+        }
+        verify_real_version_pack(resources_dir, &selected, &manifest)?
+    };
     match manifest.get("data_version").and_then(Value::as_i64) {
         Some(dv) if dv == expected_dv => {}
         Some(other) => {
             return Err(format!(
-                "Game files data_version ({other}) does not match Horizon {} ({expected_dv}).",
-                horizon_core::VANILLA_VERSION
+                "Game files data_version ({other}) does not match the verified version data_version ({expected_dv})."
             ));
         }
         None => {
@@ -464,7 +499,11 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
             map.insert(
                 id.clone(),
                 InstalledVersion {
-                    support_tier: support_tier_for_version(&id).into(),
+                    support_tier: if !ready && id != horizon_core::VANILLA_VERSION {
+                        "needs-real-rust-pack".into()
+                    } else {
+                        support_tier_for_version(&id).into()
+                    },
                     protocol: prof
                         .protocol
                         .or_else(|| ServerVersion::protocol_for_version_id(&id)),
@@ -506,7 +545,11 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
             map.insert(
                 inferred_id.clone(),
                 InstalledVersion {
-                    support_tier: support_tier_for_version(&inferred_id).into(),
+                    support_tier: if !ready && inferred_id != horizon_core::VANILLA_VERSION {
+                        "needs-real-rust-pack".into()
+                    } else {
+                        support_tier_for_version(&inferred_id).into()
+                    },
                     protocol: prof
                         .protocol
                         .or_else(|| ServerVersion::protocol_for_version_id(&inferred_id)),
@@ -559,13 +602,15 @@ pub fn active_ready_root(home: &Path) -> Option<PathBuf> {
         .map(|v| PathBuf::from(v.path))
 }
 
-/// Return the active version ID (falling back to `26.3` before any files are installed).
+/// Return the ID of a genuinely playable active root, not merely a label from `active.json`.
+/// A stale or manually edited selection that names a foreign version without a verified
+/// per-version Rust pack must not be reported as the engine's active simulation.
 pub fn active_version_id(home: &Path) -> String {
     list_installed(home)
         .into_iter()
-        .find(|v| v.active)
+        .find(|v| v.active && v.ready)
         .map(|v| v.id)
-        .unwrap_or_else(|| load_selection(home).active)
+        .unwrap_or_else(|| horizon_core::VANILLA_VERSION.to_owned())
 }
 
 /// Synchronize `horizon_protocol::adapter`'s preferred protocol and `datafix` resources root with
@@ -589,10 +634,9 @@ pub fn apply_active_protocol_preference(home: &Path) {
 pub fn select_version(home: &Path, version_id: &str) -> Result<InstalledVersion, String> {
     let clean = sanitize_version_id(version_id).ok_or("invalid version id")?;
     let installed = list_installed(home);
-    if let Some(partial) = installed.iter().find(|v| v.id == clean && !v.ready) {
-        let _ = partial;
+    if installed.iter().any(|v| v.id == clean && !v.ready) {
         return Err(format!(
-            "Minecraft {clean} needs Horizon's simulation runtime (~45 MB). Tap Complete Setup first."
+            "Minecraft {clean} is installed but has no verified per-version Rust version pack. A 26.3 simulation base cannot run it; install or build a real version pack first."
         ));
     }
     let found = installed
@@ -730,9 +774,21 @@ fn link_missing_tree(src_dir: &Path, dst_dir: &Path) -> std::io::Result<usize> {
     Ok(count)
 }
 
-/// Build a schema-valid `horizon-resources.json` derived from `base`'s manifest, preserving
-/// `data_version`, `schema`, and hashes while recording `source_minecraft`.
+/// Build an honest `horizon-resources.json`. The pinned 26.3 base keeps its real engine facts;
+/// another version is explicitly partial until a real per-version Rust pack is installed.
 fn build_manifest_from_base(base: &Path, version_id: &str) -> Value {
+    let pinned = horizon_core::VANILLA_VERSION;
+    if version_id != pinned {
+        return json!({
+            "schema": SCHEMA_VERSION,
+            "minecraft": version_id,
+            "simulation_version": version_id,
+            "source_minecraft": version_id,
+            "prepared_by": "horizon-on-device",
+            "full_simulation": false,
+            "simulation_status": "awaiting-real-version-pack",
+        });
+    }
     let mut obj = fs::read_to_string(base.join("horizon-resources.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -744,87 +800,76 @@ fn build_manifest_from_base(base: &Path, version_id: &str) -> Value {
         "data_version".to_owned(),
         json!(i64::from(horizon_world::DATA_VERSION)),
     );
-    obj.insert("minecraft".to_owned(), json!(horizon_core::VANILLA_VERSION));
-    obj.insert("source_minecraft".to_owned(), json!(version_id));
+    obj.insert("minecraft".to_owned(), json!(pinned));
+    obj.insert("simulation_version".to_owned(), json!(pinned));
     obj.insert("full_simulation".to_owned(), json!(true));
+    obj.remove("source_minecraft");
     Value::Object(obj)
 }
 
+/// Layer a pinned 26.3 simulation base into a pinned 26.3 root. For any other version, only
+/// missing cosmetic asset fallbacks are linked: registries, data schemas, worldgen and simulation
+/// tables are *not* 26.3 tables wearing a foreign label.
 fn populate_from_simulation_base(base: &Path, target_resources: &Path, version_id: &str) -> usize {
+    let pinned = version_id == horizon_core::VANILLA_VERSION;
     let mut linked = 0usize;
-    for file_name in REQUIRED_SIMULATION_FILES
-        .iter()
-        .chain(OPTIONAL_SIMULATION_FILES.iter())
-    {
-        let src = base.join(file_name);
-        let dst = target_resources.join(file_name);
-        if src.is_file() && !dst.exists() && link_or_copy_file(&src, &dst).is_ok() {
-            linked += 1;
-        }
-    }
-    for dir_name in BASE_SIMULATION_DIRS {
-        let src = base.join(dir_name);
-        let dst = target_resources.join(dir_name);
-        if let Ok(n) = link_missing_tree(&src, &dst) {
-            linked += n;
-        }
-    }
-    if version_id != horizon_core::VANILLA_VERSION {
-        // Older Mojang versions (< 26.3) carry older JSON schemas in `data/minecraft/*`,
-        // `assets/minecraft/models/*`, `assets/minecraft/blockstates/*`, `assets/minecraft/items/*`,
-        // `assets/minecraft/textures/gui/sprites/*`, and `assets/minecraft/lang/*.lang`.
-        // Replace schema-bound directories with the 26.3 simulation base while preserving all
-        // authentic version textures & sounds already unpacked in `target_resources`!
-        for schema_bound in [
-            "data",
-            "assets/minecraft/models",
-            "assets/minecraft/blockstates",
-            "assets/minecraft/items",
-            "assets/minecraft/atlases",
-            "assets/minecraft/equipment",
-            "assets/minecraft/shaders",
-            "assets/minecraft/font",
-            "assets/minecraft/textures/gui/sprites",
-        ] {
-            let src = base.join(schema_bound);
-            let dst = target_resources.join(schema_bound);
-            if src.is_dir() {
-                let _ = fs::remove_dir_all(&dst);
-                if let Ok(n) = link_missing_tree(&src, &dst) {
-                    linked += n;
-                }
-            }
-        }
-        for schema_file in [
-            "assets/pack.mcmeta",
-            "assets/minecraft/sounds.json",
-            "assets/minecraft/lang/en_us.json",
-        ] {
-            let src = base.join(schema_file);
-            let dst = target_resources.join(schema_file);
-            if src.is_file() && replace_link_or_copy_file(&src, &dst).is_ok() {
+    if pinned {
+        for file_name in REQUIRED_SIMULATION_FILES
+            .iter()
+            .chain(OPTIONAL_SIMULATION_FILES.iter())
+        {
+            let src = base.join(file_name);
+            let dst = target_resources.join(file_name);
+            if src.is_file() && !dst.exists() && link_or_copy_file(&src, &dst).is_ok() {
                 linked += 1;
             }
         }
-    }
-    // Fill any remaining missing assets/data files (e.g. blocks/items added after `version_id`,
-    // panorama fallback, Unifont) from the 26.3 base without overwriting `version_id`'s textures/sounds.
-    for sub in ["assets", "data"] {
-        if let Ok(n) = link_missing_tree(&base.join(sub), &target_resources.join(sub)) {
-            linked += n;
+        for dir_name in BASE_SIMULATION_DIRS {
+            let src = base.join(dir_name);
+            let dst = target_resources.join(dir_name);
+            if let Ok(n) = link_missing_tree(&src, &dst) {
+                linked += n;
+            }
+        }
+        for sub in ["assets", "data"] {
+            if let Ok(n) = link_missing_tree(&base.join(sub), &target_resources.join(sub)) {
+                linked += n;
+            }
+        }
+    } else {
+        // Authentic version assets stay untouched; only missing cosmetic textures/audio may be
+        // borrowed from 26.3. Never link 26.3 item definitions, models, blockstates, fonts,
+        // shaders, data schemas or simulation tables into a foreign root.
+        for rel in COSMETIC_ASSET_DIRS {
+            let src = base.join(rel);
+            let dst = target_resources.join(rel);
+            if let Ok(n) = link_missing_tree(&src, &dst) {
+                linked += n;
+            }
+        }
+        let sound_meta_src = base.join("assets/minecraft/sounds.json");
+        let sound_meta_dst = target_resources.join("assets/minecraft/sounds.json");
+        if sound_meta_src.is_file()
+            && !sound_meta_dst.exists()
+            && link_or_copy_file(&sound_meta_src, &sound_meta_dst).is_ok()
+        {
+            linked += 1;
         }
     }
     let manifest = build_manifest_from_base(base, version_id);
     if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
         let _ = write_unlinked(&target_resources.join("horizon-resources.json"), &bytes);
     }
-    build_prepared_data_cache(target_resources);
+    if pinned {
+        build_prepared_data_cache(target_resources);
+    }
     linked
 }
 
 /// Resolve the effective Minecraft version label for a prepared `resources` directory.
-/// Multi-version installs keep `"minecraft": "26.3"` for engine schema checks and store the
-/// user-selected version in `"source_minecraft"` (as well as `version-profile.json`).
+/// A real foreign version names itself consistently in `minecraft`, `simulation_version`,
+/// `source_minecraft` and `version-profile.json`; a 26.3 manifest under a foreign profile is
+/// treated as a fake display and refused by [`validate_playable_root`].
 pub fn version_id_for_root(root: &Path) -> String {
     let profile_id = || {
         let mut candidates = vec![root.join("version-profile.json")];
@@ -945,7 +990,7 @@ pub fn heal_placeholder_assets(home: &Path, root: &Path) -> usize {
                     }
                 }
                 let src = objects_dir
-                    .join(&hash[..2].to_ascii_lowercase())
+                    .join(hash[..2].to_ascii_lowercase())
                     .join(hash.to_ascii_lowercase());
                 if !src.is_file() {
                     continue;
@@ -1114,6 +1159,241 @@ fn hex_lower(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv_update(h: &mut u64, bytes: &[u8]) {
+    for b in bytes {
+        *h ^= u64::from(*b);
+        *h = h.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    fnv_update(&mut h, bytes);
+    h
+}
+
+fn fnv1a64_files(root: &Path, names: &[&str]) -> Result<u64, String> {
+    let mut h = FNV_OFFSET;
+    for name in names {
+        let path = root.join(name);
+        if !path.is_file() {
+            return Err(format!("missing version table '{name}'"));
+        }
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        fnv_update(&mut h, &bytes);
+    }
+    Ok(h)
+}
+
+fn collect_version_pack_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if ty.is_file() {
+            out.push(path);
+        } else if ty.is_dir() {
+            collect_version_pack_files(&path, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn fnv1a64_worldgen(root: &Path) -> Result<u64, String> {
+    let folder = root.join("worldgen");
+    if !folder.is_dir() {
+        return Err("missing worldgen/ folder".into());
+    }
+    let mut files = Vec::new();
+    collect_version_pack_files(&folder, &mut files)?;
+    files.sort_by_key(|p| {
+        p.strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    });
+    let mut h = FNV_OFFSET;
+    for path in files {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        fnv_update(&mut h, rel.as_bytes());
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        fnv_update(&mut h, &bytes);
+    }
+    Ok(h)
+}
+
+fn is_real_sha256(value: Option<&str>) -> bool {
+    value.is_some_and(|h| {
+        h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) && h.bytes().any(|b| b != b'0')
+    })
+}
+
+fn version_pack_str<'a>(pack: &'a Value, key: &str) -> Result<&'a str, String> {
+    pack.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("version-pack.json: missing string '{key}'"))
+}
+
+fn version_pack_u64(pack: &Value, key: &str) -> Result<u64, String> {
+    pack.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("version-pack.json: missing unsigned integer '{key}'"))
+}
+
+fn version_pack_i64(pack: &Value, key: &str) -> Result<i64, String> {
+    pack.get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("version-pack.json: missing integer '{key}'"))
+}
+
+/// Verify a *real* translated version. The 26.3 engine cannot run another version by changing
+/// a label: this binds a prepared root to its own data version, protocol, Rust build, parity
+/// harness, registries/items/worldgen digests and the exact prepared artifact bytes.
+fn verify_real_version_pack(
+    resources_dir: &Path,
+    version_id: &str,
+    manifest: &Value,
+) -> Result<i64, String> {
+    let pack_path = resources_dir.join(VERSION_PACK_FILE);
+    let text = fs::read_to_string(&pack_path).map_err(|e| {
+        format!(
+            "Minecraft {version_id} needs a real per-version Rust version pack ({VERSION_PACK_FILE}): {e}"
+        )
+    })?;
+    let pack: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("version-pack.json for {version_id} is invalid JSON: {e}"))?;
+    if pack.get("schema").and_then(Value::as_u64) != Some(VERSION_PACK_SCHEMA) {
+        return Err(format!(
+            "version-pack.json for {version_id} has an unknown or missing schema"
+        ));
+    }
+    for key in ["id", "simulation_version", "minecraft"] {
+        if version_pack_str(&pack, key)? != version_id {
+            return Err(format!(
+                "version-pack.json field '{key}' does not name Minecraft {version_id}"
+            ));
+        }
+    }
+    if version_pack_str(&pack, "engine_pin")? != horizon_core::VANILLA_VERSION {
+        return Err("version-pack.json was built against another engine pin".into());
+    }
+    let data_version = version_pack_i64(&pack, "data_version")?;
+    if data_version <= 0 || data_version == i64::from(horizon_world::DATA_VERSION) {
+        return Err(format!(
+            "version-pack.json for {version_id} must name its own data_version, not 26.3's {}",
+            horizon_world::DATA_VERSION
+        ));
+    }
+    let protocol = version_pack_i64(&pack, "protocol")?;
+    if protocol <= 0 {
+        return Err("version-pack.json has no real protocol version".into());
+    }
+    if pack.get("parity_harness_passed").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "Minecraft {version_id} has no passed per-version Rust parity harness"
+        ));
+    }
+    for key in [
+        "engine_build_sha256",
+        "rust_sources_sha256",
+        "artifact_sha256",
+    ] {
+        if !is_real_sha256(pack.get(key).and_then(Value::as_str)) {
+            return Err(format!("version-pack.json '{key}' is not a real SHA-256"));
+        }
+    }
+    let built_by = version_pack_str(&pack, "built_by")?;
+    if !built_by.contains(VERSION_PACK_PRODUCER) {
+        return Err(format!(
+            "version-pack.json for {version_id} has no verified version-pack producer provenance"
+        ));
+    }
+    let manifest_mc = manifest
+        .get("minecraft")
+        .and_then(Value::as_str)
+        .unwrap_or(horizon_core::VANILLA_VERSION);
+    if manifest_mc != version_id {
+        return Err(format!(
+            "fake version display: manifest says Minecraft {manifest_mc}, selection says {version_id}"
+        ));
+    }
+    if let Some(sim) = manifest.get("simulation_version").and_then(Value::as_str)
+        && sim != version_id
+    {
+        return Err("prepared root simulation_version disagrees with the selected version".into());
+    }
+    if let Some(src) = manifest.get("source_minecraft").and_then(Value::as_str)
+        && src != version_id
+    {
+        return Err("prepared root source_minecraft disagrees with the selected version".into());
+    }
+    if manifest.get("full_simulation").and_then(Value::as_bool) != Some(true) {
+        return Err("prepared root is not marked as a complete version simulation".into());
+    }
+    if manifest.get("data_version").and_then(Value::as_i64) != Some(data_version) {
+        return Err("version-pack.json data_version disagrees with horizon-resources.json".into());
+    }
+    if manifest.get("protocol").and_then(Value::as_i64) != Some(protocol) {
+        return Err("version-pack.json protocol disagrees with horizon-resources.json".into());
+    }
+
+    let artifact_rel = version_pack_str(&pack, "artifact_path")?;
+    let artifact_path = Path::new(artifact_rel);
+    if artifact_rel.is_empty()
+        || artifact_path.is_absolute()
+        || artifact_path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err("version-pack.json artifact_path must stay inside the prepared root".into());
+    }
+    let artifact = fs::read(resources_dir.join(artifact_path))
+        .map_err(|e| format!("could not read version artifact {artifact_rel}: {e}"))?;
+    let actual_sha = hex_lower(&Sha256::digest(&artifact));
+    let expected_sha = version_pack_str(&pack, "artifact_sha256")?.to_ascii_lowercase();
+    if actual_sha != expected_sha {
+        return Err(format!(
+            "version artifact SHA-256 mismatch (expected {expected_sha}, got {actual_sha})"
+        ));
+    }
+    if fnv1a64(&artifact) != version_pack_u64(&pack, "artifact_digest")? {
+        return Err("version artifact FNV digest mismatch".into());
+    }
+    let registries = fnv1a64_files(
+        resources_dir,
+        &[
+            "registries.json",
+            "entity-types.json",
+            "command-registries.json",
+        ],
+    )?;
+    if registries != version_pack_u64(&pack, "registries_digest")? {
+        return Err("version registries digest mismatch".into());
+    }
+    let items = fnv1a64_files(
+        resources_dir,
+        &["items.json", "creative-inventory.json", "model-states.json"],
+    )?;
+    if items != version_pack_u64(&pack, "items_digest")? {
+        return Err("version item registry digest mismatch".into());
+    }
+    if fnv1a64_worldgen(resources_dir)? != version_pack_u64(&pack, "worldgen_digest")? {
+        return Err("version worldgen digest mismatch".into());
+    }
+    Ok(data_version)
 }
 
 /// Fetch built-in and remote prepared Horizon mirrors (`versions-catalog.json`).
@@ -1557,6 +1837,12 @@ fn run_prepared_download(
         notes: "Prepared Horizon runtime & assets.".into(),
     };
     write_profile(&installed.path, &profile)?;
+    if let Err(e) = validate_playable_root(&installed.path) {
+        let _ = fs::remove_dir_all(&version_home);
+        return Err(format!(
+            "Prepared bundle cannot be installed as Minecraft {version_id}: {e}"
+        ));
+    }
     build_prepared_data_cache(&installed.path);
     let _ = upgrade_partial_mojang_versions(home, &installed.path);
 
@@ -1657,9 +1943,8 @@ pub fn ensure_simulation_base_with_job(
     Ok(installed.path)
 }
 
-/// Repair / complete any partial Mojang install(s) on the device by fetching the compact
-/// `sim-base-26.3.zip` runtime (if missing) and rebuilding/linking simulation tables without
-/// re-downloading Mojang's `client.jar` or `assets/objects`.
+/// Install/repair the pinned 26.3 base when possible. Foreign versions remain partial until a
+/// real per-version Rust pack is present: 26.3 tables are never promoted to a foreign version.
 pub fn start_repair_versions(
     home: PathBuf,
     target_id: Option<String>,
@@ -1672,7 +1957,7 @@ pub fn start_repair_versions(
     let job = begin_job(
         &label,
         "horizon-repair",
-        "Checking Horizon simulation runtime…",
+        "Checking verified per-version runtime…",
     )?;
     let initial = job_status();
 
@@ -1752,7 +2037,9 @@ fn run_repair_versions(
 
     let chosen = if let Some(tid) = target_id {
         let res = home.join("versions").join(tid).join("resources");
-        validate_playable_root(&res)?;
+        validate_playable_root(&res).map_err(|e| {
+            format!("Minecraft {tid} is not playable: {e}. A real per-version Rust version pack is required.")
+        })?;
         let mut sel = load_selection(home);
         sel.active = tid.to_owned();
         save_selection(home, &sel)?;
@@ -2001,7 +2288,7 @@ fn run_mojang_download(job: &Arc<JobState>, home: &Path, version_id: &str) -> Re
                     }
                     let done_now = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let bytes_now = downloaded_bytes.fetch_add(size, Ordering::Relaxed) + size;
-                    if done_now % 8 == 0 || done_now == total_files {
+                    if done_now.is_multiple_of(8) || done_now == total_files {
                         update_job(job, |st| {
                             st.completed_files = done_now;
                             st.received_bytes = bytes_now;
@@ -2222,10 +2509,11 @@ fn apply_classic_texture_aliases(staging: &Path) -> usize {
 /// Pure-Rust on-device resource builder for any Mojang `client.jar` + verified `assetIndex`:
 /// - For `26.3`: unpacks complete `26.3` `assets/` & `data/`, materializes `assetIndex` objects,
 ///   and links all `horizon-prepare` simulation tables from `find_simulation_base`.
-/// - For older/snapshot versions (`!= 26.3`): performs Schema-Safe Multi-Version Layering — keeping
-///   26.3's schema-bound `data/`, `models/`, `blockstates/`, `items/`, `shaders/`, `font/`, and GUI
-///   sprites intact while overlaying the downloaded version's authentic block/item/entity/environment
-///   textures (with pre-1.13 flattening renames) and `.ogg` sounds/music!
+/// - For older/snapshot versions (`!= 26.3`): keeps authentic non-GUI textures, title panorama
+///   faces and `.ogg` audio from that version, with pre-1.13 texture flattening renames. Missing
+///   cosmetic texture/sound files may be borrowed from the 26.3 base, but 26.3 schema-bound tables,
+///   registries, `data/`, `models/`, `blockstates/`, `items/`, `shaders/` and `font/` files are
+///   never linked. The install stays partial until a real per-version Rust pack is verified.
 pub fn prepare_mojang_on_device(
     home: &Path,
     version_id: &str,
@@ -2268,7 +2556,8 @@ pub fn prepare_mojang_on_device(
                 || name.starts_with("data/")
         } else {
             // For non-26.3 versions, keep authentic non-GUI textures (plus title background
-            // panorama faces) and audio; 26.3 HUD/menu sprites & JSON schemas come from `sim_base`.
+            // panorama faces) and audio. Cosmetic gaps may be filled later from `sim_base`, but
+            // 26.3 schema-bound files must never be linked into a foreign root.
             name == "pack.png"
                 || (name.starts_with("assets/minecraft/textures/")
                     && (!name.starts_with("assets/minecraft/textures/gui/")
@@ -2311,7 +2600,7 @@ pub fn prepare_mojang_on_device(
                 }
             }
             let src = objects_dir
-                .join(&hash[..2].to_ascii_lowercase())
+                .join(hash[..2].to_ascii_lowercase())
                 .join(hash.to_ascii_lowercase());
             if !src.is_file() {
                 continue;
@@ -2340,27 +2629,35 @@ pub fn prepare_mojang_on_device(
     files += apply_classic_texture_aliases(&staging);
 
     let mut full_simulation = false;
-    let mut notes = format!("Official Mojang {clean} assets & data unpacked on device.");
+    let mut notes = format!("Official Mojang {clean} assets unpacked on device.");
     if let Some(base) = sim_base.as_deref() {
         let linked = populate_from_simulation_base(base, &staging, &clean);
-        validate_playable_root(&staging)?;
-        full_simulation = true;
         files += linked;
-        notes = format!(
-            "Mojang {clean} assets + linked Horizon simulation runtime ({linked} base files)."
-        );
+        if is_native_pinned {
+            validate_playable_root(&staging)?;
+            full_simulation = true;
+            notes = format!(
+                "Mojang {clean} assets + pinned Horizon 26.3 simulation runtime ({linked} files)."
+            );
+        } else {
+            notes = format!(
+                "Mojang {clean} authentic assets + {linked} 26.3 cosmetic fallbacks. A real per-version Rust version pack is required to play; 26.3 simulation tables were not relabelled."
+            );
+        }
     } else {
         let manifest = json!({
             "schema": SCHEMA_VERSION,
             "minecraft": clean,
+            "simulation_version": clean,
             "source_minecraft": clean,
             "prepared_by": "horizon-on-device",
             "full_simulation": false,
+            "simulation_status": "awaiting-real-version-pack",
         });
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
         write_unlinked(&staging.join("horizon-resources.json"), &manifest_bytes)
             .map_err(|e| e.to_string())?;
-        notes.push_str(" Tap Complete Setup to download Horizon's simulation runtime (~45 MB).");
+        notes.push_str(" A real per-version Rust version pack is required to play.");
     }
 
     let profile = VersionProfile {
@@ -2398,7 +2695,16 @@ pub fn prepare_mojang_on_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, net::TcpListener};
+    use horizon_protocol::adapter::{
+        ServerVersion, preferred_server_version, set_preferred_server_version,
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::Mutex,
+    };
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_home(tag: &str) -> PathBuf {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -2457,11 +2763,130 @@ mod tests {
             r#"{"model":{"type":"minecraft:model","model":"minecraft:block/stone"}}"#,
         )
         .unwrap();
-        validate_playable_root(root).expect("fixture must pass validate_playable_root");
+        validate_playable_root(root).expect("pinned 26.3 fixture must pass");
+    }
+
+    /// A *contract* fixture: synthetic bytes prove the binding logic, not that these bytes are
+    /// really Minecraft 1.20.4. A real pack comes from version_port.py + parity harnesses.
+    fn write_real_version_pack_fixture(
+        root: &Path,
+        version_id: &str,
+        data_version: i64,
+        protocol: i64,
+    ) {
+        for rel in REQUIRED_SIMULATION_FILES
+            .iter()
+            .chain(REQUIRED_NESTED_FILES.iter())
+        {
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&p, format!("{version_id}/{rel}").as_bytes()).unwrap();
+        }
+        let artifact = format!("{version_id}/prepared-horizon-data.bin").into_bytes();
+        fs::write(root.join("horizon-data.bin"), &artifact).unwrap();
+        let manifest = json!({
+            "schema": 7,
+            "minecraft": version_id,
+            "simulation_version": version_id,
+            "source_minecraft": version_id,
+            "data_version": data_version,
+            "protocol": protocol,
+            "full_simulation": true,
+        });
+        fs::write(
+            root.join("horizon-resources.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let pack = json!({
+            "schema": VERSION_PACK_SCHEMA,
+            "id": version_id,
+            "simulation_version": version_id,
+            "minecraft": version_id,
+            "data_version": data_version,
+            "protocol": protocol,
+            "engine_pin": horizon_core::VANILLA_VERSION,
+            "engine_build_sha256": "a".repeat(64),
+            "rust_sources_sha256": "b".repeat(64),
+            "parity_harness_passed": true,
+            "registries_digest": fnv1a64_files(root, &["registries.json", "entity-types.json", "command-registries.json"]).unwrap(),
+            "items_digest": fnv1a64_files(root, &["items.json", "creative-inventory.json", "model-states.json"]).unwrap(),
+            "worldgen_digest": fnv1a64_worldgen(root).unwrap(),
+            "artifact_digest": fnv1a64(&artifact),
+            "artifact_sha256": hex_lower(&Sha256::digest(&artifact)),
+            "artifact_path": "horizon-data.bin",
+            "built_by": format!("{VERSION_PACK_PRODUCER} --version {version_id}"),
+            "translation_report": "rust-translation-report.json",
+        });
+        fs::write(
+            root.join(VERSION_PACK_FILE),
+            serde_json::to_vec_pretty(&pack).unwrap(),
+        )
+        .unwrap();
+        validate_playable_root(root).expect("verified synthetic version pack must pass");
     }
 
     #[test]
-    fn mojang_on_device_preparation_links_classic_textures_and_upgrades_when_base_arrives() {
+    fn a_real_version_pack_changes_the_playable_version_binding() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
+        let home = temp_home("real-version-pack");
+        let foreign = home.join("versions/1.20.4/resources");
+        write_real_version_pack_fixture(&foreign, "1.20.4", 3700, 765);
+        let selected = select_version(&home, "1.20.4").expect("real 1.20.4 pack is playable");
+        assert!(selected.ready && selected.full_simulation);
+        assert_eq!(selected.support_tier, "protocol-adapter");
+        assert_eq!(active_ready_root(&home), Some(foreign.clone()));
+        assert_eq!(preferred_server_version(), Some(ServerVersion::V1_20_3));
+        assert_eq!(
+            crate::import::resources_root(&foreign, Some(&home)),
+            Some(foreign)
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_tampered_version_pack_and_a_fake_manifest_are_refused() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
+        let home = temp_home("refuse-fake-pack");
+        let foreign = home.join("versions/1.21.1/resources");
+        write_real_version_pack_fixture(&foreign, "1.21.1", 3953, 767);
+        fs::write(foreign.join("horizon-data.bin"), b"tampered").unwrap();
+        let err = validate_playable_root(&foreign).unwrap_err();
+        assert!(err.contains("SHA-256") || err.contains("digest"), "{err}");
+        assert!(select_version(&home, "1.21.1").is_err());
+
+        // Restore the artifact, then re-label 26.3 tables as 1.21.1: still refused.
+        let artifact = b"1.21.1/prepared-horizon-data.bin".to_vec();
+        fs::write(foreign.join("horizon-data.bin"), &artifact).unwrap();
+        let fake = json!({
+            "schema": 7,
+            "minecraft": horizon_core::VANILLA_VERSION,
+            "source_minecraft": "1.21.1",
+            "data_version": horizon_world::DATA_VERSION,
+            "full_simulation": true,
+        });
+        fs::write(
+            foreign.join("horizon-resources.json"),
+            serde_json::to_vec_pretty(&fake).unwrap(),
+        )
+        .unwrap();
+        let err = validate_playable_root(&foreign).unwrap_err();
+        assert!(
+            err.contains("fake version") || err.contains("version pack"),
+            "{err}"
+        );
+        assert!(select_version(&home, "1.21.1").is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mojang_on_device_preparation_keeps_classic_textures_and_refuses_fake_upgrade() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
         let home = temp_home("mojang-prep");
         let jar_path = home.join("1.12.2.jar");
         {
@@ -2476,7 +2901,6 @@ mod tests {
             zip.start_file("assets/minecraft/textures/blocks/grass_top.png", opts)
                 .unwrap();
             zip.write_all(b"PNG112GRASS").unwrap();
-            // Old 1.12 recipe schema that MUST NOT overwrite 26.3's `data/minecraft/`!
             zip.start_file("data/minecraft/recipes/stone.json", opts)
                 .unwrap();
             zip.write_all(br#"{"type":"crafting_shaped","old_1_12":true}"#)
@@ -2490,7 +2914,6 @@ mod tests {
         let obj_file = objects_dir.join(&sound_sha1[..2]).join(&sound_sha1);
         fs::create_dir_all(obj_file.parent().unwrap()).unwrap();
         fs::write(&obj_file, sound_bytes).unwrap();
-
         let asset_index = json!({
             "objects": {
                 "minecraft/sounds/random/click.ogg": {
@@ -2500,7 +2923,6 @@ mod tests {
             }
         });
 
-        // 1. Prepare BEFORE any Horizon simulation base exists on the phone.
         let prof = prepare_mojang_on_device(
             &home,
             "1.12.2",
@@ -2509,16 +2931,13 @@ mod tests {
             &asset_index,
             &objects_dir,
         )
-        .expect("prepare 1.12.2");
+        .expect("prepare 1.12.2 authentic assets");
         assert!(!prof.full_simulation);
         let ver_root = home.join("versions/1.12.2/resources");
         assert!(has_partial_mojang_root(&ver_root));
         assert!(has_any_partial_mojang(&home));
         assert!(!is_ready_root(&ver_root));
-        // Selecting an incomplete version must fail cleanly instead of letting Play hit missing tables!
         assert!(select_version(&home, "1.12.2").is_err());
-
-        // Pre-1.13 `textures/blocks/stone.png` and `grass_top.png` aliased to modern 26.3 names!
         assert_eq!(
             fs::read(ver_root.join("assets/minecraft/textures/block/stone.png")).unwrap(),
             b"PNG112STONE"
@@ -2532,46 +2951,64 @@ mod tests {
             sound_bytes
         );
 
-        // 2. Now install a full 26.3 prepared base and verify `upgrade_partial_mojang_versions`
-        //    automatically upgrades 1.12.2 to `full_simulation = true` and `is_ready_root == true`!
         let base_26_3 = home.join("versions/26.3/resources");
         write_simulated_prepared_base(&base_26_3);
         let upgraded = upgrade_partial_mojang_versions(&home, &base_26_3);
-        assert_eq!(upgraded, 1);
-        assert!(is_ready_root(&ver_root));
-        assert!(!has_any_partial_mojang(&home));
-        assert!(ver_root.join("model-states.json").is_file());
-        assert!(ver_root.join("creative-inventory.json").is_file());
-        assert!(ver_root.join("assets/minecraft/items/stone.json").is_file());
+        assert_eq!(
+            upgraded, 0,
+            "26.3 tables must not upgrade a foreign version"
+        );
+        assert!(!is_ready_root(&ver_root));
+        assert!(has_any_partial_mojang(&home));
+        assert!(!ver_root.join("model-states.json").is_file());
+        assert!(!ver_root.join("creative-inventory.json").is_file());
+        assert!(!ver_root.join("assets/minecraft/items/stone.json").is_file());
+        assert!(
+            !ver_root
+                .join(horizon_core::prepared_files::FILE_NAME)
+                .is_file()
+        );
         assert!(!ver_root.join("data/minecraft/recipes/stone.json").exists());
-        // Verify base `horizon-resources.json` was NOT mutated via hardlink (`source_minecraft` absent in base)!
         let base_manifest: Value =
             serde_json::from_slice(&fs::read(base_26_3.join("horizon-resources.json")).unwrap())
                 .unwrap();
         assert!(base_manifest.get("source_minecraft").is_none());
 
-        // 3. Verify switching active versions updates `import::resources_root` & protocol preference!
-        select_version(&home, "1.12.2").unwrap();
-        assert_eq!(active_version_id(&home), "1.12.2");
-        assert_eq!(
-            crate::import::resources_root(&home.join("resources"), Some(&home)),
-            Some(ver_root.clone())
-        );
-
         select_version(&home, "26.3").unwrap();
         assert_eq!(active_version_id(&home), "26.3");
         assert_eq!(
             crate::import::resources_root(&ver_root, Some(&home)),
-            Some(base_26_3)
+            Some(base_26_3.clone())
         );
-
         delete_version(&home, "1.12.2").unwrap();
         assert!(!ver_root.exists());
         let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
+    fn active_version_id_refuses_a_stale_foreign_selection_without_a_verified_root() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
+        let home = temp_home("stale-active-selection");
+        save_selection(
+            &home,
+            &ActiveSelection {
+                active: "1.20.4".into(),
+                older_servers: true,
+            },
+        )
+        .expect("write stale selection");
+        assert!(active_ready_root(&home).is_none());
+        assert_eq!(active_version_id(&home), horizon_core::VANILLA_VERSION);
+        apply_active_protocol_preference(&home);
+        assert_eq!(preferred_server_version(), None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn downloads_prepared_zip_from_live_local_http_server_with_sha256_verification() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
         let home = temp_home("http-prepared");
         let src_tree = home.join("pc-prepared-26.3");
         write_simulated_prepared_base(&src_tree);
@@ -2599,31 +3036,67 @@ mod tests {
 
         let job = global_job().clone();
         let url = format!("http://127.0.0.1:{port}/horizon-26.3.zip");
-        run_prepared_download(&job, &home, &url, "1.21.4", Some(&expected_sha256))
+        run_prepared_download(&job, &home, &url, "26.3", Some(&expected_sha256))
             .expect("HTTP prepared download & SHA-256 verify");
         server.join().unwrap();
 
         let installed = list_installed(&home);
         let v = installed
             .iter()
-            .find(|i| i.id == "1.21.4")
-            .expect("1.21.4 installed");
+            .find(|i| i.id == "26.3")
+            .expect("26.3 installed");
         assert!(v.ready && v.full_simulation && v.active);
-        assert_eq!(v.protocol, Some(769));
-        assert_eq!(
-            horizon_protocol::adapter::preferred_server_version(),
-            Some(ServerVersion::V1_21_4)
+        assert_eq!(preferred_server_version(), None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_26_3_zip_cannot_be_downloaded_as_a_foreign_version() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
+        let home = temp_home("refuse-relabelled-zip");
+        let src_tree = home.join("pc-prepared-26.3");
+        write_simulated_prepared_base(&src_tree);
+        let zip_file = home.join("served-26.3.zip");
+        crate::import::pack(&src_tree, &zip_file, |_, _| {}).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let zip_bytes = fs::read(&zip_file).unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 2048];
+                let _ = stream.read(&mut req);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    zip_bytes.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&zip_bytes);
+            }
+        });
+        let job = global_job().clone();
+        let url = format!("http://127.0.0.1:{port}/fake-1.21.4.zip");
+        let err = run_prepared_download(&job, &home, &url, "1.21.4", None).unwrap_err();
+        assert!(
+            err.contains("cannot be installed as Minecraft 1.21.4"),
+            "{err}"
         );
+        assert!(
+            err.contains("fake version") || err.contains("version pack"),
+            "{err}"
+        );
+        server.join().unwrap();
         let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn prepare_mojang_overwrites_jar_placeholders_and_heals_existing_installs() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_server_version(None);
         let home = temp_home("heal-pano");
         let base_26_3 = home.join("versions/.sim-base-26.3/resources");
         write_simulated_prepared_base(&base_26_3);
 
-        // Build a synthetic client.jar containing a 150-byte 1x1 placeholder panorama_0.png
         let jar_path = home.join("minecraft/versions/26.3/26.3.jar");
         fs::create_dir_all(jar_path.parent().unwrap()).unwrap();
         {
@@ -2639,7 +3112,6 @@ mod tests {
             zw.finish().unwrap();
         }
 
-        // Write real 8,192-byte panorama_0.png + pack.mcmeta into `minecraft/assets/objects`
         let real_pano = vec![0x89u8; 8192];
         let pano_hash = hex_lower(&Sha1::digest(&real_pano));
         let pack_bytes = br#"{"pack":{"description":"Minecraft","min_format":84,"max_format":84}}"#;
@@ -2679,7 +3151,6 @@ mod tests {
         assert!(root_26_3.join("assets/pack.mcmeta").is_file());
         assert_eq!(version_id_for_root(&root_26_3), "26.3");
 
-        // Simulate a legacy `ios-build-5.1` install whose panorama_0.png was still 150 bytes:
         write_unlinked(&pano_path, &[0u8; 150]).unwrap();
         let _ = fs::remove_file(root_26_3.join("assets/pack.mcmeta"));
         let _ = fs::remove_file(root_26_3.join(".horizon-assets-healed-v1"));
@@ -2702,7 +3173,6 @@ mod tests {
         assert!(root_26_3.join("assets/pack.mcmeta").is_file());
         assert_eq!(heal_placeholder_assets(&home, &root_26_3), 0);
 
-        // Verify `version_id_for_root` returns `"1.21.1"` for multi-version layered roots:
         prepare_mojang_on_device(
             &home,
             "1.21.1",
@@ -2711,9 +3181,11 @@ mod tests {
             &asset_index,
             &objects_dir,
         )
-        .expect("prepare 1.21.1");
+        .expect("prepare 1.21.1 authentic assets");
         let root_1_21_1 = home.join("versions/1.21.1/resources");
         assert_eq!(version_id_for_root(&root_1_21_1), "1.21.1");
+        assert!(validate_playable_root(&root_1_21_1).is_err());
+        assert!(!root_1_21_1.join("model-states.json").is_file());
 
         let _ = fs::remove_dir_all(&home);
     }

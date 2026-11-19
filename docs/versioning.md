@@ -66,6 +66,21 @@ the website's `src/versions.js` (horizon-rust/horizon-site).
 - **A line's first release** goes out as soon as the release train runs after the line changes, without waiting for
   a pull request, but never while `RELEASES_PAUSED` is set.
 
+## Per-version simulation packs (not release versioning)
+
+The `horizon-server --version` / `horizon-prepare --version` checks above report the **release
+train's** tool version. `horizon-prepare` has `-V/--version` for that tool version and
+`--version-json PATH` for the pinned 26.3 version JSON; it has no `--version <minecraft-id>`
+switch. A Minecraft version id is a different concept.
+
+The draft fail-closed contract producer is `tools/prepare_version_pack.py --version <id>`
+(with `--root`, `--artifact`, `--report`, `--output`, `--check` and `--self-test`). It writes
+`version-pack.json` with `built_by: "tools/prepare_version_pack.py --version <id>"`. This is a
+host-side contract/self-test tool: it does not regenerate per-version Rust sources, run the
+parity harnesses, produce `rust-translation-report.json`, or build an engine binary. A non-26.3
+version becomes playable only after a real per-version Rust pack with passed parity harnesses is
+installed; a 26.3 simulation base under a foreign label must be refused.
+
 ## Existing installs: the way to 0.2
 
 Installs made before 0.2 run old code that compares tags number by number, so to them `v0.2.0` is older than
