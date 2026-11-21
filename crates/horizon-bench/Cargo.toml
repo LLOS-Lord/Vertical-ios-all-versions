@@ -13,3 +13,6 @@ serde_json = "1"
 # build of horizon-perf) needs the types below, never the probes.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 horizon-system = { path = "../horizon-system" }
+
+[lints]
+workspace = true

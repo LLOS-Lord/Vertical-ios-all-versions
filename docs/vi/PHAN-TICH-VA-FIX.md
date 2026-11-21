@@ -736,3 +736,74 @@ nên khi không có world nó ghi "world closed" và bỏ luôn phần ngân sá
   `the_first_poll_counts_as_unsettled_so_it_is_reported`) nằm trong `--lib` test của `horizon-client`,
   target **vốn không compile được từ trước** (74 lỗi cũ) ⇒ chưa chạy được. Đã kiểm bằng type-check:
   chúng không thêm lỗi nào (75 → 74 sau khi sửa `Budget::new` → `Budget::for_device`).
+
+## 11.7 Kết quả CI cho các sửa của §11 — và một lỗi mà "build success" ở host đã che
+
+### Lần push 1 — `b02651b` → **FAILED** (đúng loại lỗi bạn cảnh báo)
+
+`cargo check` trên host Linux: **0 error**. Actions, job `Build native ARM64 Rust engine`,
+target `aarch64-apple-ios`: **4 error**.
+
+```
+error[E0425]: cannot find type `task_vm_info` in crate `libc`        (x2, process_memory.rs:104,107)
+error[E0425]: cannot find function `mach_task_self` in crate `libc`  (process_memory.rs:114)
+error[E0308]: mismatched types — expected `u32`, found `i32`         (TASK_VM_INFO flavour)
+warning: unused doc comment                                          (process_memory.rs:141)
+```
+
+Nguyên nhân: `libc 0.2.190` gắn `target_os = "macos"` cho **cả** struct `task_vm_info` **và**
+`mach_task_self()`. Trên iOS hai thứ đó **không tồn tại trong crate**, dù libSystem có thật.
+Đây là kiểu lỗi mà host không bao giờ thấy: nhánh `#[cfg(target_vendor = "apple")]` không được
+biên dịch trên Linux, nên "0 error ở máy" là **vô nghĩa** với target Apple.
+
+**Đã sửa đúng gốc**, không đoán: tải `osfmk/mach/task_info.h` từ `apple-oss-distributions/xnu`,
+đọc layout thật —
+`TASK_VM_INFO = 22`, `phys_footprint` là field **thêm ở rev1**, và chính header tự xác nhận phép
+tính: `TASK_VM_INFO_REV0_COUNT = 2+1+1+2+2+28 = 36` natural_t word ⇒ rev1 đặt `phys_footprint` tại
+**byte 144**, kích thước buffer **152 byte = 38 word**. `task_info` trả về **ít word hơn** trên
+kernel trước rev1 ⇒ nhánh đó **trả `None`** thay vì đọc field chưa khởi tạo và coi đó là số đo.
+
+Để CI Linux kiểm được layout (nơi không có Apple SDK), layout được đưa ra module
+`task_vm_info_layout` + test khoá `144 / 152 / 38`. **Test này đã bắt hai lỗi số học của tôi**
+(đầu tiên tôi viết 160, rồi 148) trước khi push — tức là nó có giá trị thật, không phải test trang trí.
+
+### Lần push 2 — `cf73b92` → **SUCCESS**, và đây là phần quan trọng: **warning**
+
+| Job | Kết quả |
+| --- | --- |
+| Rust Guardrails & Functional Tests | ✅ success |
+| Compact 26.3 Simulation Runtime Pack | ✅ success |
+| iOS Swift Tests & Native ARM64 IPA | ✅ **success** — `Finished release profile in 16m 35s`, IPA + audit + upload OK |
+| release | ✅ success |
+
+**Warning trong log Apple — so sánh trước/sau (đây mới là bằng chứng cơ chế đã được nối):**
+
+| Crate | Trước (§11.1) | Sau | Ý nghĩa |
+| --- | --- | --- | --- |
+| `horizon-client` | **11 warning** | **4** | 7 warning của `ram.rs`/`thermal.rs` **đã biến mất** ⇒ code có đường tới nó |
+| `horizon-client-render` | **2** | **1** | `draw_budget::{scale, scene_reset}` **đã được dùng** |
+| `horizon-threads` | — | **0** | 5 phép đo mới compile sạch, không warning |
+
+Warning còn lại trong `horizon-client` (4): `ride_is_tamed`, `hud_editor_drag_target`,
+`native_recipe_lookup`, `recipe_lookups_now` — **không liên quan** request #2–#4, chưa sửa.
+`horizon-client-render` (1): `http_get` — code tải skin qua HTTP chưa nối.
+
+**3 warning `missing [lints] to inherit [workspace.lints]`** (`horizon-prepare`, `horizon-theme`,
+`horizon-bench`): đã thêm `[lints] workspace = true` cho cả ba. `cargo check` lại: **0 warning**,
+không phát sinh warning mới. (Trước khi sửa, ba crate này **thoát** bộ lint workspace — nghĩa là
+CI xanh một phần vì chúng không bị kiểm.)
+
+### Điều vẫn CHƯA chứng minh được
+
+Build xanh + warning giảm **chứng minh code có đường tới nó và compile đúng trên target Apple**.
+Nó **không** chứng minh `task_info`/`os_proc_available_memory`/`sysctlbyname` trả số đúng trên máy.
+Bằng chứng duy nhất cho việc đó là **log thiết bị lần chạy tới**, phải chứa đúng hai dòng:
+
+```
+Horizon: device iPhone10,x (…); RAM 3072 MiB, jetsam limit ~1400 MiB
+Horizon: RAM 900 MiB ceiling (measured, jetsam ~1400 MiB), peak …
+Horizon: nominal (…)
+```
+
+Nếu `jetsam limit None` xuất hiện trên máy thật thì nghĩa là `task_info` trả thiếu word hoặc
+`os_proc_available_memory` bị chặn — lúc đó phải đọc lại §11.3 chứ không được đoán.
