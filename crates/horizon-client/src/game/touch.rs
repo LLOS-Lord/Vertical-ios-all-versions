@@ -276,8 +276,12 @@ fn key_of(control: Control) -> Option<KeyCode> {
         Control::Chat => KeyCode::KeyT,
         Control::Pause => KeyCode::Escape,
         Control::Inventory => KeyCode::KeyE,
+        // Sneak+use goes through `mapped_key`, not `key_of`: giving Interact its own key here
+        // would make the button fire twice.
         Control::HideHud
         | Control::Sneak
+        | Control::Interact
+        | Control::Dismount
         | Control::Hotbar(_)
         | Control::Custom(_)
         | Control::Stick => return None,
@@ -1920,6 +1924,8 @@ impl Game<'_> {
                     Control::Chat => "Chat".to_owned(),
                     Control::Pause => "II".to_owned(),
                     Control::HideHud => "HUD".to_owned(),
+                    Control::Interact => "Use".to_owned(),
+                    Control::Dismount => "Off".to_owned(),
                     Control::Inventory => "•••".to_owned(),
                     Control::Hotbar(slot) => (slot + 1).to_string(),
                     Control::Custom(id) => self.settings.touch.button_label(id),

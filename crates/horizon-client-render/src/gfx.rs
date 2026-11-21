@@ -63,6 +63,8 @@ fn static_entity_shader() -> String {
 #[cfg(test)]
 mod crumbling_tests;
 mod entity_batch;
+mod device_probe;
+mod draw_budget;
 mod entity_outline;
 mod fluid;
 #[cfg(test)]
@@ -1086,6 +1088,16 @@ pub struct Renderer {
     pub last_wait: std::time::Duration,
     /// CPU time of the last `render`, waits excluded.
     pub last_encode: std::time::Duration,
+    /// Time between the starts of two real frames, ms, smoothed: the number the frame
+    /// scheduler and the performance overlay work from.
+    frame_ms: f32,
+    /// The frame generation gate's last answer, so the reason is logged once per change.
+    fg_reason: Option<horizon_frame_sched::Reason>,
+    /// How many section draws the GPU is given this frame (`draw_budget`): the governor's answer
+    /// to the GPU's own frame time, applied as a cut to the tail of the solid range.
+    draw_budget: draw_budget::DrawBudget,
+    /// The highest world resolution scale a thermal step allows (`set_heat_scale_ceiling`).
+    heat_scale_ceiling: f32,
     /// Watched only while HDR is On or Auto, including Auto in SDR;
     /// before `window`, so it's dropped first.
     display: Option<DisplayWatch>,
@@ -4983,9 +4995,13 @@ impl Renderer {
             },
             gpu_timer,
             gpu_times: Vec::new(),
+            draw_budget: draw_budget::DrawBudget::new(16.7),
             lightmap_pixels: [0; 16 * 16 * 4],
             last_wait: std::time::Duration::ZERO,
             last_encode: std::time::Duration::ZERO,
+            heat_scale_ceiling: 1.0,
+            frame_ms: 16.7,
+            fg_reason: None,
             window,
             target: previous.and_then(|renderer| renderer.target.clone()),
             parked: Vec::new(),
@@ -7156,7 +7172,26 @@ impl Renderer {
         if !on {
             self.frame_gen.stop();
         }
-        self.frame_gen.on = on;
+        // The setting, not the flag: a thermal suspension lowers the flag, and the choice has to
+        // survive it, or turning the device cool again would never turn generation back on.
+        self.frame_gen.set_setting(on);
+        self.frame_gen.profile(device_probe::probe(), device_probe::promotion());
+    }
+
+    /// This device, as the frame scheduler and the memory governor see it.
+    pub fn device(&self) -> horizon_frame_sched::DeviceProfile {
+        self.frame_gen.device()
+    }
+
+    /// The display's real refresh rate, Hz: the monitor's rate, corrected by the rate the real
+    /// frames actually arrive at (a ProMotion panel reports 60 nominally and presents at 120).
+    pub fn display_hz(&self) -> f32 {
+        self.frame_gen.measured_hz()
+    }
+
+    /// A thermal step's verdict: a hot SoC takes frame generation away whatever the setting says.
+    pub fn set_thermal(&mut self, action: horizon_frame_sched::ThermalAction) {
+        self.frame_gen.set_thermal(action);
     }
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     /// `sharpness`: how much TAA's upscaled picture is sharpened, 0..=1.
@@ -7189,6 +7224,19 @@ impl Renderer {
     /// pointer capture mid-turn.
     pub fn set_dynamic_world_scale(&mut self, scale: f32) {
         self.world_post.scale = scale.clamp(0.25, 2.0);
+    }
+
+    /// The highest world resolution scale a thermal step allows (1.0 when cool). The game's
+    /// dynamic resolution still measures its own scale, and this is the ceiling it takes the
+    /// smaller of, so a hot device keeps its frame rate instead of its pixels and gets the pixels
+    /// back when it cools (`game/thermal.rs`).
+    pub fn set_heat_scale_ceiling(&mut self, ceiling: f32) {
+        self.heat_scale_ceiling = ceiling.clamp(0.5, 1.0);
+    }
+
+    /// The ceiling `set_heat_scale_ceiling` last set, 1.0 when cool.
+    pub fn heat_scale_ceiling(&self) -> f32 {
+        self.heat_scale_ceiling
     }
     /// Runs `post` over the world from now on (`None`: no pack), for the dimension `dimension`;
     /// `block_ids` gives each source state its model and fluid material ids (two values
@@ -8134,7 +8182,40 @@ impl Renderer {
         // Frame generation: its present thread acquires and presents, this frame draws
         // into frames of its own. Not over menus that blur the frame, a shader pack's
         // own post passes, HDR (or the 16-bit frame it was started with) or the title screen.
-        let fg = self.frame_gen.on
+        //
+        // The switch alone is not the decision any more: `horizon-frame-sched` decides from this
+        // frame's measurements whether a made frame is worth having, how long the render thread may
+        // wait for the present thread, and it takes generation away on a device that cannot afford
+        // it (an A11) or one that is hot. That is the freeze the setting used to cause.
+        let in_world = !frame.title && frame.menu_blur.is_none();
+        let external_post = self.pack_post.as_ref().is_some_and(|p| p.1.is_some())
+            || self.native.as_ref().is_some_and(|n| n.post.is_some());
+        let gpu_ms = self.gpu_times.last().copied();
+        let decision = self.frame_gen.decide(
+            self.frame_ms,
+            gpu_ms,
+            self.display_hz(),
+            self.frame_gen.waited_ms(),
+            in_world,
+            external_post,
+        );
+        if self.fg_reason != Some(decision.reason) {
+            self.fg_reason = Some(decision.reason);
+            log::info!(
+                "Horizon: frame generation {} ({} ms real{}{}, {} Hz, {} ms present timeout)",
+                decision.reason.as_str(),
+                self.frame_ms,
+                gpu_ms.map(|g| format!(", {g} ms gpu")).unwrap_or_default(),
+                decision
+                    .multiplier
+                    .ne(&1.0)
+                    .then(|| format!(", {:.1}x", decision.multiplier))
+                    .unwrap_or_default(),
+                self.display_hz(),
+                decision.present_timeout_ms,
+            );
+        }
+        let fg = decision.generate
             && !self.frame_gen.paused
             && self.hdr.is_none()
             && self.output.frame.format == self.config.format.remove_srgb_suffix()
@@ -9131,7 +9212,34 @@ impl Renderer {
         self.draws.extend_from_slice(&self.phase2_draws);
         self.draw_pages.extend_from_slice(&self.phase2_pages);
         let culling = cull.is_some();
-        let solid_draws = self.draws.len() as u32;
+        // How much of the list the GPU is given (`draw_budget`): the governor's answer to the GPU's
+        // own frame time, applied as a cut to the *tail* of the solid range. `draws` is a sequence
+        // of contiguous page runs, so the cut has to be a prefix length rather than a selection:
+        // `draw_sections_from` binds one pipeline and one buffer pair per run, and a run of 200
+        // draws on one page becomes a single `multi_draw_indexed_indirect`.
+        //
+        // Everything below reads `solid_draws` as the end of the solid range, so the cut lands in
+        // one place and no pass can be left drawing past it. The translucent range keeps its length:
+        // it is the water and glass around the player, a handful of draws compared with the solid
+        // list, and emptying it first would be the wrong trade.
+        let walked_solid = self.draws.len() as u32;
+        let (plan, plan_changed) = self
+            .draw_budget
+            .observe(self.gpu_times.last().copied(), walked_solid, 0);
+        if plan_changed && plan.shortened(walked_solid) {
+            log::debug!(
+                "Horizon renderer: {} of {} solid draws at {:.0}% scale",
+                plan.solid,
+                walked_solid,
+                plan.scale * 100.0
+            );
+        }
+        if plan.shortened(walked_solid) && self.draw_budget.struggling() {
+            // One line when it starts, not one per frame: the device is not keeping up and the
+            // overlay should say so rather than leaving it to be inferred from the frame time.
+            log::info!("Horizon renderer: GPU over budget — {}", self.draw_budget.describe());
+        }
+        let solid_draws = plan.solid;
         // Phase 2's draws `[phase1_draws..phase2_cutout]` hold opaque quads, the rest
         // cutout ones (without the split, all of them go through one pipeline).
         let phase2_cutout = phase1_draws + phase2_opaque as u32;
@@ -12137,6 +12245,16 @@ impl Renderer {
         // Inside the present's time already.
         self.queue.take_waited();
         self.last_encode = started.elapsed().saturating_sub(self.last_wait);
+        // A real frame's period: the renderer's own clock, smoothed so one long frame (a chunk
+        // mesh landing) does not turn the scheduler off and one short one does not turn it on.
+        let period_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.frame_ms = self.frame_ms * 0.9 + period_ms.min(250.0) * 0.1;
+        // The draw budget aims at the display's own period: a frame that fits in one refresh window
+        // needed no shortening, whatever the CPU did with the rest of it.
+        let hz = self.display_hz();
+        if hz > 0.0 {
+            self.draw_budget.set_target(1000.0 / hz);
+        }
         let _ = self.started;
         self.visible = visible;
         self.visible_lods = visible_lods;

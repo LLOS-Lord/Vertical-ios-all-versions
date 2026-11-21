@@ -361,6 +361,7 @@ impl Opt {
             Opt::TouchStickOpacity => "horizon.options.touch_stick_opacity",
             Opt::TouchPointer => "horizon.options.touch_pointer",
             Opt::TouchInteract => "horizon.options.touch_interact",
+            Opt::TouchLookSmooth => "horizon.options.touch_look_smoothing",
             Opt::PadGameplayGuide => "horizon.options.gameplay_guide",
             Opt::PadRadialMode => "horizon.options.radial_mode",
             Opt::PadRadialStick => "horizon.options.radial_stick",
@@ -456,6 +457,9 @@ impl Opt {
                 crate::touch::MAX_SCALE,
             ),
             Opt::TouchStickOpacity => unit(s.touch.stick_opacity, crate::touch::MIN_OPACITY, 1.0),
+            // Four positions, 1 (raw) to 4 (smoothest). `unit` is the range the drag maps onto;
+            // `slider_steps` below makes it land only on those four.
+            Opt::TouchLookSmooth => unit(f32::from(s.touch.look_smoothing), 1.0, 4.0),
             Opt::PadTriggerThreshold => unit(s.controller.trigger_threshold, 0.1, 0.9),
             Opt::SprintWindow => unit(s.sprint_window as f32, 0.0, 10.0),
             Opt::Page(page, row) => pages::slider_kind(page, row),
@@ -525,6 +529,8 @@ impl Opt {
             Opt::PadMoveDeadzone | Opt::PadLookDeadzone => Some(50),
             Opt::PadTriggerThreshold => Some(80),
             Opt::SprintWindow => Some(10),
+            // 1..=4: raw, smooth, smoother, smoothest.
+            Opt::TouchLookSmooth => Some(3),
             _ => None,
         }
     }
@@ -764,6 +770,15 @@ impl Opt {
             }),
             // The caption names the setting: a bare "OFF" on this page says nothing about what is off.
             Opt::TouchInteract => generic(c, on_off(s.touch.interact)),
+            Opt::TouchLookSmooth => generic(
+                c,
+                Text::literal(match s.touch.look_smoothing {
+                    1 => "Off (raw)",
+                    2 => "Smooth",
+                    3 => "Smoother",
+                    _ => "Smoothest",
+                }),
+            ),
             _ => generic(c, self.value_text(s)),
         }
     }
@@ -1032,6 +1047,9 @@ impl Opt {
             Opt::TouchScale => s.touch.scale = step(75.0, 150.0) / 100.0,
             Opt::TouchStickScale => s.touch.stick_scale = step(75.0, 150.0) / 100.0,
             Opt::TouchStickOpacity => s.touch.stick_opacity = step(20.0, 100.0) / 100.0,
+            Opt::TouchLookSmooth => {
+                s.touch.look_smoothing = (step(1.0, 4.0).round() as u8).clamp(1, 4);
+            }
             Opt::PadTriggerThreshold => s.controller.trigger_threshold = step(10.0, 90.0) / 100.0,
             Opt::SprintWindow => s.sprint_window = step(0.0, 10.0) as i32,
             Opt::Page(page, row) => pages::slide(page, row, v),
@@ -1297,6 +1315,15 @@ impl Opt {
                 };
             }
             Opt::TouchInteract => s.touch.interact = !s.touch.interact,
+            Opt::TouchLookSmooth => {
+                s.touch.look_smoothing = if back {
+                    s.touch.look_smoothing.saturating_sub(1).max(1)
+                } else if s.touch.look_smoothing >= 4 {
+                    1
+                } else {
+                    s.touch.look_smoothing + 1
+                };
+            }
             Opt::PadRadialMode | Opt::PadRadialStick => self.radial_step(s, back),
             _ => {}
         }
@@ -3009,6 +3036,7 @@ impl OptionsUi {
                     Row::Big(Opt::TouchStick),
                     Row::Big(Opt::TouchPointer),
                     Row::Big(Opt::TouchInteract),
+                    Row::Big(Opt::TouchLookSmooth),
                 ];
                 // The buttons menus draw are a layout of their own: their own places and sizes.
                 if s.touch.pointer == crate::touch::PointerMode::Cursor {
@@ -9331,6 +9359,7 @@ mod tests {
             Opt::TouchStickOpacity,
             Opt::TouchPointer,
             Opt::TouchInteract,
+            Opt::TouchLookSmooth,
             Opt::PadTriggerThreshold,
             Opt::SprintWindow,
         ];

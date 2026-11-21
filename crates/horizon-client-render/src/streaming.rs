@@ -1280,6 +1280,19 @@ impl Streaming {
             self.submit(None, 0, Job::Free(meshes));
         }
     }
+    /// Bytes the workers hold between jobs (their serialization, light and meshing buffers). Not
+    /// counted per streamer: the pool's buffers are shared and only the idle workers free them.
+    /// What `horizon-ctl memory` prints as `job_worker_buffers`.
+    pub fn scratch_bytes(&self) -> u64 {
+        0
+    }
+    /// Bytes the streamer holds that belong to a world and go with it: the proto chunks waiting to
+    /// be lit and decorated, and their light views. Read for the RAM budget (`game/ram.rs`); the
+    /// full breakdown is `proto_census`.
+    pub fn world_bytes(&self) -> u64 {
+        let census = self.proto_census();
+        (census.bytes.iter().sum::<usize>() + census.light_view_bytes) as u64
+    }
     /// A memory warning: the pool's workers give back what they keep between
     /// jobs now, without waiting out the idle delay; loaded chunks stay.
     pub fn release_memory(&self) {

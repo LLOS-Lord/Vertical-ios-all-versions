@@ -1,0 +1,13 @@
+[package]
+name = "horizon-memory-governor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A byte-budgeted memory governor for iOS: ceilings derived from the device, weighted caches with visibility-driven and LRU eviction, and a control loop that keeps the game under Jetsam"
+
+[dependencies]
+horizon-frame-sched = { path = "../horizon-frame-sched" }
+
+[lints]
+workspace = true

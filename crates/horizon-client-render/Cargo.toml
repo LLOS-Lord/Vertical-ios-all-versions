@@ -10,6 +10,9 @@ description = "The client's world data, rendering and screens: chunks, meshing, 
 stacker = "0.1"
 # The settings stores of the crates above the engine (docs/layers.md, "Platform registries").
 horizon-hooks = { path = "../horizon-hooks" }
+# Frame-generation admission control, thermal budgets and frame pacing (pure policy, no GPU).
+horizon-frame-sched = { path = "../horizon-frame-sched" }
+horizon-gpu-governor = { path = "../horizon-gpu-governor" }
 # The GUI atlas's pixels, kept compressed once uploaded (hud.rs `pack_pixels`).
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 horizon-assets = { path = "../horizon-assets" }

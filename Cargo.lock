@@ -1543,13 +1543,16 @@ dependencies = [
  "horizon-core",
  "horizon-cosmetics",
  "horizon-dualsense",
+ "horizon-frame-sched",
  "horizon-friends",
  "horizon-gamecontroller",
  "horizon-hdr",
  "horizon-hooks",
  "horizon-ios-launcher",
  "horizon-items",
+ "horizon-memory-governor",
  "horizon-mod-api-gen",
+ "horizon-mod-diagnostics",
  "horizon-mods",
  "horizon-narrator",
  "horizon-optifine",
@@ -1563,6 +1566,8 @@ dependencies = [
  "horizon-telemetry",
  "horizon-theme",
  "horizon-threads",
+ "horizon-touch-pipeline",
+ "horizon-version-truth",
  "horizon-world",
  "java_regex",
  "log",
@@ -1650,6 +1655,7 @@ dependencies = [
  "horizon-telemetry",
  "horizon-theme",
  "horizon-threads",
+ "horizon-version-truth",
  "horizon-world",
  "java_regex",
  "log",
@@ -1695,6 +1701,8 @@ dependencies = [
  "horizon-client-input",
  "horizon-command",
  "horizon-core",
+ "horizon-frame-sched",
+ "horizon-gpu-governor",
  "horizon-hdr",
  "horizon-hooks",
  "horizon-items",
@@ -1790,6 +1798,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-frame-sched"
+version = "0.1.0"
+
+[[package]]
 name = "horizon-friends"
 version = "0.1.0"
 dependencies = [
@@ -1826,6 +1838,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-gpu-governor"
+version = "0.1.0"
+dependencies = [
+ "horizon-frame-sched",
+ "horizon-importance",
+]
+
+[[package]]
 name = "horizon-hdr"
 version = "0.1.0"
 dependencies = [
@@ -1848,6 +1868,15 @@ dependencies = [
 [[package]]
 name = "horizon-hooks"
 version = "0.1.0"
+
+[[package]]
+name = "horizon-importance"
+version = "0.1.0"
+dependencies = [
+ "horizon-frame-sched",
+ "horizon-memory-governor",
+ "horizon-visibility-budget",
+]
 
 [[package]]
 name = "horizon-ios"
@@ -1885,6 +1914,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-memory-governor"
+version = "0.1.0"
+dependencies = [
+ "horizon-frame-sched",
+]
+
+[[package]]
 name = "horizon-mod-api-gen"
 version = "0.1.0"
 dependencies = [
@@ -1916,6 +1952,22 @@ dependencies = [
  "snap",
  "tungstenite",
  "yaml-rust2",
+]
+
+[[package]]
+name = "horizon-mod-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "horizon-mod-shim"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2207,6 +2259,24 @@ dependencies = [
  "rustc-demangle",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "horizon-touch-pipeline"
+version = "0.1.0"
+
+[[package]]
+name = "horizon-version-truth"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha1",
+ "zip",
+]
+
+[[package]]
+name = "horizon-visibility-budget"
+version = "0.1.0"
 
 [[package]]
 name = "horizon-world"

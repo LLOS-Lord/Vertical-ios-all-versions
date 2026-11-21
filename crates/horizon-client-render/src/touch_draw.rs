@@ -263,6 +263,24 @@ fn glyph(batch: &mut HudBatch, atlas: &HudAtlas, control: Control, r: Rect, colo
                 cell(batch, x, -0.5, 1.0, 1.0);
             }
         }
+        // Interact: a hand — a palm with a thumb, the way Pocket Edition draws its use button.
+        Control::Interact => {
+            cell(batch, -2.5, -1.0, 5.0, 3.5);
+            cell(batch, -3.5, -0.5, 1.0, 2.0);
+            cell(batch, -2.5, 2.5, 1.0, 1.5);
+            cell(batch, -0.5, 2.5, 1.0, 1.5);
+            cell(batch, 1.5, 2.5, 1.0, 1.5);
+        }
+        // Dismount: an arrow leaving a saddle.
+        Control::Dismount => {
+            cell(batch, -3.0, -2.5, 6.0, 1.5);
+            cell(batch, -0.5, -1.0, 1.0, 2.0);
+            for i in 0..3 {
+                let i = i as f32;
+                cell(batch, -1.5 - i, 0.5 + i, 1.0, 1.0);
+                cell(batch, 1.5 + i, 0.5 + i, 1.0, 1.0);
+            }
+        }
         Control::Hotbar(_) | Control::Custom(_) | Control::Stick => {}
     }
 }

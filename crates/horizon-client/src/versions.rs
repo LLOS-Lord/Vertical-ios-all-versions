@@ -152,6 +152,20 @@ pub struct InstalledVersion {
     pub installed_epoch: u64,
     pub path: String,
     pub notes: String,
+    /// What this tree really is: `Native`, `Ported`, `Cosmetic` ("assets only: the world still
+    /// plays 26.3") or `Broken` (`horizon-version-truth`).
+    ///
+    /// The bug this exists for: a version other than 26.3 used to be installed by hardlinking
+    /// 26.3's simulation tables and relabelling the folder, so the lobby said "1.20.1" and the
+    /// world played 26.3. The verdict is computed from the tree, not from the label, so the list
+    /// cannot say that any more.
+    pub verdict: String,
+    /// The badge the launcher shows for it ("Assets only", "Full port", ...).
+    pub badge: String,
+    /// One sentence: why the verdict is what it is.
+    pub truth_detail: String,
+    /// The installer's remaining steps for a tree that is not `Native`, in order.
+    pub remaining: Vec<String>,
 }
 
 /// Downloadable prepared-bundle mirror or remote catalog entry.
@@ -463,7 +477,10 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
             let ready = is_ready_root(&res);
             map.insert(
                 id.clone(),
-                InstalledVersion {
+                {
+                    let truth =
+                        horizon_version_truth::judge_dir(home, &res, horizon_core::VANILLA_VERSION);
+                    InstalledVersion {
                     support_tier: support_tier_for_version(&id).into(),
                     protocol: prof
                         .protocol
@@ -471,6 +488,10 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
                     protocol_adapter: prof
                         .protocol_adapter
                         .or_else(|| ServerVersion::from_version_id(&id).map(|v| format!("{v:?}"))),
+                    verdict: truth.verdict.as_str().to_owned(),
+                    badge: truth.verdict.badge().to_owned(),
+                    truth_detail: truth.detail.clone(),
+                    remaining: truth.remaining.iter().map(|s| s.as_str().to_owned()).collect(),
                     id,
                     release_type: prof.release_type,
                     source: prof.source,
@@ -483,6 +504,7 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
                     installed_epoch: prof.installed_epoch,
                     path: res.to_string_lossy().into_owned(),
                     notes: prof.notes,
+                }
                 },
             );
         }
@@ -505,7 +527,17 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
             let ready = is_ready_root(&legacy);
             map.insert(
                 inferred_id.clone(),
+                {
+                    let truth = horizon_version_truth::judge_dir(
+                        home,
+                        &legacy,
+                        horizon_core::VANILLA_VERSION,
+                    );
                 InstalledVersion {
+                    verdict: truth.verdict.as_str().to_owned(),
+                    badge: truth.verdict.badge().to_owned(),
+                    truth_detail: truth.detail.clone(),
+                    remaining: truth.remaining.iter().map(|s| s.as_str().to_owned()).collect(),
                     support_tier: support_tier_for_version(&inferred_id).into(),
                     protocol: prof
                         .protocol
@@ -525,6 +557,7 @@ pub fn list_installed(home: &Path) -> Vec<InstalledVersion> {
                     installed_epoch: prof.installed_epoch,
                     path: legacy.to_string_lossy().into_owned(),
                     notes: prof.notes,
+                }
                 },
             );
         }
@@ -747,6 +780,25 @@ fn build_manifest_from_base(base: &Path, version_id: &str) -> Value {
     obj.insert("minecraft".to_owned(), json!(horizon_core::VANILLA_VERSION));
     obj.insert("source_minecraft".to_owned(), json!(version_id));
     obj.insert("full_simulation".to_owned(), json!(true));
+    // Say *what* the tables are, not just what the label is. This function copies the pinned
+    // version's simulation tables into a tree for `version_id`; when that is not the pinned version
+    // the result is that version's assets over 26.3's simulation, and the stamp records it as
+    // borrowed so `horizon-version-truth` can prove it from the manifest alone (bug 3: the lobby
+    // used to say "1.20.1" while the world played 26.3).
+    obj.insert(
+        "truth".to_owned(),
+        json!({
+            "version": horizon_core::VANILLA_VERSION,
+            "client_jar_sha1": "",
+            "protocol": obj.get("protocol").cloned().unwrap_or(Value::Null),
+            // "generated" | "adapted" | "borrowed"
+            "provenance": if version_id == horizon_core::VANILLA_VERSION {
+                "generated"
+            } else {
+                "borrowed"
+            },
+        }),
+    );
     Value::Object(obj)
 }
 

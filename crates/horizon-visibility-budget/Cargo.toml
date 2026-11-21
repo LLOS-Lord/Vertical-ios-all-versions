@@ -1,0 +1,12 @@
+[package]
+name = "horizon-visibility-budget"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Decides what is worth drawing: per-section visibility scoring from the camera frustum and occlusion, an entity/particle budget, and the order the frame walks candidates so the visible things are always the ones that fit"
+
+[dependencies]
+
+[lints]
+workspace = true

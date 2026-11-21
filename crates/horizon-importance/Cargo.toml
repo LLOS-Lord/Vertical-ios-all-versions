@@ -1,0 +1,15 @@
+[package]
+name = "horizon-importance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "One importance ladder the whole frame agrees on: maps the renderer's draw order, the job pool's classes, the frame ledger's kinds and the memory governor's cache classes onto a single ordered scale, then decides what to shed when the frame cannot afford everything"
+
+[dependencies]
+horizon-frame-sched = { path = "../horizon-frame-sched" }
+horizon-memory-governor = { path = "../horizon-memory-governor" }
+horizon-visibility-budget = { path = "../horizon-visibility-budget" }
+
+[lints]
+workspace = true

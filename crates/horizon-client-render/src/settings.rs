@@ -1019,6 +1019,9 @@ pub enum Opt {
     TouchPointer,
     /// Whether a tap on the world uses and a held finger mines, or the layout's buttons do it all.
     TouchInteract,
+    /// How many frames the look motion from one drag is spread over: 1 is raw and can judder,
+    /// 4 is the smoothest and trails the finger most (`TouchSettings::look_smoothing`).
+    TouchLookSmooth,
     PadGameplayGuide,
     /// The radial menu's opener held or pressed once (`PadSettings::radial_mode`).
     PadRadialMode,

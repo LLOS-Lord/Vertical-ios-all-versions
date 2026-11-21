@@ -20,6 +20,13 @@ struct InstalledModItem: Identifiable, Equatable {
     let clashWarning: String?
     let iconURL: URL?
     let bytes: Int64
+    /// Whether this mod can change anything in the game today, from `horizon-mod-diagnostics`.
+    /// False for a mod that is installed and switched on but sits in a folder the game never reads,
+    /// or one the porter could only carry assets from. `nil` when the game has not said (no
+    /// diagnosis came back: an older build, or the game is not running).
+    var effective: Bool?
+    /// The one-sentence reason, and what to do about it.
+    var diagnosis: String
 
     init?(_ json: [String: Any]) {
         guard let id = json["id"] as? String, !id.isEmpty else { return nil }
@@ -39,6 +46,17 @@ struct InstalledModItem: Identifiable, Equatable {
         clashWarning = json["clash_warning"] as? String
         iconURL = (json["icon_url"] as? String).flatMap(URL.init(string:))
         bytes = (json["bytes"] as? NSNumber)?.int64Value ?? 0
+        // Merged in from the `diagnostics` array by id (`VersionStore`/`ModsStore` `applyDiagnostics`).
+        effective = json["effective"] as? Bool
+        diagnosis = json["diagnosis"] as? String ?? ""
+    }
+
+    /// A copy carrying the game's diagnosis, which arrives separately from the mod list.
+    func diagnosed(effective: Bool, diagnosis: String) -> InstalledModItem {
+        var copy = self
+        copy.effective = effective
+        copy.diagnosis = diagnosis
+        return copy
     }
 
     var badgeText: String {
@@ -52,6 +70,9 @@ struct InstalledModItem: Identifiable, Equatable {
 
     var badgeTone: Chip.Tone {
         if clashWarning != nil { return .bad }
+        // The game's own answer wins: a mod that is on but cannot act is not "good", however
+        // promising its verdict from the porter reads.
+        if effective == false { return .warn }
         switch verdict {
         case "verified", "works": return .good
         case "partly": return .warn
@@ -220,7 +241,25 @@ final class ModStore: ObservableObject {
     func reloadInstalled() async {
         let reply = await command(["action": "list"])
         if let raw = reply["mods"] as? [[String: Any]] {
-            installed = raw.compactMap(InstalledModItem.init)
+            installed = Self.diagnosed(raw.compactMap(InstalledModItem.init),
+                                       from: reply["diagnostics"])
+        }
+    }
+
+    /// Fold the game's `diagnostics` rows into the mod list: `effective` and `diagnosis` come from
+    /// the game, which is the only thing that knows which folder it actually reads.
+    static func diagnosed(_ mods: [InstalledModItem],
+                          from rows: Any?) -> [InstalledModItem] {
+        guard let rows = rows as? [[String: Any]] else { return mods }
+        var byId: [String: (Bool, String)] = [:]
+        for row in rows {
+            guard let id = row["id"] as? String else { continue }
+            byId[id] = (row["effective"] as? Bool ?? false,
+                        row["verdict"] as? String ?? "")
+        }
+        return mods.map { mod in
+            guard let (effective, verdict) = byId[mod.id] else { return mod }
+            return mod.diagnosed(effective: effective, diagnosis: verdict)
         }
     }
 
@@ -228,7 +267,16 @@ final class ModStore: ObservableObject {
         let reply = await command(["action": "toggle", "id": modId, "enabled": enabled])
         if let err = reply["error"] as? String { return err }
         if let raw = reply["mods"] as? [[String: Any]] {
-            installed = raw.compactMap(InstalledModItem.init)
+            // The toggle reply carries no diagnostics: keep the ones already on screen rather than
+            // blanking every warning line until the next reload.
+            let known = Dictionary(uniqueKeysWithValues: installed.compactMap { mod -> (String, InstalledModItem)? in
+                guard mod.effective != nil else { return nil }
+                return (mod.id, mod)
+            })
+            installed = raw.compactMap(InstalledModItem.init).map { fresh in
+                guard let old = known[fresh.id] else { return fresh }
+                return fresh.diagnosed(effective: old.effective ?? false, diagnosis: old.diagnosis)
+            }
         }
         return nil
     }
@@ -526,6 +574,16 @@ struct ModsSectionView: View {
                                 }
                                 if let clash = mod.clashWarning {
                                     Text(clash).font(Theme.sans(11)).foregroundStyle(Theme.danger)
+                                }
+                                // The game's own answer, when it disagrees with the switch: a mod
+                                // that is on but reads from a folder the game never opens, or one
+                                // the porter could only carry assets from. This is the line that
+                                // turns "mods don't work" into something the player can act on.
+                                if mod.effective == false, !mod.diagnosis.isEmpty {
+                                    Label(mod.diagnosis, systemImage: "exclamationmark.triangle.fill")
+                                        .font(Theme.sans(11))
+                                        .foregroundStyle(Theme.warnText)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
                             Spacer(minLength: 8)

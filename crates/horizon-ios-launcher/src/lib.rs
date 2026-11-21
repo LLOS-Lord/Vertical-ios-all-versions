@@ -67,6 +67,27 @@ pub fn covered() -> bool {
     COVERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `ProcessInfo.processInfo.thermalState.rawValue`, as the Swift side last reported it: 0 nominal,
+/// 1 fair, 2 serious, 3 critical. The game's thermal governor reads it every frame
+/// (`game/thermal.rs`).
+///
+/// The launcher's bridge sets it, because it is the only code in the app that can see UIKit's
+/// notifications; the game only ever reads the atomic, so a report landing mid-frame is a torn
+/// read of one `Relaxed` integer at worst, and the governor's hysteresis absorbs it.
+static THERMAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Report the device's thermal state (0..=3, Apple's own scale). Called from the launcher's bridge
+/// on `thermalStateDidChangeNotification` and once at start.
+pub fn set_thermal_state(raw: i32) {
+    THERMAL.store(raw.clamp(0, 3), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The last reported thermal state, `None` where nothing reports one (every desktop).
+pub fn thermal_state() -> Option<i64> {
+    let raw = THERMAL.load(std::sync::atomic::Ordering::Relaxed);
+    (raw > 0).then_some(i64::from(raw))
+}
+
 /// Queue a request for the game's next frame.
 pub fn push(request: Request) {
     QUEUE

@@ -1,0 +1,16 @@
+[package]
+name = "horizon-version-truth"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Decides, from the files on disk, whether an installed Minecraft version is really that version: a 26.3 simulation base relabelled as another version is reported as such and refused"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

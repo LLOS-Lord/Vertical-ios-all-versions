@@ -12,6 +12,9 @@ mod motion;
 mod optical_flow;
 
 use glam::{DMat4, DVec3, Mat4};
+use horizon_frame_sched::{
+    Admission, Decision, DeviceProfile, FrameGenSettings, Measurements, ThermalAction,
+};
 use std::{
     sync::{
         Arc,
@@ -23,7 +26,14 @@ use std::{
 };
 
 /// Frames to draw into: a pair being drawn, a pair waiting and a pair being shown.
-const FRAMES: usize = 6;
+///
+/// Three pairs is thirty-three megabytes each at an iPhone's 3x scale: two is the most a phone's
+/// memory can spare beside the world, and the render thread waiting for a free pair is bounded by
+/// `Admission::present_timeout_ms`, so it does not need a third.
+const FRAMES: usize = 3;
+/// A present thread that misses this many timeouts in a row is stopped: a slow thread must not
+/// keep costing a timeout every frame.
+const STALL_STRIKES: u8 = 3;
 
 /// `HORIZON_FRAMEGEN_DEBUG=generated`: show only made frames (AMD's debug view), so a
 /// screenshot or an offscreen frame is the made one; `motion`: the same, each made frame
@@ -45,6 +55,31 @@ fn debug() -> Option<&'static str> {
 
 pub struct FrameGen {
     pub on: bool,
+    /// The device this renderer runs on: one answer for the admission and for the memory governor.
+    device: DeviceProfile,
+    /// Whether the next frame may be generated, and the timeout the render thread may wait for the
+    /// present thread: `horizon-frame-sched`'s policy, from this frame's measurements.
+    admission: Admission,
+    /// The setting as last given to `set_frame_generation`, which is what the admission follows: the
+    /// user's switch, not `on` — that one also goes down on a thermal suspension and would latch.
+    setting_on: bool,
+    /// How long last frame waited for a free pair, ms: the admission's stall input, and the number
+    /// the performance overlay reports.
+    waited_ms: f32,
+    /// `display_hz` is the panel's rate as measured from the real frames' arrival, when the
+    /// window's monitor does not say (an iPhone reports nominal 60 on a ProMotion panel and
+    /// presents at 120, so the monitor alone is not trusted).
+    measured_hz: f32,
+    /// The last decision, so `present` knows how long the made frame is worth showing and the
+    /// renderer can log a change once.
+    decision: Decision,
+    /// Consecutive frames whose wait for a free pair timed out.
+    stalls: u8,
+    /// The display's refresh rate, Hz, when the window's monitor reports it (ProMotion is 120).
+    display_hz: f32,
+    /// A thermal step's forced suspension: the governor's `suspend_frame_gen`, which outranks the
+    /// setting until it lifts.
+    thermal_suspend: bool,
     /// The present thread failed to show a frame (or died): until the renderer has
     /// acquired a frame itself, the normal path runs and handles the surface.
     pub paused: bool,
@@ -102,7 +137,27 @@ pub struct Camera {
 
 impl FrameGen {
     pub fn new() -> Self {
+        Self::with_device(DeviceProfile::desktop(8192))
+    }
+
+    /// Frame generation for the device the game runs on: an A11 never offers it, a ProMotion iPad
+    /// has the window it needs to fill.
+    pub fn with_device(device: DeviceProfile) -> Self {
         Self {
+            device,
+            admission: Admission::new(device, FrameGenSettings::Auto),
+            decision: Decision {
+                generate: false,
+                multiplier: 1.0,
+                present_timeout_ms: 4.0,
+                reason: horizon_frame_sched::Reason::Off,
+            },
+            stalls: 0,
+            display_hz: 60.0,
+            measured_hz: 0.0,
+            thermal_suspend: false,
+            setting_on: false,
+            waited_ms: 0.0,
             on: false,
             paused: false,
             gpu: None,
@@ -228,17 +283,128 @@ impl FrameGen {
         let presenter = self.presenter.get_or_insert_with(|| {
             Presenter::start(device, queue, surface.clone(), window.clone(), config)
         });
-        // A closed channel: the thread died.
+        // A closed channel: the thread died. Two free pairs are taken with the admission's timeout,
+        // never with a blocking `recv`: a present thread that is late (a hot SoC, a background app,
+        // a 60 Hz panel given a 120 Hz pair) must cost a missed made frame, not a frozen game.
         let pair = if presenter.failed() {
             None
         } else {
-            presenter.free.recv().ok().zip(presenter.free.recv().ok())
+            let timeout = Duration::from_secs_f32(self.decision.present_timeout_ms.max(0.5) / 1000.0);
+            let first = presenter.free.recv_timeout(timeout).ok();
+            first.and_then(|a| presenter.free.recv_timeout(timeout).ok().map(|b| (a, b)))
         };
         if pair.is_none() {
-            self.stop();
-            self.paused = true;
+            // One late frame is a hiccup; the present thread being late every frame is a stall the
+            // player feels, so it is stopped and the renderer presents as it does without frame
+            // generation (`paused`, cleared when the renderer acquires a frame itself).
+            self.stalls = self.stalls.saturating_add(1);
+            if presenter.failed() || self.stalls >= STALL_STRIKES {
+                self.stop();
+                self.paused = true;
+                self.stalls = 0;
+            }
+            // Tell the admission the present thread made this frame wait: it suspends generation
+            // until the thread has caught up.
+            self.admission.scene_reset();
         }
         pair
+    }
+
+    /// One real frame's measurements in, this frame's decision out: whether to make a frame, the
+    /// multiplier, and the longest the render thread may wait for the present thread.
+    ///
+    /// `present_wait_ms` is how long `frames` waited for a free pair last frame (0 when it did not
+    /// wait), and `made_share` is what the renderer has shown. `in_world` and `external_post` are
+    /// the renderer's own preconditions: no made frame over a menu, a shader pack's post pass or HDR.
+    pub fn decide(
+        &mut self,
+        real_ms: f32,
+        gpu_ms: Option<f32>,
+        display_hz: f32,
+        present_wait_ms: f32,
+        in_world: bool,
+        external_post: bool,
+    ) -> Decision {
+        if self.admission.settings() != self.settings() {
+            self.admission.reconfigure(self.settings());
+        }
+        let reported = if display_hz.is_finite() && display_hz >= 24.0 {
+            display_hz
+        } else {
+            60.0
+        };
+        // The panel's real rate: what the real frames actually arrive at, over the last second. A
+        // monitor that says 120 is believed; a monitor that says 60 while frames arrive every 8.3 ms
+        // is a ProMotion panel at 120 and its 60 is a nominal figure, so the arrivals win there.
+        if real_ms > 0.0 && real_ms < 250.0 {
+            let hz = 1000.0 / real_ms;
+            self.measured_hz = if self.measured_hz == 0.0 {
+                hz
+            } else {
+                self.measured_hz * 0.9 + hz * 0.1
+            };
+        }
+        self.display_hz = if reported > self.measured_hz * 1.25 || self.measured_hz < 24.0 {
+            reported
+        } else {
+            self.measured_hz.max(reported.min(60.0))
+        };
+        self.waited_ms = present_wait_ms;
+        let measurements = Measurements {
+            real_ms: real_ms.max(0.1),
+            gpu_ms,
+            made_share: self.made_share.unwrap_or(0.0),
+            display_hz: self.display_hz,
+            present_wait_ms,
+        };
+        let suppressed = self.thermal_suspend;
+        let mut decision = self.admission.observe(&measurements, in_world, external_post);
+        if suppressed && decision.generate {
+            decision.generate = false;
+            decision.reason = horizon_frame_sched::Reason::Unsupported;
+        }
+        self.decision = decision;
+        decision
+    }
+
+    /// The thermal governor's verdict: a hot SoC stops frame generation whatever the setting says,
+    /// because it is the most expensive optional work the renderer can be doing.
+    pub fn set_thermal(&mut self, action: ThermalAction) {
+        self.thermal_suspend = action.suspend_frame_gen;
+        if action.suspend_frame_gen {
+            self.stop();
+        }
+    }
+
+    /// Whether this frame must generate, as decided by [`FrameGen::decide`].
+    pub fn generating(&self) -> bool {
+        self.decision.generate && self.on && !self.paused && !self.thermal_suspend
+    }
+
+    /// The user's setting: `Renderer::set_frame_generation` passes it through here, so a thermal
+    /// suspension (which writes `on`) can be lifted without losing the choice.
+    pub fn set_setting(&mut self, on: bool) {
+        self.setting_on = on;
+        self.on = on && !self.thermal_suspend;
+    }
+
+    /// Who this renderer is running on. Called once, before the first frame, by the renderer that
+    /// built with `FrameGen::new`.
+    pub fn profile(&mut self, device: DeviceProfile, promotion: bool) {
+        self.device = DeviceProfile {
+            promotion,
+            ..device
+        };
+        self.admission = Admission::new(self.device, self.settings());
+    }
+
+    /// The user's setting, as the admission understands it.
+    fn settings(&self) -> FrameGenSettings {
+        if self.setting_on {
+            FrameGenSettings::Auto
+        } else {
+            FrameGenSettings::Off
+        }
     }
 
     /// The world's target at the screen's size this frame, where `Post::finish` draws.
@@ -351,6 +517,10 @@ impl FrameGen {
     /// Hand this frame's pair to the present thread, after the frame's submission: the
     /// made frame (when `made`) goes first.
     pub fn present(&mut self, real: wgpu::Texture, generated: wgpu::Texture, made: bool) {
+        // A made frame is only shown while the real frames still fit the display's window: once
+        // they do not (the GPU fell behind, the device got hot), presenting it puts an older
+        // picture on the screen than the one already in hand.
+        let made = made && self.generating();
         let now = Instant::now();
         if let Some(last) = self.last {
             // A real frame's time, smoothed: the made frame shows for half of it.
@@ -390,6 +560,21 @@ impl FrameGen {
             }
         };
         let _ = send.send(pair);
+    }
+
+    /// The frame rate the panel is really running at, Hz, as the real frames arrive.
+    pub fn measured_hz(&self) -> f32 {
+        self.measured_hz
+    }
+
+    /// How long last frame waited for the present thread, ms: 0 when it did not.
+    pub fn waited_ms(&self) -> f32 {
+        self.waited_ms
+    }
+
+    /// The device profile the admission is using, once `profile` has been called.
+    pub fn device(&self) -> DeviceProfile {
+        self.device
     }
 }
 

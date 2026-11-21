@@ -1045,5 +1045,7 @@
   "horizon.studio.topbar.add_marker": "Thêm điểm đánh dấu",
   "horizon.studio.topbar.clear_keyframes": "🗑 Xóa điểm khóa",
   "horizon.studio.topbar.timeline_hud": "⏱ Dòng thời gian",
-  "horizon.studio.topbar.split_scene": "Tách cảnh"
+  "horizon.studio.topbar.split_scene": "Tách cảnh",
+  "horizon.options.touch.interact": "Dùng",
+  "horizon.options.touch.dismount": "Xuống ngựa"
 }

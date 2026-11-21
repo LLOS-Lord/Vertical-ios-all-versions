@@ -129,6 +129,8 @@
   "horizon.options.touch.hotbar": "Hotbar",
   "horizon.options.touch.custom": "Custom Button",
   "horizon.options.touch.stick": "Stick",
+  "horizon.options.touch.interact": "Use",
+  "horizon.options.touch.dismount": "Dismount",
   "horizon.options.chat_delay": "Chat Delay",
   "horizon.options.lightbar.health": "Health",
   "horizon.options.lightbar.dimension": "Dimension",

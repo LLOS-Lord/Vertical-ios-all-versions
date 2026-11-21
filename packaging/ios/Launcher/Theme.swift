@@ -28,6 +28,12 @@ enum Theme {
     static let noticeBorder = accent.opacity(0.18)
     static let ready = Color.green
     static let warn = Color.orange
+    /// `warn` as text: orange reads on both themes but needs a touch more presence in light mode.
+    static let warnText = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 1.00, green: 0.62, blue: 0.24, alpha: 1)
+            : UIColor(red: 0.62, green: 0.30, blue: 0.00, alpha: 1)
+    })
     static let danger = Color.red
     static let splash = Color.yellow
     static let splashShadow = Color.black.opacity(0.3)

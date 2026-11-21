@@ -22,6 +22,17 @@ horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
 # Extension points for the crates above the engine (docs/layers.md, "How a Horizon crate plugs in").
 horizon-hooks = { path = "../horizon-hooks" }
+# RAM ceilings and cache eviction (enhancement #2), and the device/tier policy the frame
+# scheduler and the memory governor share.
+horizon-memory-governor = { path = "../horizon-memory-governor" }
+horizon-frame-sched = { path = "../horizon-frame-sched" }
+# Touch feel: look smoothing, pixel-accurate scrolling, gesture classification (bug 4).
+horizon-touch-pipeline = { path = "../horizon-touch-pipeline" }
+# Whether an installed version is really that version, or 26.3's tables under another label (bug 3).
+horizon-version-truth = { path = "../horizon-version-truth" }
+# Why an installed mod does or does not change the game (bug 1): mods land in a folder the game
+# never reads, and the porter carries assets only.
+horizon-mod-diagnostics = { path = "../horizon-mod-diagnostics" }
 # OptiFine-format pack files: custom entity models, random entity textures.
 horizon-optifine = { path = "../horizon-optifine" }
 # The server thread ahead of the workers (MinecraftServer.spin's Thread.setPriority).

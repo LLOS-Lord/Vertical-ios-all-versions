@@ -38,6 +38,12 @@ pub enum Control {
     Custom(u16),
     /// The analog stick that replaces the D-pad: a finger on it moves at its own angle and speed.
     Stick,
+    /// Use, held: what a right click does. On a phone this is how a villager's trades, a horse's
+    /// saddle or an anvil are reached — the world tap sends one short click, which the game's own
+    /// pick does not always give an entity.
+    Interact,
+    /// Off the mount: the vanilla shift-and-dismount, without the keyboard.
+    Dismount,
 }
 
 impl Control {
@@ -109,6 +115,10 @@ pub fn layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
         (Control::Right, [cx + s, cy, s, s]),
         (Control::Back, [cx, cy + s, s, s]),
         (Control::Jump, [w - MARGIN - s, cy, s, s]),
+        // Above jump: use, then (while riding) off the mount. The same column, so a thumb reaches
+        // all three without crossing the screen.
+        (Control::Interact, [w - MARGIN - s, cy - s - 8.0, s, s]),
+        (Control::Dismount, [w - MARGIN - s, cy - 2.0 * (s + 8.0), s, s]),
     ];
     let top = [
         Control::Perspective,
@@ -320,6 +330,8 @@ pub fn styled(control: Control) -> bool {
             | Control::Pause
             | Control::HideHud
             | Control::Inventory
+            | Control::Interact
+            | Control::Dismount
     )
 }
 
@@ -337,6 +349,8 @@ pub fn can_hide(control: Control) -> bool {
             | Control::Perspective
             | Control::Chat
             | Control::Inventory
+            | Control::Interact
+            | Control::Dismount
     )
 }
 
@@ -344,6 +358,12 @@ pub fn can_hide(control: Control) -> bool {
 /// places it) and the stick (sized on the Touch Controls page).
 pub fn editable(control: Control) -> bool {
     !matches!(control, Control::Hotbar(_) | Control::Stick)
+}
+
+/// Whether a button only appears while it can do something: Interact is on screen in a world (it
+/// is the right click a phone otherwise has no way to give), and Dismount only while riding.
+pub fn conditional(control: Control) -> bool {
+    matches!(control, Control::Dismount)
 }
 
 /// The colors a button's background and stroke can take, with the names the options page shows. Packed as
@@ -399,6 +419,8 @@ pub fn control_name(control: Control) -> Option<&'static str> {
         Control::HideHud => "hide_hud",
         Control::Inventory => "inventory",
         Control::Stick => "stick",
+        Control::Interact => "interact",
+        Control::Dismount => "dismount",
         Control::Hotbar(_) | Control::Custom(_) => return None,
     })
 }
@@ -417,6 +439,8 @@ pub fn control_from_name(name: &str) -> Option<Control> {
         "hide_hud" => Control::HideHud,
         "inventory" => Control::Inventory,
         "stick" => Control::Stick,
+        "interact" => Control::Interact,
+        "dismount" => Control::Dismount,
         _ => return None,
     })
 }
@@ -438,6 +462,8 @@ pub fn control_caption(control: Control) -> &'static str {
         Control::Hotbar(_) => "horizon.options.touch.hotbar",
         Control::Custom(_) => "horizon.options.touch.custom",
         Control::Stick => "horizon.options.touch.stick",
+        Control::Interact => "horizon.options.touch.interact",
+        Control::Dismount => "horizon.options.touch.dismount",
     }
 }
 
@@ -467,6 +493,16 @@ pub struct TouchSettings {
     pub stick_opacity: f32,
     /// How a finger acts over a menu.
     pub pointer: PointerMode,
+    /// Whether the player is riding something: Dismount's button is on screen only then, and the
+    /// game sets this each frame (`Game::touch_affordances`).
+    pub riding: bool,
+    /// Frames a burst of look motion is spread over (`horizon_touch_pipeline::LookSmoother`).
+    ///
+    /// UIKit delivers a finger's motion in bursts: three samples in one frame at 120 Hz, none in
+    /// the next. Handed to the camera raw, that is the judder every iPhone player reports. 1 is
+    /// raw — the choice for a player who wants the camera to stop the instant the finger does (it
+    /// costs aim precision at high sensitivity); 2 to 3 is the default range.
+    pub look_smoothing: u8,
     /// Whether a finger on the world itself taps to use and holds to mine. Turned off, touching the screen
     /// only turns the view: a player whose layout maps the mouse buttons interacts through those.
     pub interact: bool,
@@ -486,9 +522,20 @@ impl Default for TouchSettings {
             stick_scale: 1.0,
             stick_opacity: 1.0,
             pointer: PointerMode::Direct,
+            riding: false,
+            look_smoothing: 2,
             interact: true,
         }
     }
+}
+
+/// A whole number in `lo..=hi`, or `default` when the line is not one.
+fn clamp_unit_usize(value: &str, default: u8, lo: u8, hi: u8) -> u8 {
+    value
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .map_or(default, |v| v.clamp(lo, hi))
 }
 
 fn clamp_unit(value: &str, default: f32, lo: f32, hi: f32) -> f32 {
@@ -658,6 +705,10 @@ impl TouchSettings {
                         s.interact = false;
                     }
                 }
+                // `look:<frames>`: how many frames a burst of look motion is spread over (1 is raw).
+                "look" => {
+                    s.look_smoothing = clamp_unit_usize(value, 2, 1, 4);
+                }
                 // `stick:<scale>:<opacity>`, as `serialize` writes it.
                 "stick" => {
                     if let Some((scale, opacity)) = value.split_once(':') {
@@ -735,6 +786,8 @@ impl TouchSettings {
                 Control::Pause,
                 Control::HideHud,
                 Control::Inventory,
+                Control::Interact,
+                Control::Dismount,
             ] {
                 let mut style = self.style(control);
                 style.width *= scale;
@@ -763,6 +816,9 @@ impl TouchSettings {
         }
         if !self.interact {
             text.push_str("interact:off\n");
+        }
+        if self.look_smoothing != 2 {
+            text.push_str(&format!("look:{}\n", self.look_smoothing));
         }
         if self.stick_scale != 1.0 || self.stick_opacity != 1.0 {
             text.push_str(&format!(
@@ -912,6 +968,11 @@ impl TouchSettings {
         }
     }
     pub fn visible(&self, control: Control) -> bool {
+        // Dismount is only there while there is something to dismount: a button that does nothing
+        // over a thumb's reach is worse than no button.
+        if control == Control::Dismount && !self.riding {
+            return false;
+        }
         matches!(
             control,
             Control::Hotbar(_)
@@ -1697,6 +1758,42 @@ mod tests {
     }
 
     #[test]
+    fn look_smoothing_round_trips_and_only_writes_a_non_default() {
+        let mut s = TouchSettings::default();
+        assert_eq!(s.look_smoothing, 2, "smoothing is on by default");
+        assert!(!s.serialize().contains("look:"), "the default writes nothing");
+        for n in 1..=4u8 {
+            s.look_smoothing = n;
+            assert_eq!(TouchSettings::parse(&s.serialize()).look_smoothing, n);
+        }
+        // A file that says something out of range is the nearest usable value, not zero frames.
+        assert_eq!(TouchSettings::parse("look:0\n").look_smoothing, 1);
+        assert_eq!(TouchSettings::parse("look:9\n").look_smoothing, 4);
+        assert_eq!(TouchSettings::parse("look:no\n").look_smoothing, 2);
+    }
+
+    #[test]
+    fn dismount_is_only_on_screen_while_there_is_a_mount() {
+        let mut s = TouchSettings::default();
+        let names = |v: &Vec<(Control, Rect)>| v.iter().map(|(c, _)| *c).collect::<Vec<_>>();
+        assert!(!names(&s.layout(633.0, 292.0)).contains(&Control::Dismount));
+        s.riding = true;
+        let riding = s.layout(633.0, 292.0);
+        assert!(names(&riding).contains(&Control::Dismount));
+        // Above Use, which is above Jump: one column for the thumb.
+        let (jump, use_, off) = (
+            placed(&riding, Control::Jump),
+            placed(&riding, Control::Interact),
+            placed(&riding, Control::Dismount),
+        );
+        assert!(off[1] < use_[1] && use_[1] < jump[1]);
+        assert!((off[0] - jump[0]).abs() < 0.01);
+        // Hiding it by hand still wins.
+        s.set_hidden(Control::Dismount, true);
+        assert!(!names(&s.layout(633.0, 292.0)).contains(&Control::Dismount));
+    }
+
+    #[test]
     fn a_layout_keeps_its_profile_name() {
         let mut s = TouchSettings::default();
         assert_eq!(s.profile, DEFAULT_PROFILE);
@@ -1835,9 +1932,13 @@ mod tests {
         // A cancelled finger lets go of what it held.
         t.start(3, centre, 2.0, &l, &swipes);
         assert_eq!(t.cancel(3), [Out::Release(Control::Custom(id))]);
-        // A button that is not swipeable keeps its keys held even as the finger slides off.
+        // A button that is not swipeable keeps its keys held even as the finger slides off. The
+        // slide also turns the view (a held button is a place to aim from), so what must not
+        // happen is a release, not any output at all.
         t.start(4, centre, 3.0, &l, NO_SWIPES);
-        assert_eq!(t.moved(4, outside, &l, NO_SWIPES), []);
+        let out = t.moved(4, outside, &l, NO_SWIPES);
+        assert!(!out.iter().any(|o| matches!(o, Out::Release(_))), "{out:?}");
+        assert_eq!(out, [Out::Look(outside.0 - centre.0, 0.0)]);
         assert!(t.held(Control::Custom(id)));
         assert_eq!(t.end(4), [Out::Release(Control::Custom(id))]);
     }
@@ -1896,7 +1997,11 @@ mod tests {
         s.set_hidden(Control::Chat, true);
         let l = s.layout(633.0, 292.0);
         assert!(!l.iter().any(|(c, _)| *c == Control::Chat));
-        assert_eq!(l.len(), layout(633.0, 292.0).len() - 1);
+        // Against the same settings with nothing hidden: the free `layout()` is not a baseline any
+        // more, because a layout also drops the conditional buttons (Dismount, while not riding).
+        let all = TouchSettings::default().layout(633.0, 292.0);
+        assert_eq!(l.len(), all.len() - 1);
+        assert!(all.iter().any(|(c, _)| *c == Control::Chat));
     }
 
     #[test]

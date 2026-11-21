@@ -13,6 +13,8 @@ description = "Reusable client systems, control tool and parity probes"
 path = "../horizon-client/src/client_lib.rs"
 
 [dependencies]
+# Whether an installed version is really that version, or 26.3's tables under another label.
+horizon-version-truth = { path = "../horizon-version-truth" }
 horizon-cosmetics = { path = "../horizon-cosmetics" }
 horizon-friends = { path = "../horizon-friends" }
 horizon-assets = { path = "../horizon-assets" }

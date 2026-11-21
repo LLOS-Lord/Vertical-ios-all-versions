@@ -1,0 +1,14 @@
+[package]
+name = "horizon-gpu-governor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Keeps the GPU from being over-driven: a frame-time governor with headroom detection and hysteresis, a draw-call and triangle budget, and the submit-order buckets Apple's tile-based GPUs require (opaque, alpha-tested, translucent — never interleaved)"
+
+[dependencies]
+horizon-frame-sched = { path = "../horizon-frame-sched" }
+horizon-importance = { path = "../horizon-importance" }
+
+[lints]
+workspace = true

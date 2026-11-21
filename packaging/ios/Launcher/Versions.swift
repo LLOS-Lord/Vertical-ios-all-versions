@@ -17,6 +17,14 @@ struct InstalledGameVersion: Identifiable, Equatable {
     let files: Int
     let bytes: Int64
     let notes: String
+    /// What the tree really is, computed by `horizon-version-truth` from the files themselves.
+    /// `native` / `ported` / `cosmetic` / `broken`.
+    let verdict: String
+    /// The badge for `verdict` ("Native", "Full port", "Assets only", "Incomplete").
+    let badge: String
+    let truthDetail: String
+    /// What the installer still has to do for a tree that is not native, in order.
+    let remaining: [String]
 
     init?(_ json: [String: Any]) {
         guard let id = json["id"] as? String, !id.isEmpty else { return nil }
@@ -33,7 +41,16 @@ struct InstalledGameVersion: Identifiable, Equatable {
         files = (json["files"] as? NSNumber)?.intValue ?? 0
         bytes = (json["bytes"] as? NSNumber)?.int64Value ?? 0
         notes = json["notes"] as? String ?? ""
+        verdict = json["verdict"] as? String ?? "unknown"
+        badge = json["badge"] as? String ?? ""
+        truthDetail = json["truth_detail"] as? String ?? ""
+        remaining = json["remaining"] as? [String] ?? []
     }
+
+    /// Whether the version's *name* is what its tables are. False for the bug this field exists
+    /// for: a 1.20.1 folder holding 26.3's simulation tables played as 26.3 while the lobby said
+    /// 1.20.1. Shown instead of the claim whenever it disagrees.
+    var isTruthful: Bool { verdict == "native" || verdict == "ported" }
 
     var badgeText: String {
         switch supportTier {
@@ -45,11 +62,27 @@ struct InstalledGameVersion: Identifiable, Equatable {
     }
 
     var badgeTone: Chip.Tone {
+        // The verdict wins over the tier: a tree that is only assets must not wear a green chip
+        // however good its support tier reads.
+        switch verdict {
+        case "native", "ported": if ready { return .good }
+        case "cosmetic", "broken": return .warn
+        default: break
+        }
         if !ready { return .warn }
         switch supportTier {
         case "native-26.3", "protocol-adapter": return .good
         default: return .quiet
         }
+    }
+
+    /// The chip's text: the honest one when the tree and the label disagree.
+    var statedBadge: String { badge.isEmpty ? badgeText : badge }
+
+    /// "Assets only: 3 steps left (generate-tables, adapt-tables, unpack-assets)", or empty.
+    var remainingText: String {
+        guard !remaining.isEmpty else { return "" }
+        return "\(remaining.count) step\(remaining.count == 1 ? "" : "s") left: \(remaining.joined(separator: ", "))"
     }
 }
 
@@ -386,6 +419,8 @@ struct VersionBrowserSheet: View {
     @State private var customZipURL = ""
     @State private var customZipVersion = "26.3"
     @State private var customCatalogURL = ""
+    /// The version waiting on the "this is not really that version" confirmation.
+    @State private var confirmCosmetic: InstalledGameVersion?
 
     enum BrowserTab: String, CaseIterable, Identifiable {
         case installed = "Installed"
@@ -458,6 +493,27 @@ struct VersionBrowserSheet: View {
             await store.loadMojang(kind: mojangFilter, query: query)
             await store.loadCatalog()
         }
+        // The one confirmation the truth verdict gates: playing a tree whose simulation is another
+        // version's. Cancel leaves the active version alone.
+        .alert(
+            "This is not really \(confirmCosmetic?.id ?? "")",
+            isPresented: Binding(
+                get: { confirmCosmetic != nil },
+                set: { if !$0 { confirmCosmetic = nil } }
+            ),
+            presenting: confirmCosmetic
+        ) { ver in
+            Button("Use anyway") {
+                Haptics.tap()
+                confirmCosmetic = nil
+                Task { await store.select(ver.id) { await link.refresh() } }
+            }
+            Button("Cancel", role: .cancel) { confirmCosmetic = nil }
+        } message: { ver in
+            Text(
+                "\(ver.truthDetail)\n\nYour textures and sounds are \(ver.id)'s. The blocks, items, mobs and world format are another version's, so a world you make here is not a \(ver.id) world."
+            )
+        }
         .accessibilityIdentifier("launcher-version-browser")
     }
 
@@ -507,7 +563,7 @@ struct VersionBrowserSheet: View {
                                 if ver.active {
                                     Chip(tone: .good, text: "Active")
                                 }
-                                Chip(tone: ver.badgeTone, text: ver.badgeText)
+                                Chip(tone: ver.badgeTone, text: ver.statedBadge)
                             }
                             HStack(spacing: 6) {
                                 Text(ver.source)
@@ -519,6 +575,18 @@ struct VersionBrowserSheet: View {
                                 }
                             }
                             .font(Theme.mono(10)).foregroundStyle(Theme.textMuted)
+                            // The truth line: what this tree actually is, and what is left to do.
+                            // A version whose label its tables do not back says so here rather
+                            // than in a note nobody reads.
+                            if !ver.isTruthful, !ver.truthDetail.isEmpty {
+                                Text(ver.truthDetail)
+                                    .font(Theme.sans(11)).foregroundStyle(Theme.warnText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if !ver.remainingText.isEmpty {
+                                    Text(ver.remainingText)
+                                        .font(Theme.mono(10)).foregroundStyle(Theme.textMuted)
+                                }
+                            }
                             if !ver.notes.isEmpty {
                                 Text(ver.notes).font(Theme.sans(11)).foregroundStyle(Theme.textFaint).lineLimit(2)
                             }
@@ -539,8 +607,15 @@ struct VersionBrowserSheet: View {
                         } else if !ver.active {
                             Button("Use") {
                                 Haptics.tap()
-                                Task {
-                                    await store.select(ver.id) { await link.refresh() }
+                                // A tree whose tables are another version's may be played — its
+                                // textures are real — but the player is told once, plainly, rather
+                                // than discovering it inside a world saved as 1.20.1.
+                                if ver.verdict == "cosmetic" || ver.verdict == "broken" {
+                                    confirmCosmetic = ver
+                                } else {
+                                    Task {
+                                        await store.select(ver.id) { await link.refresh() }
+                                    }
                                 }
                             }
                             .buttonStyle(.borderedProminent)

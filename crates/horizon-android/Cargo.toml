@@ -27,6 +27,17 @@ horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
 horizon-hooks = { path = "../horizon-hooks" }
+# The priority ladder, the GPU submit governor and the mod shim table: the shared gameplay sources
+# above now name them, so Android's workspace must carry them too (tools/check_android_manifest.py).
+horizon-importance = { path = "../horizon-importance" }
+horizon-gpu-governor = { path = "../horizon-gpu-governor" }
+horizon-mod-shim = { path = "../horizon-mod-shim" }
+# Added by the RAM/thermal work: the budget and the diagnostics read them from the gameplay sources.
+horizon-frame-sched = { path = "../horizon-frame-sched" }
+horizon-memory-governor = { path = "../horizon-memory-governor" }
+horizon-mod-diagnostics = { path = "../horizon-mod-diagnostics" }
+horizon-touch-pipeline = { path = "../horizon-touch-pipeline" }
+horizon-version-truth = { path = "../horizon-version-truth" }
 horizon-perf-format = { path = "../horizon-perf-format" }
 horizon-system = { path = "../horizon-system" }
 crc32fast = "1"

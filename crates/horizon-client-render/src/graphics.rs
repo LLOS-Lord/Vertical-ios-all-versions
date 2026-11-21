@@ -412,6 +412,11 @@ pub enum FrameGeneration {
 }
 impl FrameGeneration {
     pub const ALL: [FrameGeneration; 2] = [FrameGeneration::Off, FrameGeneration::Fsr31];
+    /// Whether any generation is on. The one predicate the overlay, the scheduler's admission
+    /// check and the thermal governor all ask, so "off" can never be mistaken for a mode.
+    pub fn is_on(self) -> bool {
+        self != FrameGeneration::Off
+    }
     pub fn name(self) -> &'static str {
         match self {
             FrameGeneration::Off => "off",

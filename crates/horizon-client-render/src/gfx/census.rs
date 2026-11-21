@@ -9,6 +9,47 @@ use super::{
 };
 
 impl Renderer {
+    /// The sections the last frame drew, and those it holds: the share on screen is what tells the
+    /// RAM budget whether releasing memory would only remesh what the player is looking at.
+    pub fn drawn_and_resident(&self) -> (usize, usize) {
+        (self.drawn_sections, self.sections.len())
+    }
+
+    /// Releases the chunk meshes of the sections behind the camera — or beyond it, when a long
+    /// render distance is turned suddenly — and returns the bytes their vertices held.
+    ///
+    /// The far terrain tiles are *not* touched here (they are `clear_lods`): they are what the
+    /// player sees at the horizon, and the budget drops them separately, first.
+    pub fn release_offscreen_sections(&mut self) -> u64 {
+        let on_screen: std::collections::HashSet<SectionKey> =
+            self.visible.iter().map(|v| v.key).collect();
+        if on_screen.len() >= self.sections.len() {
+            return 0;
+        }
+        let stride = std::mem::size_of::<TerrainVertex>() as u64;
+        let mut freed = 0u64;
+        let behind: Vec<SectionKey> = self
+            .sections
+            .iter()
+            .map(|(key, _, _)| key)
+            .filter(|key| !on_screen.contains(key) && !self.hold.holds(*key))
+            .collect();
+        for key in behind {
+            if let Some(s) = self.sections.find(key) {
+                freed += (s.solid_slots + u64::from(s.translucent) * 4) * stride;
+            }
+            self.release_section(key);
+        }
+        freed
+    }
+
+    /// Bytes of the block sprites and their mips. They are a *costly* cache, not a rebuildable
+    /// one: rebuilding them means reading the resource packs again, so the RAM budget reports them
+    /// and never drops them on its own.
+    pub fn sprite_bytes(&self) -> u64 {
+        self.sprite_textures.iter().map(texture_bytes).sum()
+    }
+
     /// Sections with GPU buffers, for soak tests watching residency.
     pub fn resident_sections(&self) -> usize {
         self.sections.len()

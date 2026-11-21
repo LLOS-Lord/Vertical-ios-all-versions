@@ -1,0 +1,12 @@
+[package]
+name = "horizon-frame-sched"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Frame pacing, frame-generation admission control and thermal-aware budgets shared by the renderer and the client (no GPU, no window: pure decisions, unit-tested)"
+
+[dependencies]
+
+[lints]
+workspace = true

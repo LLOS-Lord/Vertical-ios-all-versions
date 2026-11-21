@@ -257,6 +257,8 @@ mod maps;
 mod melee;
 mod memory;
 mod memory_warning;
+mod ram;
+mod thermal;
 mod menu_clicks;
 mod minecarts;
 #[cfg(test)]
@@ -2978,6 +2980,14 @@ struct Game<'a> {
     /// iOS memory warnings: how many came close together, and whether the
     /// render distance is lowered (game/memory_warning.rs).
     memory: memory_warning::Memory,
+    /// The game's RAM budget: the device's ceiling, its caches, and what each eviction drops
+    /// (game/ram.rs).
+    ram: ram::Budget,
+    /// Apple silicon's thermal state, and what a hot chip takes away (game/thermal.rs).
+    heat: thermal::Thermal,
+    /// When the RAM budget last ran (`ram_tick`), and whether the world-closed plan has run.
+    last_ram_tick: Option<Instant>,
+    ram_world_closed: bool,
     /// The F3 overlay's vertices between rebuilds (`draw_debug_overlay_under`).
     debug_paint: RefCell<horizon_client::debug_overlay::PaintCache>,
     /// The F3 overlay's last reading of the refresh rate, and when it was taken.
@@ -5594,6 +5604,9 @@ impl Game<'_> {
     /// come close together in a singleplayer world at a long distance.
     pub(super) fn on_memory_warning(&mut self, now: Instant) {
         self.streaming.release_memory();
+        // The RAM budget tightens with it: its next frame plans the eviction the warning asks for,
+        // and its mark stays low for ten seconds so the caches stay small until the pressure passes.
+        self.ram.warning();
         horizon_threads::release_free_memory();
         // A remote server's chunks are not ours to unload, and without a world
         // (or a player) there is no render distance in use. The warning still
@@ -5615,14 +5628,46 @@ impl Game<'_> {
     /// The restore side of [`Game::on_memory_warning`], once a quiet while has
     /// passed; leaving the world forgets the lowering.
     fn memory_tick(&mut self, now: Instant) {
+        self.heat_tick(now);
+        self.ram_tick(now);
         if self.player.is_none() {
             let lowered = self.memory.is_lowered();
             self.memory.close_world();
             if lowered {
                 self.apply_memory_radius();
             }
+            // Leaving the world: its derived caches go with it (far tiles, off-screen meshes, the
+            // workers' buffers). One-shot: the plan is made only on the frame the world is gone.
+            if !self.ram_world_closed {
+                self.ram_world_closed = true;
+                // The renderer the heat's action was applied to is gone; the next world's renderer
+                // must be told again rather than inherit nothing.
+                self.heat.world_closed();
+                let plan = self.ram.world_closed();
+                let mut freed = 0u64;
+                if plan.far_tiles
+                    && let Some(r) = self.renderer.as_mut()
+                {
+                    freed = freed.saturating_add(r.lod_quads().saturating_mul(32));
+                    r.clear_lods();
+                }
+                if plan.offscreen_sections
+                    && let Some(r) = self.renderer.as_mut()
+                {
+                    freed = freed.saturating_add(r.release_offscreen_sections());
+                }
+                if plan.scratch {
+                    self.streaming.release_memory();
+                }
+                self.ram.done(freed);
+                log::info!(
+                    "Horizon: RAM world closed — freed {} MiB",
+                    freed >> 20
+                );
+            }
             return;
         }
+        self.ram_world_closed = false;
         if self.memory.is_lowered() {
             // A dimension change or a view distance packet sets the radius
             // again: the lowering holds until it is restored.
@@ -5638,8 +5683,85 @@ impl Game<'_> {
         }
     }
     fn apply_memory_radius(&mut self) {
-        self.streaming.radius = self.memory.effective(self.settings.render_distance);
+        let by_memory = self.memory.effective(self.settings.render_distance);
+        self.streaming.radius = self.heat.effective_distance(self.settings.render_distance, by_memory);
     }
+
+    /// The thermal governor's frame (game/thermal.rs): what a hot device takes away, in the order
+    /// that costs the player least. It runs before the RAM budget because a thermal step frees
+    /// memory too (fewer sections, fewer particles), and because frame generation must be off
+    /// before the renderer measures the frame it would make.
+    fn heat_tick(&mut self, now: Instant) {
+        if !self.heat.tick(now) {
+            return;
+        }
+        let change = self.heat.take_change();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_thermal(self.heat.action());
+        }
+        // The world's resolution: Dynamic Resolution's floor moves with the heat, and its own
+        // measurement still decides where in the range the frame lands.
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_heat_scale_ceiling(self.heat.resolution_scale);
+        }
+        self.apply_memory_radius();
+        if change.is_some_and(|level| level == horizon_frame_sched::ThermalLevel::Nominal) {
+            self.system_message(horizon_client::text::Text::literal(
+                "The device has cooled down: full quality restored",
+            ));
+        }
+        log::info!("Horizon: thermal {}", self.heat.describe());
+    }
+
+    /// The RAM budget's frame (game/ram.rs): a census of what the game caches, and the evictions
+    /// that follow when it nears the device's ceiling. The census is cheap — the renderer's census
+    /// is arithmetic over counters it already keeps — and it is what turns "the game gets killed on
+    /// older iPhones at render distance 12" into a mark that is never reached.
+    fn ram_tick(&mut self, now: Instant) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let census = ram::Census {
+            mesh_bytes: renderer.section_vertex_bytes()[0],
+            visible_share: ram::visible_share(renderer),
+            lod_bytes: renderer.lod_quads().saturating_mul(32),
+            texture_bytes: renderer.sprite_bytes(),
+            scratch_bytes: self.streaming.scratch_bytes(),
+            world_bytes: self.streaming.world_bytes(),
+            // A column's sections, counted the way `ColumnLayout` lays them out.
+            sections: (self.world.chunks.len() as u64)
+                .saturating_mul(self.world.layout().sections() as u64),
+        };
+        let dt = self.last_ram_tick.map_or(0.016, |t| now.duration_since(t).as_secs_f32());
+        self.last_ram_tick = Some(now);
+        let Some(plan) = self.ram.frame(census, now, dt.min(0.25)) else {
+            return;
+        };
+        let mut freed = 0u64;
+        if plan.far_tiles
+            && let Some(r) = self.renderer.as_mut()
+        {
+            freed = freed.saturating_add(r.lod_quads().saturating_mul(32));
+            r.clear_lods();
+        }
+        if plan.offscreen_sections
+            && let Some(r) = self.renderer.as_mut()
+        {
+            freed = freed.saturating_add(r.release_offscreen_sections());
+        }
+        if plan.scratch {
+            self.streaming.release_memory();
+        }
+        self.ram.done(freed);
+        log::info!(
+            "Horizon: RAM {} — freed {} MiB, {}% of the {} MiB ceiling in use",
+            plan.cause.as_str(),
+            freed >> 20,
+            (self.ram.utilisation() * 100.0).round(),
+            self.ram.ceiling_mib()
+        );
+    }
+
     fn tick(&mut self) -> Result<()> {
         if self.agent.hold_server {
             return Ok(());
@@ -8464,6 +8586,24 @@ impl Game<'_> {
         }
         followed
     }
+    /// Whether the player is riding a tamed adult equine, so that Use means "open its inventory"
+    /// rather than "click it": vanilla's `AbstractHorse.mobInteract` opens the inventory on
+    /// shift + use for a tamed adult, and a phone has no shift.
+    ///
+    /// Deliberately narrow. A villager, a chest boat, a saddled pig or an untamed horse must get a
+    /// plain right click: sending them a sneak as well would turn a trade into a refusal.
+    fn ride_is_tamed(&self) -> bool {
+        let Some(id) = self.riding else {
+            return false;
+        };
+        let Some(m) = self.mobs.iter().find(|m| m.id == id) else {
+            return false;
+        };
+        !m.is_baby()
+            && m.extra.tame
+            && horizon_client::mobs::equine::is_equine(m.species())
+    }
+
     /// `Player.getVehicle().getBoundingBox()` for the local player's vehicle
     /// (`riding`): a mob, one of `object_target`'s kinds (boat, cart, armour
     /// stand, item frame, painting) or a tracked special — the same chain
@@ -12099,6 +12239,15 @@ impl<'a> Game<'a> {
             debug_options: None,
             memory_meter: Default::default(),
             memory: Default::default(),
+            // The device's ceiling: a 3 GB iPhone's derived caches are held to about 1.3 GiB, and a
+            // desktop's to 40% of its memory. `Renderer::device` settles the same profile for the
+            // frame scheduler, so the two budgets never disagree.
+            ram: ram::Budget::for_device(&ram::probe()),
+            heat: thermal::Thermal::new(
+                ram::probe_device().tier,
+            ),
+            last_ram_tick: None,
+            ram_world_closed: false,
             debug_paint: Default::default(),
             debug_refresh: Default::default(),
             gpu_utilization: 0.0,

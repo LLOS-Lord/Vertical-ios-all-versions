@@ -1,0 +1,12 @@
+[package]
+name = "horizon-touch-pipeline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Touch input for a phone: press latency, look smoothing that never drifts, list scrolling that follows the finger without juddering, and a gesture classifier that cannot mistake a drag for a tap"
+
+[dependencies]
+
+[lints]
+workspace = true
