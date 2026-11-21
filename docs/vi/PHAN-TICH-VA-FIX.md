@@ -587,3 +587,25 @@ Thay vào đó: chép **đúng 9 package block** của crate nội bộ từ `Ca
 theo (name, version) đúng thứ tự cargo, rồi để `cargo metadata --locked` thêm các **cạnh phụ thuộc**
 còn thiếu trong những package đã có. Kết quả: **+73 dòng, 0 dòng xoá** — chỉ thêm. `cargo metadata
 --locked` exit=0 và lockfile **không đổi**.
+
+## 10.5 Kết quả cuối — commit `601448c`, tất cả workflow xanh
+
+| Workflow | Kết quả |
+| --- | --- |
+| `build` | ✅ **completed / success** |
+| ⤷ Rust Guardrails & Functional Tests | ✅ success |
+| ⤷ Compact 26.3 Simulation Runtime Pack | ✅ success |
+| ⤷ **iOS Swift Tests & Native ARM64 IPA** | ✅ **success** — Xcode 26 + SDK 26, Swift LauncherLogicTests trên Simulator, **build engine ARM64 thật**, đóng gói + audit IPA unsigned và TrollStore |
+| ⤷ release | ✅ success |
+| `android` → apk | ✅ **success** — build ARM64 `--locked`, đóng gói + ký APK |
+
+**Điểm quan trọng:** job iOS đã **biên dịch `horizon-official` cho `aarch64-apple-ios` thành công**.
+Đây là lần đầu code trong request này được biên dịch cho target Apple thật (không chỉ host Linux), và
+`gfx/draw_budget.rs` + 9 crate mới đều qua được. Nó **không** chứng minh đường render chạy đúng trên
+GPU thật — chỉ chứng minh nó build được và test logic pass.
+
+**Vẫn chưa kiểm chứng được (phải nói thật):**
+- Chưa có thiết bị iOS thật: `draw_budget` chưa đo được `gpu_ms` thật, `governor` chưa chạy với số đo
+  GPU thật. Logic đã test bằng số giả lập trong unit test.
+- `probe()` trong `game/ram.rs` vẫn trả `limit_mib: None` trên mọi nền tảng — **đường đo Jetsam thật
+  chưa chạy lần nào**. `horizon-ios` cần gọi `os_proc_available_memory()` + `phys_footprint`.
