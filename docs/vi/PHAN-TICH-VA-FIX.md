@@ -807,3 +807,35 @@ Horizon: nominal (…)
 
 Nếu `jetsam limit None` xuất hiện trên máy thật thì nghĩa là `task_info` trả thiếu word hoặc
 `os_proc_available_memory` bị chặn — lúc đó phải đọc lại §11.3 chứ không được đoán.
+
+### Lần push 3 — `5a7ef88` → **SUCCESS**, warning `[lints]` đã hết
+
+| Job | Kết quả |
+| --- | --- |
+| Rust Guardrails & Functional Tests | ✅ success |
+| Compact 26.3 Simulation Runtime Pack | ✅ success |
+| iOS Swift Tests & Native ARM64 IPA | ✅ success — `Finished release profile in 15m 14s` |
+| release | ✅ success |
+
+**Warning trong log Apple sau khi thêm `[lints]`:**
+
+```
+horizon-client        (lib) generated 4 warnings
+horizon-client-render (lib) generated 1 warning
+```
+
+Không còn dòng `missing [lints] to inherit [workspace.lints]` nào. Năm warning còn lại đều **không
+liên quan** request #2–#4 và **có sẵn từ trước**: `ride_is_tamed`, `hud_editor_drag_target`,
+`native_recipe_lookup`, `recipe_lookups_now`, `http_get`.
+
+**Con số để so sánh:** trước request #4, log Apple có **13 warning dead-code** của đúng các module
+này + **3 warning `[lints]`** = 16 vấn đề. Sau: **5**, và không cái nào thuộc request này.
+
+### Bài học ghi vào quy trình
+
+`cargo check` trên host Linux cho ra **0 error** trong khi target `aarch64-apple-ios` có **4 error**.
+Lý do: nhánh `#[cfg(target_vendor = "apple")]` **không được biên dịch** trên Linux, nên kết quả
+"xanh ở máy" không nói gì về Apple. Từ nay, với bất kỳ thay đổi nào trong nhánh Apple:
+1. phần **không phụ thuộc SDK** phải được đưa ra chỗ CI Linux kiểm được (như `task_vm_info_layout`),
+   kèm test khoá offset/kích thước;
+2. khẳng định "đã sửa xong" chỉ được đưa ra **sau khi job iOS xanh**, không phải sau `cargo check`.
