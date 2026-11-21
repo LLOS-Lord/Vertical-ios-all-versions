@@ -98,3 +98,16 @@ Sửa gốc đã làm: thêm 5 phép đo kernel trong `horizon-threads::process_
 overlay F3 hiện số thật, và `memory` entry không còn trống trên iOS (nó đọc `/proc` trước đây).
 
 Chi tiết + bảng bằng chứng + danh sách **giới hạn chưa kiểm chứng**: `docs/vi/PHAN-TICH-VA-FIX.md` **§11**.
+
+**Bổ sung sau CI (bắt buộc, ghi thành luật):** `cargo check` trên host **không** kiểm được nhánh
+`#[cfg(target_vendor = "apple")]`. Push đầu tiên của §11 xanh ở máy (**0 error**) nhưng **đỏ** trên
+`aarch64-apple-ios` với 4 lỗi: `libc 0.2.190` gắn `target_os = "macos"` cho cả `task_vm_info` **và**
+`mach_task_self()` ⇒ trên iOS hai thứ đó **không có trong crate**. Cách đúng: tra
+`osfmk/mach/task_info.h` của XNU để lấy layout thật (`phys_footprint` tại byte 144, buffer 38 word),
+khai báo `#[repr(C)]` cục bộ, và đưa layout ra module để **CI Linux test được offset** — test đó đã
+bắt hai lỗi số học của tôi (160, rồi 148) trước khi push. Chỉ được nói "đã sửa" sau khi **job iOS xanh**.
+
+Kết quả 3 lần push: `b02651b` ❌ (4 error Apple) → `cf73b92` ✅ (dead-code warning của
+`ram.rs`/`thermal.rs`/`draw_budget.rs` biến mất: `horizon-client` 11→4, `horizon-client-render` 2→1)
+→ `5a7ef88`/`fcaa154` ✅ (thêm `[lints]` cho 3 crate: hết 3 warning `missing [lints]`).
+Tổng: **16 vấn đề trong log Apple trước request #4 → 5**, và 5 cái còn lại không thuộc request này.
