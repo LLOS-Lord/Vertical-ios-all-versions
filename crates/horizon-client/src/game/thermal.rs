@@ -45,6 +45,8 @@ pub struct Thermal {
     announced: ThermalLevel,
     /// The level as last read, so a change can be detected without the governor's own latch.
     current: ThermalLevel,
+    /// Whether a reading has been logged this session.
+    described: bool,
     /// The renderer's resolution ceiling from the heat alone, 0..=1. Dynamic Resolution still
     /// decides *where* in the range the frame lands; this only lowers the top of the range, which
     /// is why it composes with the frame's own autotune instead of overriding it.
@@ -67,6 +69,7 @@ impl Thermal {
             announced: ThermalLevel::Nominal,
             current: ThermalLevel::Nominal,
             resolution_scale: 1.0,
+            described: false,
         }
     }
 
@@ -84,6 +87,25 @@ impl Thermal {
     /// The level currently in force.
     pub fn level(&self) -> ThermalLevel {
         self.current
+    }
+
+    /// Whether the governor has taken its first observation.
+    ///
+    /// Its first reading only seeds it — there is nothing to compare against yet — so it is not a
+    /// change and must not be mistaken for "nothing happened". The caller uses this to make sure a
+    /// session's *first* thermal reading is reported even when it needs no action taken.
+    pub fn settled(&self) -> bool {
+        self.polled.is_some()
+    }
+
+    /// Whether a reading has been logged this session.
+    pub fn described(&self) -> bool {
+        self.described
+    }
+
+    /// Record that a reading has been logged.
+    pub fn note_described(&mut self) {
+        self.described = true;
     }
 
     /// Poll the platform's thermal state and step the governor. Returns whether the caller must
@@ -172,6 +194,7 @@ impl Thermal {
         self.polled = None;
         self.announced = ThermalLevel::Nominal;
         self.current = ThermalLevel::Nominal;
+        self.described = false;
         self.sync();
     }
 
@@ -245,6 +268,21 @@ mod tests {
         thermal.tick(Instant::now() + POLL + Duration::from_millis(1));
         assert_eq!(before, ThermalLevel::Nominal);
         assert_eq!(thermal.level(), ThermalLevel::Nominal);
+    }
+
+    /// The defect: the governor's first observation only *seeds* it, so it reports no change — and
+    /// `heat_tick` read "no change" as "nothing to do" and returned before even looking. The device
+    /// log then contained no thermal line at all, in nine hours of play.
+    #[test]
+    fn the_first_poll_counts_as_unsettled_so_it_is_reported() {
+        let mut thermal = Thermal::new(DeviceTier::Mobile);
+        assert!(!thermal.settled(), "nothing polled yet");
+        assert!(!thermal.described(), "nothing reported yet");
+        thermal.note_described();
+        assert!(thermal.described());
+        // A later world closes its own reporting.
+        thermal.world_closed();
+        assert!(!thermal.described(), "a new session reports its own first reading");
     }
 
     #[test]

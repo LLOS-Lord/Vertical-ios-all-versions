@@ -609,3 +609,130 @@ GPU thật — chỉ chứng minh nó build được và test logic pass.
   GPU thật. Logic đã test bằng số giả lập trong unit test.
 - `probe()` trong `game/ram.rs` vẫn trả `limit_mib: None` trên mọi nền tảng — **đường đo Jetsam thật
   chưa chạy lần nào**. `horizon-ios` cần gọi `os_proc_available_memory()` + `phys_footprint`.
+
+---
+
+# §11 — Kiểm toán request #4: cơ chế đã thêm có thật sự chạy? (đọc log, không chỉ đọc "success")
+
+Yêu cầu của bạn: *"cần chú ý thêm trong log build action, ko phải bảo build success là ko có gì lỗi cả,
+những warn cx rất quan trọng"*. §11 làm đúng việc đó: đọc **cả** 274 dòng log build Actions **và**
+9411 dòng log chẩn đoán trên máy thật (iOS 16.7.16, app 0.1.44 build 14.1, A11), rồi đối chiếu từng
+cơ chế với bằng chứng "có dòng log / không có dòng log".
+
+## 11.0 Kết luận trước, ngắn
+
+**Build success KHÔNG có nghĩa là cơ chế hoạt động.** Bốn cơ chế của request #2–#3 được nối dây, biên
+dịch sạch cho `aarch64-apple-ios`, test logic pass — và **không cái nào chạy trên máy thật**. Cả bốn
+đều thất bại theo cùng một kiểu: chúng phụ thuộc một phép đo từ kernel mà **không có dòng code nào
+thực hiện phép đo đó**, và bộ biên dịch đã nói ra điều này bằng warning "never used" — đúng loại
+warning mà "build success" che mất.
+
+## 11.1 Bằng chứng từ log build (274 dòng, job `Build native ARM64 Rust engine`, 17m01s, success)
+
+| Warning | Vị trí | Nghĩa thật |
+| --- | --- | --- |
+| `limit_from`, `total_bytes`, `is_empty`, field `measured`, `profile`/`measured`/`limit_mib`/`describe`/`stats` **never used** | `crates/horizon-client/src/game/ram.rs:83,128,153,168,197–307` | **Toàn bộ phần đọc Jetsam là code chết.** Không chỗ nào lấy limit ⇒ `Budget` luôn dùng bảng tier |
+| field `tier` `:41`; `level`, `may_relax_ticks`, `reset`, `tier` **never used** | `crates/horizon-client/src/game/thermal.rs:85–179` | Nhiệt độ đo được nhưng **không ai đọc**. Chỉ `describe()`/`action()` được gọi |
+| `scene_reset`, `scale` **never used** | `crates/horizon-client-render/src/gfx/draw_budget.rs:138,143` | Draw budget tự chỉnh độ phân giải, **không ai đọc `scale()`** ⇒ không có gì chứng minh nó tác động lên hình |
+| `missing [lints] to inherit [workspace.lints]` | `horizon-prepare`, `horizon-theme`, `horizon-bench` | 3 crate **thoát khỏi bộ lint của workspace** — CI vẫn xanh vì chúng không bị kiểm |
+| `http_get` never used | `horizon-client-render/src/skins.rs:1803` | Code tải skin qua HTTP chưa nối |
+
+## 11.2 Bằng chứng từ log thiết bị (9411 dòng, 21:24–23:09)
+
+| Cơ chế | Chuỗi kỳ vọng | Thực tế trong log | Kết luận |
+| --- | --- | --- | --- |
+| Ngân sách RAM | `Horizon: RAM … ceiling … freed N MiB` | **0 lần**. Dòng RAM duy nhất: `Horizon: RAM world closed — freed 0 MiB` (×5) | ❌ |
+| Nhiệt độ | `Horizon: thermal …` | **0 lần** (`thermal` 0 hit, `heat` 0 hit) trong 9 giờ chơi | ❌ |
+| Draw budget | đổi `scale` khi GPU quá tải | không có log nào, không có accessor | ❌ |
+| Máy/SoC | — | `Horizon renderer: Apple A11 GPU` (đúng), nhưng profile nội bộ lại là **A12** (xem 11.3) | ❌ |
+
+Chi tiết đáng chú ý khác:
+- `frame generation off` ×8 / `unsupported` ×6 — trên A11 là **đúng thiết kế** (Legacy tier tắt FG),
+  không phải lỗi. Nhưng nó được quyết bởi tier… mà tier lại sai (11.3).
+- Version skew: launcher ghi `Horizon 0.1.44`, log game ghi `Horizon 0.1.0` — xem 11.5.
+- Chỉ 2 dòng ERROR, cả hai vô hại: `Error while loading the narrator: Unsupported platform ios`.
+
+## 11.3 Nguyên nhân gốc (đã xác minh bằng đọc mã, không suy đoán)
+
+**Gốc 1 — không có phép đo Jetsam nào tồn tại.**
+`game/ram.rs::probe()` hard-code `available_mib: None`, `limit_mib: None`. Trong toàn bộ
+`crates/horizon-threads`, lần gọi `sysctlbyname` **duy nhất** là `hw.perflevel0.physicalcpu`
+(`lib.rs:202`); **không có** `os_proc_available_memory`, **không có** `phys_footprint`.
+⇒ `Device::ceiling_mib()` luôn rơi về bảng tier, `Budget::frame()` không bao giờ vượt ngưỡng, nên
+**không có plan, không có eviction, không có log**. Đây là lý do dòng `RAM world closed — freed 0 MiB`
+luôn là `0`: không có gì được giải phóng vì không có gì được yêu cầu giải phóng.
+
+**Gốc 2 — định danh máy đọc từ biến môi trường.**
+`ram::hw_machine()` chỉ đọc `HORIZON_HW_MACHINE`, thứ không ai set trên điện thoại ⇒
+`DeviceProfile::from_hw_machine("")` ⇒ nhánh cuối `Self::A12`. **Mọi** thiết bị iOS đều bị xếp A12:
+A11 thật bị xếp cao hơn thực tế (ngân sách khung hình sai), máy yếu hơn cũng bị xếp A12.
+
+**Gốc 3 — `heat_tick` coi "chưa có gì thay đổi" là "không cần làm gì".**
+`Thermal::tick()` trả `false` cho lần quan sát **đầu tiên** (nó chỉ *seed* governor). `heat_tick` thấy
+`false` ⇒ `return` **trước cả khi** đọc/tính, và không log. Cộng thêm: chuỗi này chỉ chạy trong
+`memory_tick` khi world đã tồn tại ⇒ một session 9 giờ vẫn không có một dòng nhiệt độ nào.
+
+**Gốc 4 — `ram_tick` tính census trước, kiểm tra world sau.**
+Census (`world_bytes`, `lod_bytes`, `visible_share`) được tính rồi mới tới nhánh `player.is_none()`,
+nên khi không có world nó ghi "world closed" và bỏ luôn phần ngân sách thật.
+
+## 11.4 Đã sửa gì (đúng gốc, không vá ngọn)
+
+1. `crates/horizon-threads/src/process_memory.rs` — thêm phép đo thật, có `SAFETY:` cho từng `unsafe`:
+   `footprint_bytes()` (`task_info(TASK_VM_INFO).phys_footprint`),
+   `available_memory_bytes()` (`os_proc_available_memory`, iOS 13+),
+   `jetsam_limit_bytes()` = `footprint + available` (`available == 0` ⇒ limit = footprint, không ratchet
+   về 0), `hw_machine()` (`sysctlbyname("hw.machine")`), `physical_memory_bytes()` (`hw.memsize`).
+   Toàn bộ có bản `#[cfg]` rỗng cho nền tảng khác, nên API là toàn phần.
+2. `game/ram.rs::probe()` — dùng 5 phép đo trên; `limit_mib` giờ là số thật trên máy.
+   `hw_machine()` — `sysctlbyname` trước, biến môi trường chỉ để soak harness giả lập máy.
+3. `game/thermal.rs` — thêm `settled()`, `described()`, `note_described()`; `reset()` xoá cờ.
+   `game.rs::heat_tick` — không `return` sớm khi governor chưa settle, và **log lần đọc đầu tiên** của
+   mỗi session (nếu không, "mát" và "chưa từng đọc" không phân biệt được trong log).
+4. `game.rs::ram_tick` — chặn `player.is_none()` **trước** khi tính census, và log `ram.describe()`
+   một lần mỗi session (nguồn limit: `measured` hay `tier`).
+5. Nối các accessor từng chết vào đúng chỗ dùng: overlay F3 giờ in `RAM … ceiling`, `RAM plan: N MiB
+   over M plan(s)`, `Thermal: <level> tier (<name>)`, `Draw resolution: N%`; entry point log
+   `Horizon: device iPhone…, RAM … MiB, jetsam limit … MiB` ngay khi mở log.
+6. `gfx.rs::set_thermal` — chuyển `frame_budget_ms` của governor nhiệt xuống `draw_budget.set_target()`
+   (chip nóng ⇒ ngân sách khung hình ngắn hơn ⇒ mục tiêu GPU thật), và `invalidate_presentation()` gọi
+   `draw_budget.scene_reset()`.
+7. Overlay `memory` trên iOS: `ProcessMemory::read()` đọc `/proc` — **không tồn tại trên iOS**, nên
+   entry này **trống trên máy**. Thêm `debug_overlay::jetsam_lines()` dùng chính hai số jetsam.
+
+## 11.5 Phát hiện thêm, chưa sửa (nói thật)
+
+- **Version skew** `0.1.44` vs `0.1.0`: `crash::version()` = `RELEASE` (`option_env!("HORIZON_VERSION")`)
+  hoặc `CARGO_PKG_VERSION`. `.github/workflows/build.yml` (luồng build IPA này) **không** set
+  `HORIZON_VERSION`; chỉ `game-build.yml` set. ⇒ bản IPA 0.1.44 thực chất là crate `0.1.0` và tự khai
+  là `0.1.0`. Đây là mùi của nguyên tắc **không fake version** và cần một quyết định riêng (truyền
+  `HORIZON_VERSION` vào job IPA, hay để bản dev tự nhận là dev). **Chưa sửa** vì nó đổi số version
+  của artifact — cần bạn đồng ý.
+- `missing [lints] to inherit [workspace.lints]` ở 3 crate: chưa thêm, vì bật bộ lint workspace có thể
+  làm đỏ CI với hàng loạt cảnh báo có sẵn. Đề xuất làm thành một PR riêng.
+- 74 lỗi `cargo check -p horizon-client --all-targets` (test lib của crate) là **có sẵn từ trước**,
+  không do §11 (đã đối chiếu: 75 → 74, lỗi còn lại đều ở `motion.rs`/test cũ). CI không chạy target này.
+- 4 test host hỏng có sẵn: `gfx::hdr` (2), `chat_field_budgets_utf16`, `extras::mobile_ui`;
+  `cargo test -p horizon-threads` 13 lỗi ở `profile`/`sampler` (đo CPU, không liên quan).
+
+## 11.6 Giới hạn — điều gì đã kiểm chứng, điều gì chưa
+
+**Đã kiểm chứng:**
+- `cargo check -p horizon-client` (host, `--no-default-features`): **0 error**.
+- `cargo check -p horizon-client-render --all-targets`: **0 error**, còn đúng 1 warning (`http_get`).
+- Dead-code của `ram.rs`/`thermal.rs`/`draw_budget.rs` **đã biến mất** khỏi danh sách warning; chỉ còn
+  `ride_is_tamed`, `hud_editor_drag_target`, `used_mouse`, `http_get` (không liên quan request này).
+- `cargo test -p horizon-frame-sched`: **21/21 pass** (kể cả `DeviceTier::name` mới).
+- `cargo test -p horizon-client-render --lib`: 135 test, chỉ 4 lỗi **có sẵn** như trên.
+
+**CHƯA kiểm chứng (phải nói rõ):**
+- **Chưa chạy trên máy thật.** `phys_footprint`/`os_proc_available_memory`/`hw.machine` chỉ được biên
+  dịch và kiểm tra bằng đọc mã; nhánh `unsafe` **chưa được thực thi lần nào** trong lần sửa này.
+  Bằng chứng duy nhất sẽ là log thiết bị lần tới, phải có hai dòng:
+  `Horizon: device iPhone…` và `Horizon: RAM … ceiling (measured…`.
+- Chưa build cho `aarch64-apple-ios` sau khi sửa (sẽ push để Actions làm — bước tiếp theo).
+- Test hồi quy mới (`a_device_that_reports_its_counters_gets_a_real_ceiling`,
+  `a_reported_machine_identifier_selects_its_own_tier`,
+  `the_first_poll_counts_as_unsettled_so_it_is_reported`) nằm trong `--lib` test của `horizon-client`,
+  target **vốn không compile được từ trước** (74 lỗi cũ) ⇒ chưa chạy được. Đã kiểm bằng type-check:
+  chúng không thêm lỗi nào (75 → 74 sau khi sửa `Budget::new` → `Budget::for_device`).

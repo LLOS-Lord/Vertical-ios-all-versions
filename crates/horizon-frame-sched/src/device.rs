@@ -83,6 +83,16 @@ pub enum DeviceTier {
 }
 
 impl DeviceTier {
+    /// The tier's name, as the overlay and the log spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Mobile => "mobile",
+            Self::Balanced => "balanced",
+            Self::Capable => "capable",
+        }
+    }
+
     /// A tier from an available-memory figure in MiB and a GPU class string, for platforms that
     /// cannot name an Apple SoC (Android, desktop). Never returns [`DeviceTier::Capable`] from
     /// memory alone: that needs a name.

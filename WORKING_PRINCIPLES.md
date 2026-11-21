@@ -49,3 +49,52 @@
   `game/mods*`, `packaging/ios/Launcher/*.swift`. Kết quả: xem `docs/vi/PHAN-TICH-VA-FIX.md` +
   các crate mới `horizon-frame-sched`, `horizon-memory-governor`, `horizon-version-truth`,
   `horizon-mod-diagnostics`, `horizon-touch-pipeline`, `horizon-visibility-budget`.
+- **2026-11-21 — request #2 (bốn yêu cầu lớn: đa luồng theo mức quan trọng / quản lý RAM / port mod /
+  chặn GPU quá tải)**: đọc `horizon-visibility-budget/src/lib.rs`, `horizon-frame-sched/src/*.rs`,
+  `horizon-threads/src/{jobs,process_memory}.rs`, `horizon-memory-governor/src/lib.rs`,
+  `horizon-hooks/src/porter.rs`, `horizon-client/src/{game.rs,mod_api.rs,client_lib.rs}`,
+  `horizon-client-render/src/gfx/{cull,census,visbuffer,device_probe}.rs`, `gfx.rs`
+  (`occlusion_culling_requested`, `TILED_MIN_SECTIONS`, submit path).
+
+  **Phát hiện cốt lõi (khác giả định ban đầu):** `horizon-visibility-budget` và
+  `horizon-frame-sched::budgets` vẫn là **crate chết**, và vấn đề thật không phải "thiếu scheduler"
+  mà là **bốn thang ưu tiên không biết nhau** (`Sort`, `FrameKind`, `jobs::Class`,
+  `memory_governor::Class`) với bốn cách chia khoảng khác nhau, không chỗ nào chuyển đổi. Vì vậy
+  việc đúng là viết **lớp điều phối**, không viết thêm scheduler thứ năm.
+
+  Ba crate mới, std-only, `#![forbid(unsafe_code)]`, test đầy đủ:
+  `horizon-importance` (**16/16**), `horizon-gpu-governor` (**22/22**), `horizon-mod-shim`
+  (**12/12**) = **50 test pass**.
+
+  Sửa gốc RAM: `game/ram.rs` viết lại — trần Jetsam suy từ `footprint + os_proc_available_memory()`
+  tại runtime thay cho bảng tier chip (nghiên cứu: giới hạn Jetsam *không* suy từ RAM lắp máy).
+  `game/thermal.rs` viết lại theo đúng API `game.rs` gọi.
+
+  **Sự cố môi trường:** sandbox reset **hai lần** trong request này — xoá toolchain Rust (cài lại
+  1.95.0 vì workspace yêu cầu) và prune toàn bộ 482 file `crates/horizon-client/src/game/*.rs`
+  (phục hồi 637 file từ clone sạch `ec84e17`, `ram.rs`/`thermal.rs` viết lại thủ công).
+  Đã xác nhận `horizon-importance`/`gpu-governor`/`mod-shim` + `game.rs` edits còn nguyên.
+
+  Chi tiết + bảng nguồn: `docs/vi/PHAN-TICH-VA-FIX.md` **§9**.
+
+### 2026-11-20 — request #4 (kiểm toán: "build success ≠ không có lỗi")
+
+**Bài học, ghi thành luật:** một cơ chế chỉ được coi là "đã có" khi **log trên máy thật** chứng minh
+nó chạy. Biên dịch được + test logic pass + CI xanh **không** phải bằng chứng. Warning `never used` /
+`never read` trong log build là **lỗi chức năng**, không phải tiếng ồn: nó nói rằng thứ vừa viết ra
+không có đường nào tới nó.
+
+Kiểm toán request #2–#3 trên log thật cho kết quả: **0/4 cơ chế hoạt động**.
+- RAM budget: không có phép đo Jetsam nào tồn tại trong cây ⇒ `limit_mib` luôn `None`; log chỉ có
+  `RAM world closed — freed 0 MiB` (×5), còn dòng ngân sách **0 lần**.
+- Nhiệt độ: `thermal` **0 hit** trong 9 giờ chơi; `heat_tick` return sớm vì lần poll đầu không phải
+  "thay đổi".
+- Draw budget: `scale()`/`scene_reset()` chết ⇒ không chứng minh được nó tác động lên hình.
+- SoC: `hw.machine` đọc từ **biến môi trường** ⇒ mọi máy iOS bị xếp **A12** (A11 thật bị xếp sai).
+
+Sửa gốc đã làm: thêm 5 phép đo kernel trong `horizon-threads::process_memory`
+(`phys_footprint`, `os_proc_available_memory`, `jetsam_limit = footprint + available`, `hw.machine`,
+`hw.memsize`), nối `Budget`/`Thermal`/`DrawBudget` vào đúng chỗ, log lần đọc đầu tiên mỗi session,
+overlay F3 hiện số thật, và `memory` entry không còn trống trên iOS (nó đọc `/proc` trước đây).
+
+Chi tiết + bảng bằng chứng + danh sách **giới hạn chưa kiểm chứng**: `docs/vi/PHAN-TICH-VA-FIX.md` **§11**.

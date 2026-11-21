@@ -7192,6 +7192,25 @@ impl Renderer {
     /// A thermal step's verdict: a hot SoC takes frame generation away whatever the setting says.
     pub fn set_thermal(&mut self, action: horizon_frame_sched::ThermalAction) {
         self.frame_gen.set_thermal(action);
+        // A hot chip has less time per frame than a cool one, so the draw budget aims at the
+        // thermal governor's own budget rather than at the display's nominal period: keeping the
+        // nominal target on a chip that has lost clocks would leave the governor chasing a
+        // frame it cannot make, and it would answer by shortening the view to nothing.
+        let target = action.frame_budget_ms;
+        if target.is_finite() && target >= 1.0 {
+            self.draw_budget.set_target(target);
+        }
+    }
+
+    /// What the draw budget has settled on, for the performance overlay: the GPU's own time against
+    /// its target and the resolution scale that follows from it.
+    pub fn draw_budget_report(&self) -> String {
+        self.draw_budget.describe()
+    }
+
+    /// The scale the draw budget currently applies to the solid draw list, `0.25..=1.0`.
+    pub fn draw_scale(&self) -> f32 {
+        self.draw_budget.scale()
     }
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     /// `sharpness`: how much TAA's upscaled picture is sharpened, 0..=1.
@@ -7902,6 +7921,11 @@ impl Renderer {
     fn invalidate_presentation(&mut self) {
         self.presentation_generation = self.presentation_generation.wrapping_add(1);
         self.presented_generation = None;
+        // A new target or a rebuilt swapchain ends the run of frames the draw budget was reasoning
+        // about: its history would otherwise carry a frame time measured at the old size into the
+        // new one, and hold the resolution down (or up) for a device that has changed under it. The
+        // ceiling the governor learned about the chip survives; only this frame's history does not.
+        self.draw_budget.scene_reset();
     }
     /// The owner calls this after an actual GUI coordinate/layout change (for
     /// example GUI scale), even when the drawable dimensions stayed the same.

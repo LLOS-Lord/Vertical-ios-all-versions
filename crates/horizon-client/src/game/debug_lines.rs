@@ -100,7 +100,11 @@ impl Game<'_> {
                     d.group("looking_at_fluid", lines);
                 }
                 "memory" => {
-                    if let Some(lines) = self.memory_meter.borrow_mut().lines() {
+                    // The kernel's own jetsam numbers where it reports them (iOS): the `/proc`
+                    // meter below is `None` there, so the entry used to be blank on the device.
+                    if let Some(lines) = overlay::jetsam_lines() {
+                        d.group("memory", lines);
+                    } else if let Some(lines) = self.memory_meter.borrow_mut().lines() {
                         d.group("memory", lines);
                     }
                 }

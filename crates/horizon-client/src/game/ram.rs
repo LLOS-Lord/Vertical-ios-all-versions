@@ -388,30 +388,37 @@ pub fn probe_device() -> DeviceProfile {
     DeviceProfile::from_hw_machine(&hw_machine())
 }
 
-/// The platform's machine identifier, or a value that matches no Apple SoC.
+/// The platform's machine identifier: `iPhone11,8` on the phone itself.
+///
+/// `sysctlbyname("hw.machine")` is the phone's own answer. It used to come only from an environment
+/// variable, which nothing sets on a device — so `from_hw_machine("")` fell through to `A12` on
+/// **every** phone: the wrong SoC tier, and with it the wrong thermal table and memory ceiling. The
+/// variable is still honoured first, because a soak harness needs to pretend to be a given device.
 fn hw_machine() -> String {
-    std::env::var("HORIZON_HW_MACHINE").unwrap_or_default()
+    match std::env::var("HORIZON_HW_MACHINE") {
+        Ok(faked) if !faked.trim().is_empty() => faked,
+        _ => horizon_threads::process_memory::hw_machine().unwrap_or_default(),
+    }
 }
 
 /// Probe the process's memory counters.
 ///
-/// `resident_bytes` is `horizon_threads`' existing read of the process's RAM, used here as the
-/// nearest available stand-in for `phys_footprint` on a platform that has no jetsam. On iOS the
-/// caller (`horizon-ios`) fills in the real `phys_footprint` and `os_proc_available_memory`; this
-/// function's job is only to say what the rest of the build can see.
+/// `limit_mib` is the number this whole module is built on: `phys_footprint + available`, both read
+/// from the kernel on an Apple platform. When the kernel cannot answer (a desktop, or an iOS before
+/// 13), it stays `None` and [`Budget`] falls back to the tier table — but on a phone it now answers.
 pub fn probe() -> Device {
     let physical_mib = horizon_threads::process_memory::usage()
         .map(|usage| usage[2] >> 20)
-        .or_else(|| {
-            horizon_threads::process_memory::resident_bytes().map(|bytes| bytes >> 20)
-        });
-    let footprint_mib = horizon_threads::process_memory::resident_bytes().map(|b| b >> 20);
+        .or_else(|| horizon_threads::process_memory::physical_memory_bytes().map(|b| b >> 20));
+    // `phys_footprint`, the metric jetsam compares against; `resident_bytes` inside it is the older
+    // counter and misses compressed pages.
+    let footprint_mib = horizon_threads::process_memory::footprint_bytes().map(|b| b >> 20);
+    let available_mib = horizon_threads::process_memory::available_memory_bytes().map(|b| b >> 20);
     Device {
         physical_mib,
-        available_mib: None,
+        available_mib,
         footprint_mib,
-        // Without a platform limit there is nothing to sum, so the tier table decides.
-        limit_mib: None,
+        limit_mib: horizon_threads::process_memory::jetsam_limit_bytes().map(|b| b >> 20),
     }
 }
 
@@ -445,6 +452,32 @@ mod tests {
         assert_eq!(Device::limit_from(1400, 0), Some(1400));
         // And a process that reports almost nothing is not a real device.
         assert_eq!(Device::limit_from(10, 0), None);
+    }
+
+    /// The defect this fixed, as a test: a device that reports a footprint and a headroom must
+    /// produce a limit, so `Budget::frame` has a ceiling to compare against. Before, `probe()` hard
+    /// coded `available_mib: None` and `limit_mib: None`, so the ceiling was always the tier
+    /// table's — and the device log never once carried a budget line.
+    #[test]
+    fn a_device_that_reports_its_counters_gets_a_real_ceiling() {
+        let probed = device(Device::limit_from(900, 484), 900, 484);
+        assert_eq!(probed.limit_mib, Some(1384));
+        assert!(probed.footprint_mib.is_some());
+        assert!(probed.available_mib.is_some());
+        let budget = Budget::for_device(&probed);
+        assert!(budget.measured(), "a measured limit must be the one in force");
+        assert_eq!(budget.limit_mib(), Some(1384));
+    }
+
+    /// The machine identifier is what picks the SoC tier, and with it the thermal table and the
+    /// memory ceiling. It used to be read from an environment variable nothing sets on a phone, so
+    /// every device was classified A12; a real identifier must now win.
+    #[test]
+    fn a_reported_machine_identifier_selects_its_own_tier() {
+        // An A11 phone is `iPhone10,x`; the fallback for an empty identifier is A12, a different tier.
+        let a11 = DeviceProfile::from_hw_machine("iPhone10,3");
+        let fallback = DeviceProfile::from_hw_machine("");
+        assert_ne!(a11, fallback, "hw.machine must change the profile, not be ignored");
     }
 
     #[test]

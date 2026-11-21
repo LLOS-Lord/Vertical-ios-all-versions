@@ -257,7 +257,7 @@ mod maps;
 mod melee;
 mod memory;
 mod memory_warning;
-mod ram;
+pub mod ram;
 mod thermal;
 mod menu_clicks;
 mod minecarts;
@@ -2987,6 +2987,8 @@ struct Game<'a> {
     heat: thermal::Thermal,
     /// When the RAM budget last ran (`ram_tick`), and whether the world-closed plan has run.
     last_ram_tick: Option<Instant>,
+    /// Whether the budget's ceiling has been logged this session.
+    ram_described: bool,
     ram_world_closed: bool,
     /// The F3 overlay's vertices between rebuilds (`draw_debug_overlay_under`).
     debug_paint: RefCell<horizon_client::debug_overlay::PaintCache>,
@@ -5661,10 +5663,16 @@ impl Game<'_> {
                 }
                 self.ram.done(freed);
                 log::info!(
-                    "Horizon: RAM world closed — freed {} MiB",
-                    freed >> 20
+                    "Horizon: RAM world closed — freed {} MiB (peak {:.0}% of the {} MiB ceiling)",
+                    freed >> 20,
+                    self.ram.utilisation() * 100.0,
+                    self.ram.ceiling_mib()
                 );
             }
+            // A new world is a new session for the thermal report too: its first reading must be
+            // logged even if the chip is cool, or the log again says nothing at all.
+            self.heat.reset();
+            self.ram_described = false;
             return;
         }
         self.ram_world_closed = false;
@@ -5692,7 +5700,11 @@ impl Game<'_> {
     /// memory too (fewer sections, fewer particles), and because frame generation must be off
     /// before the renderer measures the frame it would make.
     fn heat_tick(&mut self, now: Instant) {
-        if !self.heat.tick(now) {
+        // The poll gate lives inside `Thermal::tick` (2 s). Looking like "nothing to apply" and
+        // "nothing to poll" were one answer is what kept this silent: the governor's first
+        // observation only *seeds* it, so the first live level was never announced either.
+        let changed = self.heat.tick(now);
+        if !changed && !self.heat.settled() {
             return;
         }
         let change = self.heat.take_change();
@@ -5710,7 +5722,12 @@ impl Game<'_> {
                 "The device has cooled down: full quality restored",
             ));
         }
-        log::info!("Horizon: thermal {}", self.heat.describe());
+        // Once per level, and once on the first poll of a session: a device log that never mentions
+        // the thermal state cannot be told apart from one where it was never read.
+        if change.is_some() || !self.heat.described() {
+            self.heat.note_described();
+            log::info!("Horizon: thermal {}", self.heat.describe());
+        }
     }
 
     /// The RAM budget's frame (game/ram.rs): a census of what the game caches, and the evictions
@@ -5718,6 +5735,12 @@ impl Game<'_> {
     /// is arithmetic over counters it already keeps — and it is what turns "the game gets killed on
     /// older iPhones at render distance 12" into a mark that is never reached.
     fn ram_tick(&mut self, now: Instant) {
+        // Outside a world there is no census worth taking: the renderer's sections are the title
+        // screen's, `world_bytes` is zero and the governor would be measuring nothing. The
+        // world-closed plan below is what this frame is for.
+        if self.player.is_none() {
+            return;
+        }
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
@@ -5734,6 +5757,13 @@ impl Game<'_> {
         };
         let dt = self.last_ram_tick.map_or(0.016, |t| now.duration_since(t).as_secs_f32());
         self.last_ram_tick = Some(now);
+        if !self.ram_described {
+            // Once: which limit the budget settled on, and whether it came from the device or from
+            // the tier table. Without this the log's only RAM line is the world-closed one, which
+            // says nothing about what the budget is holding the game to.
+            self.ram_described = true;
+            log::info!("Horizon: {}", self.ram.describe());
+        }
         let Some(plan) = self.ram.frame(census, now, dt.min(0.25)) else {
             return;
         };
@@ -12247,6 +12277,7 @@ impl<'a> Game<'a> {
                 ram::probe_device().tier,
             ),
             last_ram_tick: None,
+            ram_described: false,
             ram_world_closed: false,
             debug_paint: Default::default(),
             debug_refresh: Default::default(),

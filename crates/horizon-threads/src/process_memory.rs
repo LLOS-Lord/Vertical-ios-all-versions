@@ -85,7 +85,174 @@ pub fn resident_bytes() -> Option<u64> {
 /// macOS-only; iOS and the other Apple platforms expose this through Mach.
 #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
 pub fn resident_bytes() -> Option<u64> {
-    mach_resident_bytes()
+    // `phys_footprint` where it can be read: it is the metric jetsam compares against, and it
+    // counts compressed and IOKit-backed pages that `resident_size` misses. `resident_size` stays
+    // the fallback because it is the older, always-present counter.
+    footprint_bytes().or_else(mach_resident_bytes)
+}
+
+/// `task_vm_info.phys_footprint`: what jetsam actually measures, in bytes.
+///
+/// `resident_size` is the wrong number for this purpose — it misses compressed and IOKit-backed
+/// pages — so a budget built on it under-reads and lets the process walk into a kill it could have
+/// seen coming. iOS exposes it through `task_info(TASK_VM_INFO)`, the same Mach call the resident
+/// count uses.
+#[cfg(target_vendor = "apple")]
+pub fn footprint_bytes() -> Option<u64> {
+    // TASK_VM_INFO is a Mach constant (mach/task_info.h), not something libc exports.
+    const TASK_VM_INFO: libc::c_int = 22;
+    let mut info = std::mem::MaybeUninit::<libc::task_vm_info>::zeroed();
+    // The call takes and returns the size in natural_t words. libc's struct and its count constant
+    // are the SDK's, so the two cannot disagree about the layout.
+    let mut count = (std::mem::size_of::<libc::task_vm_info>()
+        / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+    // SAFETY: `info` is exactly `count` natural_t words of space for the struct the call writes,
+    // and the kernel never writes more than `count` words back. The task port is borrowed from
+    // libSystem and needs no deallocation.
+    let result = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            TASK_VM_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: success means the kernel filled the struct; `phys_footprint` is plain data.
+    Some(unsafe { info.assume_init() }.phys_footprint)
+}
+
+/// `os_proc_available_memory()`: how many more bytes this process may allocate before jetsam kills
+/// it, in bytes.
+///
+/// iOS 13+. Returns `Some(0)` when the process is *already* over the limit, which is why the RAM
+/// budget sums it with the footprint rather than using it alone: a limit of `footprint + 0` is a
+/// real limit, not an absent one. `None` where the symbol is not there (macOS, and any iOS before
+/// 13), so the caller falls back to the tier table rather than to a wrong number.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+pub fn available_memory_bytes() -> Option<u64> {
+    // SAFETY: `os_proc_available_memory` takes no arguments and has no preconditions; it is
+    // exported by libSystem from iOS 13 on.
+    Some(unsafe { os_proc_available_memory() as u64 })
+}
+
+/// The symbol above, resolved from libSystem. Declared rather than pulled through a crate: it is
+/// one C function with an obvious signature, and it is only called on iOS 13+ (the deployment
+/// target is 16.0), so no weaker-linked fallback is needed.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+unsafe extern "C" {
+    fn os_proc_available_memory() -> usize;
+}
+
+/// Jetsam's limit for this process, in bytes: what it holds now plus what it may still allocate.
+///
+/// This is the only honest way to learn it. The limit is a per-process property the kernel decides
+/// from the device class and the foreground state; it is not derived from installed RAM (two phones
+/// with 4 GB can be held 50 % apart), and nothing in the SDK reports it directly. Summing the two
+/// counters gives it for any device without a table.
+#[cfg(target_vendor = "apple")]
+pub fn jetsam_limit_bytes() -> Option<u64> {
+    let footprint = footprint_bytes()?;
+    let available = available_memory_bytes()?;
+    // `available` is 0 both for "no headroom left" and for "already over": the limit is then at
+    // least what the process already holds.
+    Some(footprint.saturating_add(available))
+}
+
+/// The machine identifier (`hw.machine`, e.g. `iPhone11,8`): what tells an A11 from an A15.
+///
+/// `ram.rs` read this from an environment variable, which nothing sets on a phone, so every device
+/// fell through to `AppleSoc::from_hw_machine("")` and was classified **A12** — the wrong tier, and
+/// the wrong thermal table and memory ceiling with it. The phone's own identifier is the answer, and
+/// `sysctlbyname` is how iOS hands it over.
+#[cfg(target_vendor = "apple")]
+pub fn hw_machine() -> Option<String> {
+    let mut size = 0usize;
+    // SAFETY: a NUL-terminated name and a null buffer, which asks for the length only.
+    let sized = unsafe {
+        libc::sysctlbyname(
+            c"hw.machine".as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` is exactly `size` bytes, the length the first call reported.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"hw.machine".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    // The value is a NUL-terminated C string ("iPhone11,8\0").
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// `ProcessInfo.physicalMemory`'s number from the kernel (`hw.memsize`): the RAM the machine has.
+///
+/// Read for the device profile, which distinguishes a 3 GB phone from a 6 GB one. `sysctl` is the
+/// cheap way and needs no Foundation call from Rust.
+#[cfg(target_vendor = "apple")]
+pub fn physical_memory_bytes() -> Option<u64> {
+    let mut mib = 0u64;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a 64-bit integer; `mib` has that many bytes of space and `size` says
+    // so, which is what the call writes at most.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut mib).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (read == 0).then_some(mib)
+}
+
+/// [`physical_memory_bytes`] where the platform has it: none.
+#[cfg(not(target_vendor = "apple"))]
+pub fn physical_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// [`jetsam_limit_bytes`] where the platform has it: no jetsam outside Apple's platforms.
+#[cfg(not(target_vendor = "apple"))]
+pub fn jetsam_limit_bytes() -> Option<u64> {
+    None
+}
+
+/// [`hw_machine`] where the platform has it: none, so the caller uses its own fallback.
+#[cfg(not(target_vendor = "apple"))]
+pub fn hw_machine() -> Option<String> {
+    None
+}
+
+/// [`available_memory_bytes`] where the platform has it: none, so the RAM budget falls back to its
+/// tier table rather than inventing a limit.
+#[cfg(not(all(target_vendor = "apple", not(target_os = "macos"))))]
+pub fn available_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// [`footprint_bytes`] where the platform has it: the resident count is the nearest it has.
+#[cfg(not(target_vendor = "apple"))]
+pub fn footprint_bytes() -> Option<u64> {
+    resident_bytes()
 }
 
 #[cfg(all(target_vendor = "apple", any(not(target_os = "macos"), test)))]

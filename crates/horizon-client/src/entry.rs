@@ -112,6 +112,20 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         );
         // The log's first line names the build, so a bug report that carries the log says which one it was.
         log::info!("Horizon {}", crash::version());
+        // What this build thinks it is running on, before a world exists: `hw.machine` and the SoC
+        // tier behind the thermal table and the memory ceiling. Both used to come from nothing —
+        // an unset environment variable — so the whole device profile was a fallback nobody could
+        // see was a fallback. One line, read from the kernel, ends that.
+        {
+            let machine = horizon_threads::process_memory::hw_machine().unwrap_or_default();
+            let profile = horizon_client::game::ram::probe_device();
+            log::info!(
+                "Horizon: device {machine} ({:?}); RAM {:?} MiB, jetsam limit {:?} MiB",
+                profile,
+                horizon_threads::process_memory::physical_memory_bytes().map(|b| b >> 20),
+                horizon_threads::process_memory::jetsam_limit_bytes().map(|b| b >> 20),
+            );
+        }
         crash::install(home.clone(), side);
         // The Microsoft account a last start kept (the title screen's face button), signed in again.
         #[cfg(not(target_os = "ios"))]

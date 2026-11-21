@@ -462,6 +462,25 @@ impl Game<'_> {
                 "naive"
             }
         ));
+        // Horizon: what the frame is actually held to. The thermal tier is what decides the frame
+        // budget and whether quality may be relaxed, and the RAM ceiling is what decides whether the
+        // cache evicts — both are device facts the stock entries never show, and both are now read
+        // from the kernel instead of guessed.
+        d.line(format!(
+            "Thermal: {} tier ({}), redraw every tick {}",
+            self.heat.level().as_str(),
+            self.heat.tier().name(),
+            if self.heat.may_relax_ticks() { "may" } else { "no" }
+        ));
+        d.line(self.ram.describe());
+        let (ceiling, planned, plans) = self.ram.stats();
+        d.line(format!(
+            "RAM plan: {planned} MiB over {plans} plan(s), ceiling {ceiling} MiB"
+        ));
+        if let Some(renderer) = self.renderer.as_ref() {
+            d.line(renderer.draw_budget_report());
+            d.line(format!("Draw resolution: {:.0}%", renderer.draw_scale() * 100.0));
+        }
     }
     /// `DebugEntrySystemSpecs` (no Java line: Horizon has no JVM).
     pub(super) fn debug_system_lines(

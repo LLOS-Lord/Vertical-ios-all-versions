@@ -596,6 +596,29 @@ impl MemoryMeter {
     }
 }
 
+/// `DebugEntryMemory`'s three lines where the kernel reports a jetsam limit — a phone.
+///
+/// [`ProcessMemory::read`] parses `/proc`, which does not exist on iOS, so the memory entry was
+/// **blank on the device** and the one place a player could see the process walking towards a
+/// jetsam kill showed nothing. These read the two counters jetsam itself uses, so line 1 is the
+/// same comparison the kernel makes, and line 3 is the headroom left before the kill.
+pub fn jetsam_lines() -> Option<[String; 3]> {
+    let footprint = horizon_threads::process_memory::footprint_bytes()?;
+    let available = horizon_threads::process_memory::available_memory_bytes()?;
+    let limit = horizon_threads::process_memory::jetsam_limit_bytes()?.max(1);
+    let mib = |bytes: u64| bytes / 1024 / 1024;
+    Some([
+        format!(
+            "Mem: {:2}% {:03}/{:03}MiB",
+            (footprint * 100 / limit).min(100),
+            mib(footprint),
+            mib(limit)
+        ),
+        format!("Jetsam headroom: {:03}MiB", mib(available)),
+        format!("Footprint: {:03}MiB (phys_footprint)", mib(footprint)),
+    ])
+}
+
 /// `DebugEntryMemory`'s three lines.
 pub fn memory_lines(m: ProcessMemory, rate: i64) -> [String; 3] {
     let mib = |bytes: u64| bytes / 1024 / 1024;
