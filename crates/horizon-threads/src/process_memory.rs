@@ -99,29 +99,46 @@ pub fn resident_bytes() -> Option<u64> {
 /// count uses.
 #[cfg(target_vendor = "apple")]
 pub fn footprint_bytes() -> Option<u64> {
-    // TASK_VM_INFO is a Mach constant (mach/task_info.h), not something libc exports.
-    const TASK_VM_INFO: libc::c_int = 22;
-    let mut info = std::mem::MaybeUninit::<libc::task_vm_info>::zeroed();
-    // The call takes and returns the size in natural_t words. libc's struct and its count constant
-    // are the SDK's, so the two cannot disagree about the layout.
-    let mut count = (std::mem::size_of::<libc::task_vm_info>()
-        / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
-    // SAFETY: `info` is exactly `count` natural_t words of space for the struct the call writes,
-    // and the kernel never writes more than `count` words back. The task port is borrowed from
-    // libSystem and needs no deallocation.
+    // The layout lives in [`task_vm_info_layout`] so a host test can check its offsets: the Apple
+    // SDK is not on a Linux runner, so nothing else in CI can compile this branch at all.
+    let mut info = std::mem::MaybeUninit::<task_vm_info_layout::TaskVmInfo>::zeroed();
+    // `task_info` takes and returns the buffer's size in natural_t (32-bit) words.
+    let mut count = task_vm_info_layout::TaskVmInfo::COUNT;
+    let wanted = count;
+    // SAFETY: `info` is exactly `count` natural_t words of space, and the kernel writes at most
+    // that many words into it. The task port is libSystem's own and must not be deallocated.
     let result = unsafe {
         libc::task_info(
-            libc::mach_task_self(),
+            mach_task_self(),
             TASK_VM_INFO,
             info.as_mut_ptr().cast(),
             &mut count,
         )
     };
-    if result != libc::KERN_SUCCESS {
+    // A kernel older than rev1 stops early and reports fewer words: the field would then be
+    // uninitialised, so its value is not a measurement and must not be passed off as one.
+    if result != 0 || count < wanted {
         return None;
     }
-    // SAFETY: success means the kernel filled the struct; `phys_footprint` is plain data.
+    // SAFETY: the kernel filled the whole struct (it wrote `wanted` words, or we returned above),
+    // and every field is plain data.
     Some(unsafe { info.assume_init() }.phys_footprint)
+}
+
+/// `TASK_VM_INFO`'s flavour number (`osfmk/mach/task_info.h`).
+#[cfg(target_vendor = "apple")]
+const TASK_VM_INFO: libc::task_flavor_t = 22;
+
+/// `mach_task_self()`, the current task's port. `libc` only declares the `mach_task_self_` *static*
+/// and only for macOS, so the function is declared here; libSystem exports it on every Apple
+/// platform, and it returns a borrowed port that needs no deallocation.
+#[cfg(target_vendor = "apple")]
+fn mach_task_self() -> libc::mach_port_t {
+    unsafe extern "C" {
+        fn mach_task_self() -> libc::mach_port_t;
+    }
+    // SAFETY: no arguments, no preconditions; the port it returns is the borrowed current-task port.
+    unsafe { mach_task_self() }
 }
 
 /// `os_proc_available_memory()`: how many more bytes this process may allocate before jetsam kills
@@ -138,9 +155,9 @@ pub fn available_memory_bytes() -> Option<u64> {
     Some(unsafe { os_proc_available_memory() as u64 })
 }
 
-/// The symbol above, resolved from libSystem. Declared rather than pulled through a crate: it is
-/// one C function with an obvious signature, and it is only called on iOS 13+ (the deployment
-/// target is 16.0), so no weaker-linked fallback is needed.
+// `os_proc_available_memory`, resolved from libSystem. Declared here rather than pulled through a
+// crate: it is one C function with an obvious signature, and it is called only on iOS 13+ (the
+// deployment target is 16.0), so no weaker-linked fallback is needed.
 #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
 unsafe extern "C" {
     fn os_proc_available_memory() -> usize;
@@ -318,5 +335,69 @@ mod tests {
             mach_during >= mach_before + SIZE as u64 / 2,
             "Mach task: {mach_before} then {mach_during} bytes"
         );
+    }
+}
+
+/// The `task_vm_info` layout, where this target compiles it.
+#[cfg(target_vendor = "apple")]
+pub mod task_vm_info_layout {
+    /// The struct handed to `task_info(TASK_VM_INFO)`, laid out against XNU's
+    /// `osfmk/mach/task_info.h`. Public so a host test can check the offsets it will read on a
+    /// device: nothing else in CI can, because the Apple SDK is not on a Linux runner.
+    #[repr(C)]
+    pub struct TaskVmInfo {
+        pub virtual_size: u64,
+        pub region_count: i32,
+        pub page_size: i32,
+        pub resident_size: u64,
+        pub resident_size_peak: u64,
+        pub counters: [u64; 14],
+        pub phys_footprint: u64,
+    }
+
+    impl TaskVmInfo {
+        /// The buffer size `task_info` expects, in natural_t (32-bit) words.
+        pub const COUNT: u32 =
+            (std::mem::size_of::<Self>() / std::mem::size_of::<u32>()) as u32;
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    /// Where `phys_footprint` sits inside `task_vm_info`, and how big the buffer is — in **words**.
+    ///
+    /// These are the numbers a device reads the kernel's answer with, and no Linux CI can compile
+    /// the Apple branch to check them, so they are pinned here: XNU's `osfmk/mach/task_info.h` has
+    /// `virtual_size`, `region_count`, `page_size`, `resident_size`, `resident_size_peak` (32 bytes:
+    /// two 64-bit fields around two 32-bit ones), fourteen `mach_vm_size_t` counters (112 bytes),
+    /// then `phys_footprint` added for rev1.
+    ///
+    /// The header's own math agrees: `TASK_VM_INFO_REV0_COUNT = REV1 - 2` and rev0 is
+    /// `2 + 1 + 1 + 2 + 2 + 28 = 36` words, so rev1 is 38 words = 152 bytes with the field at 144.
+    /// Getting this wrong would read a neighbouring counter as the footprint and quietly feed the
+    /// RAM budget a number that is not the one jetsam checks.
+    #[test]
+    fn the_task_vm_info_offsets_match_the_header() {
+        // rev0 is 36 words: (2 + 1 + 1 + 2 + 2) for the five leading fields, 28 for the counters.
+        assert_eq!(36, 2 + 1 + 1 + 2 + 2 + 28, "rev0 words, from the header's field widths");
+        // phys_footprint is the next word after rev0, so byte offset 36 * 4 = 144.
+        let offset = 36 * 4;
+        assert_eq!(offset, 144, "phys_footprint offset");
+        assert_eq!(offset + 8, 152, "struct size");
+        assert_eq!(152 / 4, 38, "TASK_VM_INFO_COUNT in natural_t words");
+    }
+
+    /// The same numbers again, measured from the struct that is actually used on a device rather
+    /// than recomputed: on any target the field widths and `repr(C)` are the same as Apple's, so a
+    /// host test measures the very layout the phone will hand to `task_info`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_declared_struct_has_the_offsets_the_header_says() {
+        use super::task_vm_info_layout::TaskVmInfo;
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, resident_size), 16);
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, counters), 32);
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, phys_footprint), 144);
+        assert_eq!(std::mem::size_of::<TaskVmInfo>(), 152);
+        assert_eq!(TaskVmInfo::COUNT, 38);
     }
 }
