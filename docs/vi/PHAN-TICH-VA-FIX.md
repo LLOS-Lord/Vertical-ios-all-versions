@@ -507,3 +507,83 @@ Ba crate này là **lớp chính sách**, đã test đầy đủ, nhưng **chưa
   sách đã test, không phải tính năng đang bật.
 - Sandbox reset **hai lần** trong request này (xoá toolchain, prune 482 file `game/*.rs`, xoá swap).
   Đã phục hồi đầy đủ; `game/touch.rs` phải vá lại 2 arm `Interact`/`Dismount` đã mất trong lần prune.
+
+---
+
+# Phần 10 — Nối `Scheduler` vào `gfx.rs` + build trên GitHub Actions
+
+## 10.1 Điều chỉnh thiết kế sau khi đọc đường submit thật
+
+Kế hoạch ban đầu (§9.7) là "gọi `Scheduler::schedule` trước khi submit". Đọc `gfx.rs` cho thấy điều
+đó **sai** ở hai điểm, và sửa lại là phần lớn công việc của phần này:
+
+1. **Renderer đã submit đúng thứ tự cho TBDR.** Solid terrain đi pass riêng, translucent đi pass
+   riêng (`draw_sections(.., 0, solid_draws, translucent_draws)`), mirror và shadow camera cũng vậy.
+   Không có translucent nào xen giữa opaque ⇒ **không có gì để `Bucket` sửa**. Thêm một lượt sort
+   chỉ tốn CPU mỗi khung.
+2. **`Renderer::draws` không phải một túi draw độc lập.** Nó là một dãy **run liền mạch**, mỗi run
+   chia sẻ một arena page + index page, vì `draw_sections_from` bind một pipeline và một cặp buffer
+   cho mỗi page rồi phát cả run. Solid là **tiền tố** `0..solid_draws`, translucent nối sau, và trong
+   solid thì `phase1_draws..phase2_cutout` là opaque, phần còn lại là cutout.
+
+⇒ Bỏ lẻ tẻ một draw ở giữa là vô nghĩa (tiết kiệm đúng một `draw_indexed`, thứ GPU vốn đã bỏ qua khi
+bin rỗng). Cắt **đuôi** mới đáng: một run 200 draw trên một page là **một** lệnh
+`multi_draw_indexed_indirect`; giảm nửa danh sách là giảm nửa lệnh đó — và trên GPU Apple nút cổ chai
+là geometry/bin-list chứ không phải fragment.
+
+## 10.2 Cái đã làm: `gfx/draw_budget.rs`
+
+`horizon_gpu_governor::Governor` (đo thời gian GPU, trả về scale) + `Plan::of(solid, translucent,
+scale)`:
+
+* Scale áp lên **solid range** dưới dạng **độ dài tiền tố**, không bao giờ tạo lỗ.
+* **Translucent giữ nguyên độ dài**: đó là nước và kính quanh người chơi, số lượng ít so với solid, và
+  làm rỗng hồ trước khi rút ngắn chân trời là đánh đổi sai.
+* `MIN_SOLID_DRAWS = 8`: không bao giờ cắt vào near-field.
+* **Khung hình bình thường giữ nguyên toàn bộ danh sách** — `Plan::full`, mọi phép tính range quy về
+  như trước. Đường đo là **ngoại lệ**, không phải mặc định.
+* Một chỗ duy nhất: `let solid_draws = plan.solid;` — mọi pass đọc `solid_draws` nên không pass nào
+  vẽ quá mốc.
+* `target` của governor lấy theo `display_hz()` thật.
+
+**Test bắt được một lỗi thật:** `struggling()` ban đầu đo "plan có cắt không" — nhưng plan còn cắt
+suốt hàng trăm khung sau khi máy đã khoẻ (scale chưa về 1.0). Đổi sang đo "còn vượt target không"
+(`governor.frame_ms() > target_ms()`). **9/9 test pass.**
+
+## 10.3 Guardrail của CI — hai cái đỏ sẵn phải sửa trước khi push
+
+| Check | Trước | Sau |
+| --- | --- | --- |
+| `check_android_manifest.py` | ❌ thiếu **8** dependency (5 của request trước + 3 crate mới) | ✅ pass |
+| `check_layers.py` | ❌ **9** crate không có layer | ✅ 69 crate, 28 exception |
+| `check_public_tree.py` | cần git history → chỉ chạy được trên CI | ✅ pass trên CI |
+
+## 10.4 Push và kết quả Actions (commit `91bfa45`)
+
+| Workflow / job | Kết quả |
+| --- | --- |
+| `build` → Compact 26.3 Sim Runtime Pack | ✅ success |
+| `build` → **Rust Guardrails & Functional Tests** | ✅ **success** (guardrails, `horizon-hooks`, `horizon-addresses`, `horizon-protocol`, `horizon-port-pack`, `horizon-official`, `horizon-client-lib`, e2e ios_all_versions, check official) |
+| `build` → iOS Swift Tests & Native ARM64 IPA | ⏳ đang chạy |
+| `android` → apk | ❌ **fail ở "Build the game"** |
+
+### Lỗi Android và cách sửa
+
+```
+error: cannot update the lock file .../crates/horizon-android/Cargo.lock
+       because --locked was passed to prevent this
+```
+
+`crates/horizon-android` là **workspace riêng** với **lockfile riêng** (`crates/horizon-android/
+Cargo.lock`, có track trong git). `android.yml` build bằng `--manifest-path crates/horizon-android/
+Cargo.toml --locked`. Thêm 8 dependency vào manifest mà không cập nhật lockfile đó ⇒ cargo muốn ghi
+⇒ `--locked` chặn.
+
+**Cách sửa — và một cái bẫy đã tránh được:** `cargo update --manifest-path` **nâng cấp 93 crate**
+(gồm `wgpu`, `naga`, `tokio`, `zip`, `arboard`…) vì lockfile của Android đã cũ so với registry. Đó là
+thay đổi khổng lồ không liên quan và rất dễ làm hỏng build ARM64.
+
+Thay vào đó: chép **đúng 9 package block** của crate nội bộ từ `Cargo.lock` gốc sang, sắp xếp lại
+theo (name, version) đúng thứ tự cargo, rồi để `cargo metadata --locked` thêm các **cạnh phụ thuộc**
+còn thiếu trong những package đã có. Kết quả: **+73 dòng, 0 dòng xoá** — chỉ thêm. `cargo metadata
+--locked` exit=0 và lockfile **không đổi**.
