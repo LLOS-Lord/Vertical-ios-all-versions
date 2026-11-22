@@ -627,7 +627,16 @@ impl Game<'_> {
             }
             "sculk" => Ok(Some(self.sculk_command(&words)?)),
             "hello" => Ok(Some(hello())),
-            "status" => Ok(Some(self.control_status())),
+            "status" => {
+                // The overlay's draw-call count costs a walk over every solid draw, so it is only
+                // computed for a frame that someone is about to read. This is that request: the
+                // next frame counts, and keeps counting while the control socket keeps asking.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.want_stats(true);
+                }
+                self.stats_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                Ok(Some(self.control_status()))
+            }
             "memory" => Ok(Some(self.memory_value())),
             "stall" => {
                 let millis: u64 = arg(1)?.parse()?;

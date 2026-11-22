@@ -58,6 +58,11 @@ const WARNING_HOLD: Duration = Duration::from_secs(10);
 /// distance, and pretending otherwise only makes the crash later.
 const FLOOR_MIB: u64 = 256;
 
+/// At or under this much jetsam headroom the process acts on the frame it sees it, whatever the
+/// watermarks say: this is the margin the kernel kills from, and a photo, a dimension change or a
+/// chunk burst in the next second would spend it.
+pub const OUT_OF_HEADROOM_BYTES: u64 = 32 << 20;
+
 /// What the probe learned about the device this run.
 ///
 /// Every field is `Option` because every one of them comes from a platform call that a non-Apple
@@ -121,9 +126,40 @@ pub struct Census {
     pub world_bytes: u64,
     /// Resident sections, for the per-section cost in the log.
     pub sections: u64,
+    /// The process's `phys_footprint`, bytes, read from the kernel. This is the number jetsam
+    /// compares against, and the only figure here that is a measurement rather than a guess.
+    ///
+    /// The census alone was the budget's whole input, and on a device it read **8% of a 1363 MiB
+    /// ceiling** while the game was running a world at render distance 32 — because `mesh_bytes`
+    /// counted only the vertices resident *sections* hold, not the arena pages, the index buffer or
+    /// the block sprites' mips. A budget that under-reads by an order of magnitude never evicts;
+    /// that is why nine hours of device logs contain `freed 0 MiB` and nothing else.
+    pub measured_bytes: Option<u64>,
+    /// The process's jetsam headroom, bytes, from `os_proc_available_memory`. Zero means already
+    /// over the limit, which is the one state that must act immediately.
+    pub available_bytes: Option<u64>,
 }
 
 impl Census {
+    /// What the budget should compare against the ceiling: the kernel's `phys_footprint` when it
+    /// was read, and the accounted total otherwise.
+    ///
+    /// Taking the larger of the two is deliberate. A census that over-reports would evict memory
+    /// the process is really using; a census that under-reports — which is what the device log
+    /// showed — leaves the budget blind. `max` cannot be fooled by the second, and the first only
+    /// errs on the side of freeing caches that can be rebuilt.
+    pub fn in_use_bytes(&self) -> u64 {
+        self.measured_bytes
+            .unwrap_or(0)
+            .max(self.total_bytes())
+    }
+
+    /// Whether the kernel says this process is out of headroom: the state jetsam kills from, and
+    /// the only one that justifies evicting on the frame it is seen rather than at a watermark.
+    pub fn out_of_headroom(&self) -> bool {
+        self.available_bytes.is_some_and(|bytes| bytes < OUT_OF_HEADROOM_BYTES)
+    }
+
     /// Everything the game accounts for, bytes.
     pub fn total_bytes(&self) -> u64 {
         self.mesh_bytes
@@ -173,6 +209,8 @@ pub struct Budget {
     warnings: u32,
     /// The worst utilisation seen, so the log reports the peak rather than the frame it happened on.
     peak: f32,
+    /// Evictions forced by jetsam headroom rather than by a watermark.
+    emergencies: u32,
 }
 
 impl Budget {
@@ -190,6 +228,7 @@ impl Budget {
             warned: None,
             warnings: 0,
             peak: 0.0,
+            emergencies: 0,
         }
     }
 
@@ -221,10 +260,11 @@ impl Budget {
             None => String::new(),
         };
         format!(
-            "RAM {} MiB ceiling ({source}{limit}), peak {:.0}%, {} warning(s)",
+            "RAM {} MiB ceiling ({source}{limit}), peak {:.0}%, {} warning(s), {} headroom eviction(s)",
             self.ceiling_mib,
             self.peak * 100.0,
-            self.warnings
+            self.warnings,
+            self.emergencies
         )
     }
 
@@ -293,6 +333,22 @@ impl Budget {
         // The peak is against the ceiling, so a run that never crosses the high mark never logs.
         self.peak = self.peak.max(self.governor.utilisation(&registry));
 
+        // Out of headroom: evict now, in the order the registry ranks, without waiting for a
+        // watermark. The governor's marks are a share of a ceiling it only reaches on the way down;
+        // `os_proc_available_memory` under 32 MiB is the kernel saying the kill is close, and that
+        // is not a moment to be prudent about hysteresis.
+        if census.out_of_headroom() {
+            self.emergencies = self.emergencies.saturating_add(1);
+            let plan = Plan {
+                far_tiles: true,
+                offscreen_sections: true,
+                scratch: true,
+                cause: Cause::Headroom,
+            };
+            self.governor.plan_done(0);
+            return Some(plan);
+        }
+
         let plan = self.governor.frame(&registry, dt)?;
         Some(self.translate(plan, &census))
     }
@@ -344,6 +400,18 @@ impl Budget {
         registry.upsert("streaming_scratch", Class::Scratch, census.scratch_bytes, 0.0, 0);
         // The world's own chunks are player data: never evicted, reported so the total is honest.
         registry.upsert("world_chunks", Class::Irreplaceable, census.world_bytes, 0.0, 0);
+        // What the census cannot name — the arena pages, the index buffer, the sprites' mips, the
+        // GPU driver's host-side copies, the JVM-free heap of everything else the game holds — is
+        // the difference between what the kernel measures and what the caches above account for.
+        //
+        // Without this row the governor's utilisation was `census / ceiling`, which on the device
+        // read 8% while a world ran at render distance 32: the watermarks were never crossed and no
+        // cache was ever a candidate. The row is `Irreplaceable` and untouchable — it is not a
+        // cache — but it makes the total the number jetsam actually sees, so the marks mean what
+        // they say.
+        let named = registry.total_bytes();
+        let unnamed = census.in_use_bytes().saturating_sub(named);
+        registry.upsert("process_unaccounted", Class::Irreplaceable, unnamed, 0.0, 0);
         registry
     }
 
@@ -555,6 +623,8 @@ mod tests {
             texture_bytes: 3 << 20,
             scratch_bytes: 4 << 20,
             world_bytes: 5 << 20,
+            measured_bytes: None,
+            available_bytes: None,
             visible_share: 0.5,
             sections: 100,
         };
@@ -570,4 +640,89 @@ mod tests {
         assert!(budget.ceiling_mib() >= FLOOR_MIB);
         assert!(budget.describe().contains("tier"));
     }
+    /// The device's own numbers, from the bundle that exposed the defect: an iPhone10,5 with a
+    /// 2098 MiB jetsam limit, a 1363 MiB ceiling, and a census that summed to 8% of it — 109 MiB —
+    /// while a world ran at render distance 32. Before this change the governor compared 109 MiB
+    /// against 1363 and never crossed a watermark, which is exactly what the log showed: no plan,
+    /// no eviction, `freed 0 MiB`, for nine hours.
+    #[test]
+    fn the_devices_own_numbers_now_reach_the_governor() {
+        let census = Census {
+            // What the renderer's counters accounted for on the device.
+            mesh_bytes: 40 << 20,
+            visible_share: 0.5,
+            lod_bytes: 8 << 20,
+            texture_bytes: 16 << 20,
+            scratch_bytes: 1 << 20,
+            world_bytes: 44 << 20,
+            sections: 12_288,
+            // What the kernel measured: the real footprint of a phone running a world.
+            measured_bytes: Some(900 << 20),
+            available_bytes: Some(1198 << 20),
+        };
+        assert_eq!(census.total_bytes(), 109 << 20, "the census alone under-reads");
+        assert_eq!(census.in_use_bytes(), 900 << 20, "the kernel's figure is the one in use");
+
+        let device = Device {
+            physical_mib: Some(2973),
+            available_mib: Some(1198),
+            footprint_mib: Some(900),
+            limit_mib: Some(2098),
+        };
+        let mut budget = Budget::for_device(&device);
+        assert_eq!(budget.ceiling_mib(), 1363);
+
+        // 900 MiB of 1363 is 66%: over the high-water mark, so a plan is made. The same census
+        // without the kernel's figure is 8%, and made none — which is the difference between the
+        // budget the log described and the budget it should have been.
+        let now = Instant::now();
+        let plan = budget.frame(census, now, 0.016).expect("over the high mark");
+        assert!(!plan.is_empty());
+    }
+
+    /// `os_proc_available_memory` under the margin: evict on this frame, whatever the watermarks
+    /// say. This is the path a Jetsam kill comes through, and no watermark can catch it — the
+    /// ceiling is a design share, and the kill happens at the limit.
+    #[test]
+    fn no_jetsam_headroom_evicts_at_once() {
+        let device = Device {
+            physical_mib: Some(2973),
+            available_mib: Some(8),
+            footprint_mib: Some(2090),
+            limit_mib: Some(2098),
+        };
+        let mut budget = Budget::for_device(&device);
+        let census = Census {
+            mesh_bytes: 40 << 20,
+            visible_share: 1.0,
+            measured_bytes: Some(2090 << 20),
+            available_bytes: Some(8 << 20),
+            ..Census::default()
+        };
+        let plan = budget.frame(census, Instant::now(), 0.016).expect("a plan");
+        assert!(plan.far_tiles && plan.offscreen_sections && plan.scratch);
+        assert_eq!(plan.cause, Cause::Headroom);
+        assert!(budget.describe().contains("1 headroom eviction"));
+    }
+
+    /// A comfortable phone with the kernel's figures present and low: no plan, no eviction, and the
+    /// reported share is against the real footprint rather than against a census that under-reads.
+    #[test]
+    fn a_comfortable_phone_is_left_alone() {
+        let device = Device {
+            physical_mib: Some(2973),
+            available_mib: Some(1198),
+            footprint_mib: Some(400),
+            limit_mib: Some(2098),
+        };
+        let mut budget = Budget::for_device(&device);
+        let census = Census {
+            measured_bytes: Some(400 << 20),
+            available_bytes: Some(1198 << 20),
+            ..Census::default()
+        };
+        assert!(budget.frame(census, Instant::now(), 0.016).is_none());
+        assert_eq!(budget.utilisation(), 0.0);
+    }
+
 }

@@ -969,3 +969,96 @@ Bước tiếp theo cần nối vào `launcher_mods::port_jar` để verdict hi�
    Chỉ một dòng `GPU timer off` là đủ để biết vì sao draw budget im lặng.
 2. Tên một mod Fabric cụ thể bạn muốn chạy. Tôi sẽ chạy porter trên jar đó và nói chính xác cái gì
    port được, cái gì không — thay vì nói chung về "mod Fabric".
+
+---
+
+# §13 — Request #6: bốn điều bạn muốn, đo bằng log mới (build 25.1)
+
+Log `(7)` có phần "Game current" đầy đủ — lần đầu tiên đọc được số thật.
+
+## 13.1 Trả lời câu hỏi treo từ §12.4
+
+```
+Horizon renderer: pipelines ready (multi-draw on, occlusion culling on,
+                  GPU culling unavailable, GPU timer on)
+Horizon: startup handoff 948 ms (renderer 504 ms, start_game 59 ms)
+Horizon: first frame after 277 ms
+```
+
+- **`GPU timer on`** ⇒ `draw_budget` **có** số đo GPU. Nó không phải số trang trí. Giả thuyết §12.4
+  sai — tốt, đã loại.
+- **`GPU culling unavailable`** ⇒ trên Metal **không có** culling trên GPU. Mọi thứ về "thứ không nhìn
+  thấy" phải làm trên CPU. Đây là chìa khoá cho yêu cầu #4 của bạn.
+- Khởi động: 948 ms handoff, frame đầu 277 ms, `acquiring → presenting` 2 s. Chấp nhận được.
+
+## 13.2 Phát hiện lớn nhất: RAM manager **đếm sai một bậc độ lớn**
+
+```
+Horizon: RAM 1363 MiB ceiling (measured, jetsam 2098 MiB), peak 0%, 0 warning(s)
+Horizon: RAM world closed — freed 0 MiB (peak 4% of the 1363 MiB ceiling)
+```
+
+`peak 0–8%` của 1363 MiB = **13–109 MiB**, trong khi máy đang chạy world ở **render distance 32**.
+Không thể đúng: riêng sprite atlas đã 16 MiB, arena section vài chục MiB.
+
+**Nguyên nhân:** `Budget` chỉ so **census** với trần, và census chỉ là phép cộng trên các counter của
+renderer (`section_vertex_bytes()[0]` là *dung lượng arena đã cấp*, cộng `lod_quads*32`, sprite,
+scratch, world). Nó **không** có: page arena thừa, index buffer, mip của sprite, bản sao host-side của
+driver GPU, heap của phần còn lại của game. Và vì `probe()` chỉ chạy **một lần lúc khởi động**, con
+số duy nhất đúng — `phys_footprint` từ kernel — không bao giờ được dùng lại.
+
+Hệ quả: watermark không bao giờ bị vượt ⇒ `ram_tick` không bao giờ tạo plan ⇒ `freed 0 MiB` mãi mãi.
+Đây chính là "trình quản lý RAM" bạn yêu cầu ở mục 2, và nó **chưa từng hoạt động**.
+
+**Đã sửa (gốc):**
+1. `Census` có thêm `measured_bytes` (`phys_footprint`) và `available_bytes`
+   (`os_proc_available_memory`), đọc **mỗi frame** trong `ram_tick`.
+2. `Census::in_use_bytes()` = `max(measured, census total)` — census đếm thiếu thì không lừa được
+   budget nữa; census đếm thừa thì chỉ evict cache có thể dựng lại.
+3. `registry()` thêm dòng `process_unaccounted` (`Irreplaceable`) = phần kernel đo được mà census
+   không kể tên. Nhờ đó `utilisation` = số thật / trần, và watermark có nghĩa.
+4. **Đường khẩn cấp mới:** `Cause::Headroom` — khi `os_proc_available_memory` < 32 MiB, evict
+   (`far_tiles` + `offscreen_sections` + `scratch`) **ngay frame đó**, không đợi watermark. Đây là
+   ngưỡng mà Jetsam giết process; watermark không bao giờ bắt được nó vì trần là "design share".
+5. `describe()` in thêm số lần evict khẩn cấp.
+
+**Test dùng đúng số của máy bạn:** `2098 MiB` limit, `1363 MiB` ceiling, census `109 MiB`,
+`phys_footprint 900 MiB` ⇒ utilisation 66 % ⇒ **có plan**. Không có số kernel thì 8 % ⇒ không plan.
+Đó là toàn bộ khác biệt giữa budget trong log và budget đúng.
+
+## 13.3 Yêu cầu #4 — thứ không nhìn thấy: mặc định iOS đang **tắt** culling
+
+Đọc `Graphics::default()`: `cave_culling: true` nhưng `entity_culling: Off`,
+`particle_culling: Off`. Trên Metal thì `GPU culling unavailable`. Nghĩa là trên máy bạn:
+- entity sau tường **vẫn được vẽ**;
+- particle ngoài tầm nhìn **vẫn được vẽ**;
+- chỉ có section graph (cave culling) và leaf culling là làm việc.
+
+**Đã sửa:** mặc định iOS = `entity_culling: Asynchronous`, `particle_culling: Asynchronous`
+(async, không chặn frame — đúng nguyên tắc "không chặn main thread"), desktop giữ nguyên. Có test
+`a_phone_starts_with_the_cpu_side_culls_on` khoá lại. Mỗi thứ vẫn tắt được bằng một setting, và máy
+đã cài giữ giá trị đã lưu — đây là mặc định cho bản cài mới.
+
+## 13.4 Yêu cầu #1 — luồng xử lý: một việc mỗi frame không ai đọc
+
+Trên Metal, `section_draw_calls` được tính bằng cách **duyệt toàn bộ** danh sách solid draw mỗi frame
+(vài nghìn draw ở RD 32), chỉ để F3 hiển thị `C:`. Không ai đọc khi overlay tắt.
+
+Đã sửa: `Renderer::want_stats(bool)`. Overlay F3 bật khi nó thực sự vẽ; control socket `status` bật
+trong 2 giây. Ngoài ra **không tính**. (Số `drawn_sections` mà `saving.rs` dùng vẫn luôn có.)
+
+## 13.5 Yêu cầu #3 — port mod: phần đã làm và phần không thể
+
+`FabricDeclaration` (§12.5) đã có, 17/17 test. Repo không có engine Java ⇒ **mod có mixin không thể
+chạy code**. Không có cách nào "thêm cơ chế" để vượt qua điều đó mà không viết JVM + bridge Java↔Rust,
+đó là dự án riêng nhiều tháng và sẽ phá nguyên tắc hiệu năng. Điều làm được và đã làm: **nói đúng
+trước khi cài** (content port được bao nhiêu, hành vi mất gì).
+
+## 13.6 Nói thật về giới hạn
+
+- **Chưa có số FPS/frame-time nào.** Log không có. Mọi kết luận hiệu năng ở trên là từ **mã**, không
+  phải từ số đo frame. Muốn chứng minh cải thiện cần: chơi 60 s, xuất bundle, và tôi cần thấy
+  `peak %` của RAM (giờ phải là số thật, không còn 8 %) cùng frame time.
+- Test mới của `ram.rs` nằm trong target `--lib` của `horizon-client` **vốn không compile được từ
+  trước** (74 lỗi cũ). Đã kiểm bằng type-check: không thêm lỗi nào. Test ở crate khác
+  (`horizon-client-render` 21/21, `horizon-mod-shim` 17/17, `horizon-frame-sched` 21/21) chạy thật.

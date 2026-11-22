@@ -2989,6 +2989,9 @@ struct Game<'a> {
     last_ram_tick: Option<Instant>,
     /// Whether the budget's ceiling has been logged this session.
     ram_described: bool,
+    /// Until when the frame statistics are wanted: set by a control-socket `status` query, and by
+    /// the F3 overlay every frame it draws. Outside those, the renderer skips the draw-call count.
+    stats_deadline: Option<Instant>,
     ram_world_closed: bool,
     /// The F3 overlay's vertices between rebuilds (`draw_debug_overlay_under`).
     debug_paint: RefCell<horizon_client::debug_overlay::PaintCache>,
@@ -5754,6 +5757,13 @@ impl Game<'_> {
             // A column's sections, counted the way `ColumnLayout` lays them out.
             sections: (self.world.chunks.len() as u64)
                 .saturating_mul(self.world.layout().sections() as u64),
+            // The kernel's own figures. Everything above is arithmetic over the renderer's
+            // counters, and on a device it summed to 8% of a 1363 MiB ceiling while a world was
+            // running at render distance 32: the arena pages, the index buffer and the sprites'
+            // mips were simply not in it. `phys_footprint` is what jetsam measures, and
+            // `os_proc_available_memory` is how much is left before it kills the process.
+            measured_bytes: horizon_threads::process_memory::footprint_bytes(),
+            available_bytes: horizon_threads::process_memory::available_memory_bytes(),
         };
         let dt = self.last_ram_tick.map_or(0.016, |t| now.duration_since(t).as_secs_f32());
         self.last_ram_tick = Some(now);
@@ -6126,6 +6136,15 @@ impl Game<'_> {
         self.draw_narrator_toast(&mut batch);
         // Gui.extractRenderState: the debug overlay comes after the screen
         // and the toasts, so it is over everything, menus included.
+        // The overlay's `C:` line reads the draw-call count, and that count is a walk over every
+        // solid draw when the backend is Metal. So the renderer is told to count only while
+        // something is displaying it: this, or a control-socket `status` query.
+        let overlay_wants =
+            self.debug_entries.any_enabled(self.debug, self.reduced_debug_info()) && !self.ui.hide_gui;
+        let deadline = self.stats_deadline.filter(|at| Instant::now() < *at).is_some();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.want_stats(overlay_wants || deadline);
+        }
         self.draw_debug_overlay(&mut batch, size);
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
@@ -12278,6 +12297,7 @@ impl<'a> Game<'a> {
             ),
             last_ram_tick: None,
             ram_described: false,
+            stats_deadline: None,
             ram_world_closed: false,
             debug_paint: Default::default(),
             debug_refresh: Default::default(),

@@ -106,6 +106,9 @@ pub enum Cause {
     Thermal,
     /// A world was closed: everything belonging to it goes.
     WorldClosed,
+    /// The kernel reported almost no jetsam headroom (`os_proc_available_memory`): evict now,
+    /// whatever the watermarks say. This is the one cause that acts on the frame it is seen.
+    Headroom,
 }
 
 impl Cause {
@@ -115,6 +118,7 @@ impl Cause {
             Self::Warning => "warning",
             Self::Thermal => "thermal",
             Self::WorldClosed => "world-closed",
+            Self::Headroom => "headroom",
         }
     }
 }

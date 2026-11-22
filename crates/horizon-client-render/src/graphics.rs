@@ -969,10 +969,31 @@ impl Default for Graphics {
             far_detail: FarDetail::Full,
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
+            // Nothing culls draws on the GPU where the device cannot run the culling pass (the
+            // device log reports `GPU culling unavailable` on Metal), so whatever a phone does
+            // about what the player cannot see has to happen on the CPU. A phone therefore starts
+            // with the three CPU-side culls on and both of the ones that cost frame time
+            // asynchronous:
+            //
+            // * `entity_culling`: an entity behind a wall is not drawn. Off by default cost every
+            //   hidden mob and item frame its vertices, in a world at render distance 32.
+            // * `particle_culling`: the same for particles, which are many and small.
+            // * `leaf_culling` (below): the two faces a leaf shares are not drawn.
+            //
+            // All three are one setting away from off, and a phone upgrading keeps what it saved:
+            // this is the default a new install starts from, not a value forced on the player.
             gpu_culling: GpuCullingMode::Off,
-            entity_culling: EntityCullingMode::Off,
+            entity_culling: if cfg!(target_os = "ios") {
+                EntityCullingMode::Asynchronous
+            } else {
+                EntityCullingMode::Off
+            },
             entity_culling_precheck: 64,
-            particle_culling: ParticleCullingMode::Off,
+            particle_culling: if cfg!(target_os = "ios") {
+                ParticleCullingMode::Asynchronous
+            } else {
+                ParticleCullingMode::Off
+            },
             leaf_culling: if cfg!(target_os = "ios") {
                 LeafCullingMode::Hidden
             } else {
@@ -1626,6 +1647,26 @@ mod tests {
         assert!(g.settle_failed_start("Vulkan 10de:2684 GPU; NVIDIA; 582.02"));
         assert_eq!((g.hdr, g.hdr_failed_start), (HdrMode::On, None));
         assert!(!Graphics::default().hdr_held(held));
+    }
+
+    /// A phone starts with its CPU-side culling on: on Metal nothing culls on the GPU (the device
+    /// log reports `GPU culling unavailable`), so these three are the only thing standing between
+    /// the GPU and geometry the player cannot see. Both of the per-frame ones are asynchronous,
+    /// because the alternative — deciding on the frame's critical path — is what the working
+    /// principles forbid.
+    #[test]
+    fn a_phone_starts_with_the_cpu_side_culls_on() {
+        let g = Graphics::default();
+        assert!(g.cave_culling, "the section graph is what drops a cave's worth of geometry");
+        if cfg!(target_os = "ios") {
+            assert_eq!(g.entity_culling, EntityCullingMode::Asynchronous);
+            assert_eq!(g.particle_culling, ParticleCullingMode::Asynchronous);
+            assert_eq!(g.leaf_culling, LeafCullingMode::Hidden);
+        }
+        // Desktop keeps the stock defaults: its GPU culling pass runs.
+        if !cfg!(target_os = "ios") {
+            assert_eq!(g.entity_culling, EntityCullingMode::Off);
+        }
     }
 
     #[test]

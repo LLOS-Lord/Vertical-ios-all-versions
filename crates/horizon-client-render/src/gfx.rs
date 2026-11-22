@@ -1558,6 +1558,10 @@ pub struct Renderer {
     pub drawn_sections: usize,
     pub section_draws: usize,
     pub section_draw_calls: usize,
+    /// Whether anything is reading the frame statistics: the F3 overlay, or a `status` query over
+    /// the control socket. While nothing is, the draw-call count is not computed — it is a walk
+    /// over every solid draw, and the frame is better off without it.
+    stats_wanted: bool,
     /// `draw_frame`'s frames past its early returns, and the one whose statistics are shown.
     frame_serial: u64,
     stats_frame: u64,
@@ -5266,6 +5270,7 @@ impl Renderer {
             drawn_sections: 0,
             section_draws: 0,
             section_draw_calls: 0,
+            stats_wanted: false,
             frame_serial: 0,
             stats_frame: 0,
             uploaded_bytes: 0,
@@ -9460,9 +9465,18 @@ impl Renderer {
         );
         let shadow_translucent = self.draws.len() as u32 - shadow_first - shadow_solid;
         laps.lap("r_nearby");
-        // Metal replays a multi-draw as one draw call per entry.
-        let mut section_draw_calls = if self.multi_draw && self.info.backend != wgpu::Backend::Metal
-        {
+        // Metal replays a multi-draw as one draw call per entry, so the count is the number of
+        // page runs; elsewhere it is one call per draw.
+        //
+        // This was computed for every frame, for every device, to be read by one consumer: the F3
+        // overlay's `C:` line. The filter walks the whole solid range — several thousand draws at
+        // render distance 32 — and on Metal it cannot stop early or be folded into the loop that
+        // already walks it, because `multi_draw` is true there and the backend test is what makes
+        // the walk necessary at all. It is now paid only when something is reading the number.
+        let counting_calls = self.stats_wanted && !self.draws.is_empty();
+        let mut section_draw_calls = if !counting_calls {
+            0
+        } else if self.multi_draw && self.info.backend != wgpu::Backend::Metal {
             (0..section_draws)
                 .filter(|&i| {
                     i == 0

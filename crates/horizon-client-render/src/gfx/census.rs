@@ -11,6 +11,15 @@ use super::{
 impl Renderer {
     /// The sections the last frame drew, and those it holds: the share on screen is what tells the
     /// RAM budget whether releasing memory would only remesh what the player is looking at.
+    /// Ask for the frame statistics to be counted (`control.rs`'s `status`, the F3 overlay).
+    ///
+    /// Counting them costs a walk over every solid draw on Metal, where the backend replays a
+    /// multi-draw as one call per entry: worth paying while a player is reading the overlay, not
+    /// worth paying on the other 99% of frames.
+    pub fn want_stats(&mut self, wanted: bool) {
+        self.stats_wanted = wanted;
+    }
+
     pub fn drawn_and_resident(&self) -> (usize, usize) {
         (self.drawn_sections, self.sections.len())
     }
