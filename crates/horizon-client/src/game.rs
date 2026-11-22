@@ -5773,6 +5773,24 @@ impl Game<'_> {
             // says nothing about what the budget is holding the game to.
             self.ram_described = true;
             log::info!("Horizon: {}", self.ram.describe());
+            // What the four culls are set to, and how much of the world the GPU is handed. The
+            // bundle could not answer "was culling on?" at all: no line in it named a culling
+            // mode, and on Metal `GPU culling unavailable` is the only one that appears, which
+            // reads as though geometry the player cannot see is free. It was not.
+            let g = &self.settings.horizon;
+            log::info!(
+                "Horizon: culling — caves {}, GPU {}, entities {}, particles {}, leaves {}; {} columns \
+                 of {} sections, {} draw section(s) resident, {}% of the mesh visible",
+                if g.cave_culling { "on" } else { "off" },
+                g.gpu_culling.name(),
+                g.entity_culling.name(),
+                g.particle_culling.name(),
+                g.leaf_culling.name(),
+                self.world.chunks.len(),
+                self.world.layout().sections(),
+                renderer.section_draw_calls,
+                (census.visible_share * 100.0).round(),
+            );
         }
         let Some(plan) = self.ram.frame(census, now, dt.min(0.25)) else {
             return;

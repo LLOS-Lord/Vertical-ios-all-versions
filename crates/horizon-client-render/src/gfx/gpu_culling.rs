@@ -537,6 +537,51 @@ pub(super) fn supported(
         && !loses_base_vertex(info, flat_min_sections.is_some())
 }
 
+/// The first requirement `supported` did not meet, as a short phrase for the startup line.
+///
+/// `supported` answers yes or no, and a bundle that carries only the no is a dead end: the
+/// phone's log says `GPU culling unavailable` and nothing else, which leaves open whether the
+/// pass is merely not offered on that backend or whether the device cannot run it at all. The
+/// answer changes what to do - the first is a setting, the second is not - so the reason is
+/// written down at the one place that knows it, in the order `supported` checks them, cheapest
+/// first (a check that costs nothing is reported before one that has to look at a driver).
+///
+/// Returns `"available"` when nothing failed, so the caller can print the answer either way.
+pub(super) fn shortfall(
+    info: &wgpu::AdapterInfo,
+    features: wgpu::Features,
+    downlevel: wgpu::DownlevelFlags,
+    limits: &wgpu::Limits,
+    multi_draw: bool,
+    flat_min_sections: Option<usize>,
+) -> &'static str {
+    if !super::translucent_batchable(info, multi_draw) {
+        // Metal reports no `INDIRECT_FIRST_INSTANCE` before macOS 14 / iOS 17, and `multi_draw`
+        // needs it: this is the answer an iPhone on iOS 16 gets, and it is about the OS, not the
+        // chip.
+        return "not offered here: no indirect first instance";
+    }
+    if flat_min_sections.is_some_and(|min| min != usize::MAX) {
+        return "not offered here: a shader pack draws flat";
+    }
+    if !features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT) {
+        return "not offered here: no multi-draw indirect count";
+    }
+    if !downlevel.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) {
+        return "no compute shaders";
+    }
+    if limits.max_storage_buffers_per_shader_stage < 8 {
+        return "not offered here: under 8 storage buffers a stage";
+    }
+    if super::flat::is_broken_intel_vulkan(info) {
+        return "no: this Intel Vulkan driver miscounts instanced draws";
+    }
+    if loses_base_vertex(info, flat_min_sections.is_some()) {
+        return "not offered here: DX12 with flat page groups loses the base vertex";
+    }
+    "available"
+}
+
 /// DX12's count draws leave each draw's base vertex out of `vertex_index`, by which the
 /// pulled solid pipelines (those of a device with flat page groups) read the page.
 /// shortcut: not offered there, until GPU culling's draws carry their base vertex otherwise.
@@ -1643,6 +1688,106 @@ mod tests {
         fn unit(&mut self) -> f32 {
             (self.bits() >> 40) as f32 / (1u64 << 24) as f32
         }
+    }
+
+    /// The device this ran on: an Apple A11 through Metal on iOS 16.7, whose bundle reports
+    /// `GPU culling unavailable`. Metal before iOS 17 has no `INDIRECT_FIRST_INSTANCE`, so
+    /// `multi_draw` is off and the reason the pass is not offered is the OS — not the chip, and
+    /// not a setting the player can change. The startup line has to be able to say that, because
+    /// "unavailable" on its own reads as a defect and sent this investigation down the wrong path.
+    #[test]
+    fn an_iphone_on_ios_16_is_told_the_os_is_why() {
+        let info = wgpu::AdapterInfo {
+            name: "Apple A11 GPU".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Metal,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        };
+        // What iOS 16 offers: compute shaders, plenty of storage buffers, no multi-draw.
+        let why = shortfall(
+            &info,
+            wgpu::Features::empty(),
+            wgpu::DownlevelFlags::COMPUTE_SHADERS,
+            &wgpu::Limits::default(),
+            false,
+            None,
+        );
+        assert_eq!(why, "not offered here: no indirect first instance");
+        assert!(!supported(
+            &info,
+            wgpu::Features::empty(),
+            wgpu::DownlevelFlags::COMPUTE_SHADERS,
+            &wgpu::Limits::default(),
+            false,
+            None,
+        ));
+    }
+
+    /// When it is offered the reason says so, so the caller prints one string either way and the
+    /// two can never disagree about which branch was taken.
+    #[test]
+    fn the_reason_is_available_when_the_pass_is() {
+        let info = wgpu::AdapterInfo {
+            name: "Apple M2".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Metal,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        };
+        let features = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        let downlevel = wgpu::DownlevelFlags::COMPUTE_SHADERS;
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 8,
+            ..wgpu::Limits::default()
+        };
+        assert!(supported(&info, features, downlevel, &limits, true, None));
+        assert_eq!(shortfall(&info, features, downlevel, &limits, true, None), "available");
+    }
+
+    /// A shader pack that draws flat takes the pass away on any device, and the reason names the
+    /// pack rather than the hardware: the player can turn the pack off and get the pass back.
+    #[test]
+    fn a_flat_drawing_shader_pack_is_named_as_the_reason() {
+        let info = wgpu::AdapterInfo {
+            name: "Apple M2".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Metal,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        };
+        let features = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        let downlevel = wgpu::DownlevelFlags::COMPUTE_SHADERS;
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 8,
+            ..wgpu::Limits::default()
+        };
+        // `min_sections` cheaper than every section: flat draws for the terrain.
+        assert_eq!(
+            shortfall(&info, features, downlevel, &limits, true, Some(4)),
+            "not offered here: a shader pack draws flat"
+        );
     }
 
     /// Where a section's solid quads are: key, arena page, first vertex, quads,

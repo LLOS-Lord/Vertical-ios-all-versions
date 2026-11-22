@@ -45,6 +45,37 @@ const HOLD_STILL: Duration = Duration::from_millis(120);
 const MENU_STEP_DELAY: Duration = Duration::from_millis(350);
 const MENU_STEP_REPEAT: Duration = Duration::from_millis(100);
 
+/// Whether a touch diagnostic may fill the log this frame. The bundle that exposed this carried
+/// 15 505 `touch` lines in 15 693: per-finger-event `INFO` lines, formatted and written on the
+/// render thread, that drowned every other line in it - the RAM plan, the culling states, the
+/// frame budget. A gesture is worth the shape of it once a second, not every event.
+///
+/// The log wants four things from input, and nothing else: did a finger land where the game thinks
+/// it did, did a gesture become a control, did a menu receive what the player meant, and did input
+/// stop arriving. So the gate is a drip - [`TOUCH_DRIP`] lines a second across the whole module,
+/// shared by every site - and each site additionally keeps its own per-key interval through
+/// [`log_due`]. At 30 lines a second the log costs nothing measurable; the finger events that do
+/// not fit are counted and mentioned in the next line that does.
+pub(super) fn touch_log_due() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// What the callers were not allowed to write since the last line that was.
+    static DROPPED: AtomicU32 = AtomicU32::new(0);
+    if log_due("touch-drip", TOUCH_DRIP) {
+        let dropped = DROPPED.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            log::info!("touch: {dropped} finger event(s) went unlogged to keep this log readable");
+        }
+        true
+    } else {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// The longest a touch diagnostic waits: a gesture's shape survives 33 ms, and a hundred fingers a
+/// second do not each get a line.
+const TOUCH_DRIP: std::time::Duration = std::time::Duration::from_millis(33);
+
 /// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
 /// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
 pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
@@ -513,7 +544,9 @@ impl Game<'_> {
         );
         // Every start, lift and cancel, but a drag's moves only once a second: the log wants the shape of a
         // gesture and the state the look gate reads, not a hundred lines a second.
-        if touch.phase != TouchPhase::Moved || log_due("touch", std::time::Duration::from_secs(1)) {
+        if (touch.phase != TouchPhase::Moved || log_due("touch", std::time::Duration::from_secs(1)))
+            && touch_log_due()
+        {
             log::info!(
                 "touch {} {:?} at ({:.0}, {:.0}) GUI; playing={} focused={} captured={} agent_pointer={}",
                 touch.id,
@@ -1955,5 +1988,49 @@ impl Game<'_> {
             }
         }
         buttons
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundle that opened this carried 15 505 touch lines of 15 693 - 99% of it, at INFO, on
+    /// the render thread - because every finger event was written. `Moved` already went through a
+    /// one-second interval, but `Started` and `Ended` did not: a hundred taps a second (the studio's
+    /// buttons, a menu's cursor) wrote two lines each, and the log became unreadable.
+    ///
+    /// This pins the drip: no more than a bounded number of lines a second across the module,
+    /// whatever the event rate. The numbers here are the bundle's own: 8 000 events in a minute of
+    /// play is what the file shows, and it must cost that minute a few dozen lines, not 8 000.
+    #[test]
+    fn finger_events_cannot_fill_the_log() {
+        let start = std::time::Instant::now();
+        let mut allowed = 0;
+        // 8 000 events, as fast as a finger can arrive.
+        for _ in 0..8_000 {
+            if touch_log_due() {
+                allowed += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        // One line per `TOUCH_DRIP`: a burst that takes a moment gets a handful.
+        let ceiling = elapsed.as_secs_f64() / TOUCH_DRIP.as_secs_f64() + 2.0;
+        assert!(
+            f64::from(allowed) <= ceiling,
+            "{allowed} lines in {elapsed:?}, more than {ceiling:.0}"
+        );
+        assert!(allowed <= 8_000, "every event was logged");
+    }
+
+    /// A gesture keeps its shape: at least one line while it happens, so a report can still say
+    /// where a finger landed.
+    #[test]
+    fn a_gesture_still_gets_a_line() {
+        // A different key from the one the other test used, so this one starts with its interval
+        // expired: the drip is shared, and it is the first event of the process either way.
+        let allowed = (0..50).filter(|_| touch_log_due()).count();
+        assert!(allowed >= 1, "a gesture's start and end must still be logged");
+        assert!(allowed < 50, "and not once per event");
     }
 }

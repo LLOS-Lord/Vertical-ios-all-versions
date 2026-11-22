@@ -1062,3 +1062,39 @@ trước khi cài** (content port được bao nhiêu, hành vi mất gì).
 - Test mới của `ram.rs` nằm trong target `--lib` của `horizon-client` **vốn không compile được từ
   trước** (74 lỗi cũ). Đã kiểm bằng type-check: không thêm lỗi nào. Test ở crate khác
   (`horizon-client-render` 21/21, `horizon-mod-shim` 17/17, `horizon-frame-sched` 21/21) chạy thật.
+
+## 13.7 "Cơ chế không rõ": giờ log nói tên từng cái
+
+Bạn nói đúng — log cũ **không có dòng nào** cho biết culling đang bật hay tắt. Chỉ có
+`GPU culling unavailable`, một chữ "unavailable" không lý do, đọc lên như thể hình học không nhìn
+thấy là miễn phí. Đã thêm hai dòng, in **một lần** khi world mở:
+
+```
+Horizon: RAM 1363 MiB ceiling (measured, jetsam 2098 MiB), ... 0 headroom eviction(s)
+Horizon: culling — caves on, GPU off, entities async, particles async, leaves hidden;
+         1024 columns of 24 sections, 1840 draw section(s) resident, 47% of the mesh visible
+```
+
+- `GPU off` / `entities async` … chính là bốn công tắc của yêu cầu #4, nêu đích danh.
+- `shortfall()` mới trong `gpu_culling.rs` trả **lý do** thay cho chữ `unavailable`:
+  `not offered here: no indirect first instance` (iOS 16 trên máy bạn — do **hệ điều hành**, không
+  phải do chip), `a shader pack draws flat` (do pack shader — tắt pack là có lại),
+  `under 8 storage buffers a stage`, `no compute shaders`, …
+  Ba test mới, một test dựng đúng `AdapterInfo` của A11/Metal/iOS 16.
+
+## 13.8 Log: 99% file là một gesture
+
+| dòng | số lượng |
+|---|---|
+| `touch N Ended/Started/Moved at …` | 15 505 / 15 693 (**98,8 %**) |
+
+`Moved` đã có interval 1 giây, nhưng `Started`/`Ended` thì **không**: 825 lần `press Forward` ⇒ 825
+`Started` + 825 `Ended`, mỗi dòng `format!` + ghi file **trên render thread**. Đó là ~7.600 cặp
+dòng trong một phiên. Mọi log khác — plan RAM, budget, culling, mod — bị chôn trong đó.
+
+Đã thêm `touch_log_due()`: **một drip chung cho cả module**, tối đa 1 dòng / 33 ms (≈30 dòng/giây),
+và các sự kiện bị bỏ được **đếm** rồi nói trong dòng kế tiếp
+(`touch: 412 finger event(s) went unlogged to keep this log readable`). Một gesture vẫn giữ nguyên
+hình dạng (bắt đầu / kết thúc), `press`/`release`/`hold` vẫn ở INFO vì đó là những dòng để chẩn đoán
+một nút bị kẹt. Test: `finger_events_cannot_fill_the_log` (8 000 sự kiện ⇒ không quá số dòng cho
+phép), `a_gesture_still_gets_a_line`.

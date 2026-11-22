@@ -4889,6 +4889,18 @@ impl Renderer {
             ),
             flat.is_some(),
         );
+        // Why it is not offered, named. The bundle used to carry only `GPU culling unavailable`,
+        // with nothing beside it, so the one question worth asking of a phone -- is the pass merely
+        // not offered here, or is the hardware unable to run it? -- could not be answered from the
+        // log. `gpu_culling::shortfall` names the first requirement that failed.
+        let gpu_culling_why = gpu_culling::shortfall(
+            &adapter.get_info(),
+            device.features(),
+            adapter.get_downlevel_capabilities().flags,
+            &device.limits(),
+            multi_draw,
+            flat.as_ref().map(|f| f.min_sections),
+        );
         // Not again after the device was lost in one of its frames, until Horizon restarts.
         let gpu_culling_offer = if crate::graphics::gpu_culling_lost() {
             crate::graphics::GpuCullingOffer::DeviceLost
@@ -4970,10 +4982,9 @@ impl Renderer {
                 "pipelines ready (multi-draw {}, occlusion culling {}, GPU culling {}, GPU timer {})",
                 on_off(multi_draw),
                 on_off(cull.is_some()),
-                if gpu_culling_offer == crate::graphics::GpuCullingOffer::Offered {
-                    "available"
-                } else {
-                    "unavailable"
+                match gpu_culling_offer {
+                    crate::graphics::GpuCullingOffer::Offered => "available",
+                    _ => gpu_culling_why,
                 },
                 on_off(gpu_timer.is_some()),
             ));
