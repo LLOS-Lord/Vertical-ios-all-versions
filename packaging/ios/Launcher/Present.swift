@@ -18,6 +18,9 @@ private var rotationWatchInstalled = false
 public func horizonLauncherPresent(_ submit: HorizonSubmit?) -> Bool {
     Bridge.submit = submit
     Theme.registerFonts()
+    // Start hearing the phone's heat before the game's first frame: the governor polls from
+    // `game/thermal.rs`, and with nothing reporting, a hot phone was always told "nominal".
+    Thermal.watch()
     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
     Diagnostics.record("launcher presented; Horizon \(version) on iOS \(UIDevice.current.systemVersion)")
     DispatchQueue.main.async {

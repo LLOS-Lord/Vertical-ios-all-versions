@@ -12,6 +12,9 @@
 //! ([`take`]), the game answers it on its next frame, and the answer goes back to Swift through the callback
 //! that came with it.
 
+#![cfg_attr(not(target_os = "ios"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "ios", deny(unsafe_code))]
+
 use std::{
     collections::VecDeque,
     sync::{Mutex, PoisonError},
@@ -80,6 +83,19 @@ static THERMAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 /// on `thermalStateDidChangeNotification` and once at start.
 pub fn set_thermal_state(raw: i32) {
     THERMAL.store(raw.clamp(0, 3), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The C entry point Swift's launcher calls on every `thermalStateDidChangeNotification` and once
+/// when it loads, so the game sees the phone's heat rather than an environment variable nothing
+/// sets on a device.
+///
+/// No allocation, no dependency on the game's frame loop, callable from any thread: it stores one
+/// relaxed integer, which is what [`thermal_state`] later reads. `raw` is Apple's own 0..=3 scale;
+/// anything else is clamped, because a wrong number must not be able to invent a thermal emergency.
+#[cfg_attr(target_os = "ios", unsafe(no_mangle))]
+#[cfg(target_os = "ios")]
+pub extern "C" fn horizon_thermal_state(raw: i32) {
+    set_thermal_state(raw);
 }
 
 /// The last reported thermal state, `None` where nothing reports one (every desktop).

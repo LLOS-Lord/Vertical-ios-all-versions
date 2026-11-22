@@ -116,6 +116,11 @@ pub struct DrawBudget {
     /// for as long as the scale is below one, which is hundreds of frames after the device has
     /// recovered, and reporting that as struggling would be saying something untrue.
     over: u32,
+    /// Frames observed, and how many of them carried a GPU time. `observed == 0` after hundreds of
+    /// frames means the platform never gave a measurement, which is a different report from a fast
+    /// device and must not be shown as one.
+    frames: u64,
+    observed: u64,
 }
 
 impl DrawBudget {
@@ -123,6 +128,8 @@ impl DrawBudget {
     pub fn new(target_ms: f32) -> Self {
         Self {
             governor: Governor::new(target_ms),
+            frames: 0,
+            observed: 0,
             applied: 1.0,
             over: 0,
         }
@@ -151,7 +158,9 @@ impl DrawBudget {
     /// Returns whether the plan for this frame is different from the last one, so the caller only
     /// re-plans when the answer actually moved.
     pub fn observe(&mut self, gpu_ms: Option<f32>, solid: u32, translucent: u32) -> (Plan, bool) {
+        self.frames = self.frames.saturating_add(1);
         if let Some(ms) = gpu_ms {
+            self.observed = self.observed.saturating_add(1);
             self.governor.observe(ms);
         }
         let plan = Plan::of(solid, translucent, self.governor.scale());
@@ -177,6 +186,18 @@ impl DrawBudget {
 
     /// A one-line description for the performance overlay.
     pub fn describe(&self) -> String {
+        // Say so when there is no measurement at all. Without this the overlay reads "GPU 0.0/16.7
+        // ms at 100% scale", which looks like a device with room to spare rather than one whose
+        // frame time was never read — and on a platform where the timestamp query is not granted
+        // (the Metal path being the one that matters here) that is exactly what happens: the
+        // governor is never observed and never shortens anything.
+        if self.observed == 0 {
+            return format!(
+                "GPU time not read ({} frame(s), no timestamp query): the draw budget is not \
+                 shortening anything",
+                self.frames
+            );
+        }
         self.governor.describe()
     }
 }
@@ -279,8 +300,25 @@ mod tests {
 
     #[test]
     fn the_description_is_one_line() {
-        let budget = DrawBudget::new(16.7);
+        let mut budget = DrawBudget::new(16.7);
+        budget.observe(Some(8.0), 400, 20);
         let text = budget.describe();
         assert!(text.contains("ms") && !text.contains('\n'));
+    }
+
+    /// The defect this fixed: with no GPU time ever reported, the overlay said
+    /// "GPU 0.0/16.7 ms at 100% scale", which reads as a device with plenty of room. It was a
+    /// device whose frame time was never measured — and a budget that never shortens anything.
+    #[test]
+    fn no_measurement_is_reported_as_no_measurement() {
+        let mut budget = DrawBudget::new(16.7);
+        for _ in 0..30 {
+            budget.observe(None, 400, 20);
+        }
+        let text = budget.describe();
+        assert!(text.contains("not read"), "{text}");
+        assert!(!text.contains("0.0/16.7"), "a missing reading is not a fast frame: {text}");
+        // And it still does not pretend to have shortened anything.
+        assert_eq!(budget.scale(), 1.0);
     }
 }

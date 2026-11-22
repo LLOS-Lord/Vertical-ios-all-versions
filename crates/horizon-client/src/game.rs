@@ -5704,7 +5704,7 @@ impl Game<'_> {
         // "nothing to poll" were one answer is what kept this silent: the governor's first
         // observation only *seeds* it, so the first live level was never announced either.
         let changed = self.heat.tick(now);
-        if !changed && !self.heat.settled() {
+        if !changed {
             return;
         }
         let change = self.heat.take_change();
@@ -5722,11 +5722,11 @@ impl Game<'_> {
                 "The device has cooled down: full quality restored",
             ));
         }
-        // Once per level, and once on the first poll of a session: a device log that never mentions
-        // the thermal state cannot be told apart from one where it was never read.
-        if change.is_some() || !self.heat.described() {
-            self.heat.note_described();
-            log::info!("Horizon: thermal {}", self.heat.describe());
+        // Once per level. The first reading of a session is covered too: `tick` reports the change
+        // from `Nominal`, and the device log's 131 identical "thermal nominal" lines in 40 seconds
+        // were this branch running on every poll because nothing ever marked the level as announced.
+        if let Some(level) = change {
+            log::info!("Horizon: thermal {} ({})", self.heat.describe(), level.as_str());
         }
     }
 

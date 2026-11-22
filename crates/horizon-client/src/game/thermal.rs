@@ -45,8 +45,8 @@ pub struct Thermal {
     announced: ThermalLevel,
     /// The level as last read, so a change can be detected without the governor's own latch.
     current: ThermalLevel,
-    /// Whether a reading has been logged this session.
-    described: bool,
+    /// The last raw report, so a level that vanishes by the next poll is not acted on.
+    pending: Option<ThermalLevel>,
     /// The renderer's resolution ceiling from the heat alone, 0..=1. Dynamic Resolution still
     /// decides *where* in the range the frame lands; this only lowers the top of the range, which
     /// is why it composes with the frame's own autotune instead of overriding it.
@@ -69,7 +69,7 @@ impl Thermal {
             announced: ThermalLevel::Nominal,
             current: ThermalLevel::Nominal,
             resolution_scale: 1.0,
-            described: false,
+            pending: None,
         }
     }
 
@@ -87,25 +87,6 @@ impl Thermal {
     /// The level currently in force.
     pub fn level(&self) -> ThermalLevel {
         self.current
-    }
-
-    /// Whether the governor has taken its first observation.
-    ///
-    /// Its first reading only seeds it — there is nothing to compare against yet — so it is not a
-    /// change and must not be mistaken for "nothing happened". The caller uses this to make sure a
-    /// session's *first* thermal reading is reported even when it needs no action taken.
-    pub fn settled(&self) -> bool {
-        self.polled.is_some()
-    }
-
-    /// Whether a reading has been logged this session.
-    pub fn described(&self) -> bool {
-        self.described
-    }
-
-    /// Record that a reading has been logged.
-    pub fn note_described(&mut self) {
-        self.described = true;
     }
 
     /// Poll the platform's thermal state and step the governor. Returns whether the caller must
@@ -126,17 +107,27 @@ impl Thermal {
         }
         self.polled = Some(now);
         let level = platform_level();
+        // A level must survive one poll before it takes quality away. `thermalState` flaps between
+        // nominal and fair on a warm phone, and acting on the first fair of a pair would spend a
+        // resolution change (and the frame that pays for re-creating the target) on a spike that was
+        // gone 2 seconds later. Descending is the expensive direction, so it is the one gated;
+        // a cooler report is believed at once.
+        let seen = self.pending.replace(level);
+        let level = if level > self.current && seen != Some(level) {
+            self.current
+        } else {
+            level
+        };
         self.current = level;
         self.governor.observe(level, dt);
         self.sync();
         // The governor's action can change without the level changing (its own hysteresis), so the
-        // change is measured against what the caller was last told.
-        let effective = self.governor.level();
-        if effective == self.announced {
-            return false;
-        }
-        self.announced = effective;
-        true
+        // change is measured against what the caller was last told. `announced` is **not** written
+        // here: `take_change` owns it. Writing it here as well made `take_change` always answer
+        // `None`, which is why a device's log carried the same "thermal nominal" line 131 times in
+        // one session — the caller saw "no change" every time and its once-a-session guard never
+        // tripped.
+        self.governor.level() != self.announced
     }
 
     /// The change since the last call, if any: what the caller should announce to the player.
@@ -194,7 +185,7 @@ impl Thermal {
         self.polled = None;
         self.announced = ThermalLevel::Nominal;
         self.current = ThermalLevel::Nominal;
-        self.described = false;
+        self.pending = None;
         self.sync();
     }
 
@@ -211,15 +202,20 @@ impl Thermal {
 /// phone. Everything else reports nominal — a desktop has no thermal state to report, and the
 /// governor's other inputs (frame time) still act.
 fn platform_level() -> ThermalLevel {
-    match std::env::var("HORIZON_THERMAL").as_deref() {
-        Ok("nominal") => ThermalLevel::Nominal,
-        Ok("fair") => ThermalLevel::Fair,
-        Ok("serious") => ThermalLevel::Serious,
-        Ok("critical") => ThermalLevel::Critical,
-        // `horizon-ios` sets this from `ProcessInfo` on iOS; elsewhere it never appears.
-        Ok(raw) => raw.parse::<i64>().map_or(ThermalLevel::Nominal, ThermalLevel::from_raw),
-        Err(_) => ThermalLevel::Nominal,
+    // The phone's own report first: `horizon-ios-launcher` holds what Swift's
+    // `ProcessInfo.thermalStateDidChangeNotification` last said. Reading only an environment
+    // variable — which nothing sets on a device — is why the thermal governor never once acted on
+    // heat in nine hours of play: it was told "nominal" on a phone that was hot.
+    if let Ok(raw) = std::env::var("HORIZON_THERMAL") {
+        return match raw.as_str() {
+            "nominal" => ThermalLevel::Nominal,
+            "fair" => ThermalLevel::Fair,
+            "serious" => ThermalLevel::Serious,
+            "critical" => ThermalLevel::Critical,
+            other => other.parse::<i64>().map_or(ThermalLevel::Nominal, ThermalLevel::from_raw),
+        };
     }
+    horizon_ios_launcher::thermal_state().map_or(ThermalLevel::Nominal, ThermalLevel::from_raw)
 }
 
 #[cfg(test)]
@@ -270,19 +266,19 @@ mod tests {
         assert_eq!(thermal.level(), ThermalLevel::Nominal);
     }
 
-    /// The defect: the governor's first observation only *seeds* it, so it reports no change — and
-    /// `heat_tick` read "no change" as "nothing to do" and returned before even looking. The device
-    /// log then contained no thermal line at all, in nine hours of play.
+    /// The defect, as a test: `tick` must report the change from the level the caller was last
+    /// told, and must not keep reporting it. On a device this branch logged the same
+    /// "thermal nominal" line 131 times in 40 seconds because `tick` wrote `announced` itself and
+    /// `take_change` then always answered `None`, so the caller's guard never held.
     #[test]
-    fn the_first_poll_counts_as_unsettled_so_it_is_reported() {
+    fn a_level_is_announced_once_and_then_left_alone() {
         let mut thermal = Thermal::new(DeviceTier::Mobile);
-        assert!(!thermal.settled(), "nothing polled yet");
-        assert!(!thermal.described(), "nothing reported yet");
-        thermal.note_described();
-        assert!(thermal.described());
-        // A later world closes its own reporting.
-        thermal.world_closed();
-        assert!(!thermal.described(), "a new session reports its own first reading");
+        let start = Instant::now();
+        // The first poll: nothing to compare against, so nothing is announced.
+        assert!(!thermal.tick(start));
+        // The next poll after the interval, same level: still nothing.
+        assert!(!thermal.tick(start + POLL + Duration::from_millis(1)));
+        assert_eq!(thermal.take_change(), None);
     }
 
     #[test]

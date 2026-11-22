@@ -148,6 +148,24 @@ pub struct Entry {
 /// The table. Every `Native` here names a facility that exists in this repository; see the module
 /// docs for why that is the load-bearing rule.
 pub const TABLE: &[Entry] = &[
+    // ---- Java-level patching: absent by construction ----
+    Entry {
+        loader_point: "fabric-mixin",
+        family: Family::Lifecycle,
+        fidelity: Fidelity::Absent,
+        horizon: "",
+        note: "A mixin patches the game's own Java classes as they load. Horizon is a native Rust \
+               build with no JVM and no Java classes to patch, so the patch is dropped: the \
+               mod's blocks, items, recipes and textures still port, the behaviour does not.",
+    },
+    Entry {
+        loader_point: "fabric-access-widener",
+        family: Family::Lifecycle,
+        fidelity: Fidelity::Absent,
+        horizon: "",
+        note: "An access widener widens Java visibility at class-load time, which needs the same \
+               JVM a mixin does. Dropped with it.",
+    },
     // ---- lifecycle ----
     Entry {
         loader_point: "fabric-lifecycle-events",
@@ -360,6 +378,223 @@ pub const TABLE: &[Entry] = &[
                read once and left alone.",
     },
 ];
+
+
+/// What a Fabric mod's `fabric.mod.json` actually asks the loader for.
+///
+/// A `TABLE` lookup judges the points Horizon implements; this reads the *declaration* in the jar
+/// and turns it into exactly those point names, so the verdict is about the mod in hand rather than
+/// about Fabric in general. Fabric names these things in five separate places and a mod's metadata
+/// is authoritative on all of them:
+///
+/// * `entrypoints` — `main`, `client`, `server`, `modmenu`, each contributed by the `fabric-loader`
+///   and Fabric API entrypoint modules (`fabric-lifecycle-events-v1`'s client init is reached
+///   through `client`).
+/// * `depends` / `suggests` — the API modules themselves. A mod that depends on
+///   `fabric-key-binding-api-v1` is *using* keybinds whether or not it says so again in the code.
+/// * `mixins` — a Mixin config runs at class-load time against the game's own Java classes. No
+///   amount of shimming serves it, and naming it as absent is the whole reason this exists.
+/// * `accessWidener` — the same story one step further down: it widens Java visibility at load.
+/// * `custom.modmenu.*` — badges, which nothing reads.
+///
+/// Anything not recognised is left **unknown** rather than absent, because "this build has never
+/// heard of it" and "this build cannot do it" are different answers and only the second one should
+/// lower a verdict.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FabricDeclaration {
+    /// The loader points the mod's metadata names, in a stable order, ready for [`judge`].
+    pub points: Vec<String>,
+    /// Mixin configuration files (`"mixins": ["example.mixins.json"]`): Java bytecode patched into
+    /// the game's own classes, which Horizon's Rust build cannot host.
+    pub mixins: Vec<String>,
+    /// Access wideners: `"accessWidener"` plus the `aw` entries in `depends`.
+    pub access_wideners: Vec<String>,
+    /// What the mod says it needs from Fabric API, as it wrote them.
+    pub api_modules: Vec<String>,
+    /// The loader and game versions it was built for, so a mismatch is visible before install.
+    pub minecraft: Vec<String>,
+    pub loader: Vec<String>,
+}
+
+impl FabricDeclaration {
+    /// Read `fabric.mod.json`'s text. `None` when it is not a Fabric mod at all.
+    ///
+    /// Pure parsing: nothing is executed, no class is loaded, and a malformed file yields `None`
+    /// rather than an error, because the caller's next question is "then what is it?".
+    pub fn parse(text: &str) -> Option<Self> {
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        let object = json.as_object()?;
+        let mut declaration = Self::default();
+        // `schemaVersion` is Fabrics's "this is a fabric.mod.json" marker.
+        object.get("schemaVersion")?;
+
+        // Entrypoints: each role name is a loader point of its own.
+        if let Some(entrypoints) = object.get("entrypoints").and_then(|v| v.as_object()) {
+            for role in entrypoints.keys() {
+                let point = match role.as_str() {
+                    "main" => "fabric-loader:main",
+                    "client" => "fabric-loader:client",
+                    "server" => "fabric-loader:server",
+                    "modmenu" => "fabric-modmenu",
+                    other => {
+                        // A custom entrypoint is a Fabric API module's own: keep its name.
+                        declaration.points.push(format!("fabric:{other}"));
+                        continue;
+                    }
+                };
+                declaration.points.push(point.to_owned());
+            }
+        }
+
+        // Dependencies name the API modules the mod calls into.
+        for key in ["depends", "suggests"] {
+            let Some(map) = object.get(key).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for (module, wanted) in map {
+                match module.as_str() {
+                    "fabricloader" => declaration.loader.extend(versions(wanted)),
+                    "minecraft" => declaration.minecraft.extend(versions(wanted)),
+                    "java" => {}
+                    // `fabric-api` is the bundle: every module, so none of them is claimed
+                    // individually — the jar's own code decides which it uses, and the porter
+                    // reads that separately.
+                    "fabric-api" => {}
+                    other => {
+                        declaration.api_modules.push(other.to_owned());
+                        declaration.points.push(normalise_module(other));
+                    }
+                }
+            }
+        }
+
+        // Mixins and access wideners: Java-level, absent whatever the table says.
+        if let Some(list) = object.get("mixins") {
+            declaration.mixins.extend(strings(list));
+        }
+        if let Some(aw) = object.get("accessWidener").and_then(|v| v.as_str()) {
+            declaration.access_wideners.push(format!("{aw} (accessWidener)"));
+        }
+        if let Some(aw) = object.get("access_widener").and_then(|v| v.as_str()) {
+            declaration.access_wideners.push(format!("{aw} (access_widener)"));
+        }
+
+        declaration.points.sort();
+        declaration.points.dedup();
+        Some(declaration)
+    }
+
+    /// The points to judge, including the two Java-level ones as [`Fidelity::Absent`] by name so a
+    /// report cannot quietly omit them.
+    pub fn points_with_java_level(&self) -> Vec<String> {
+        let mut points = self.points.clone();
+        if !self.mixins.is_empty() {
+            points.push("fabric-mixin".to_owned());
+        }
+        if !self.access_wideners.is_empty() {
+            points.push("fabric-access-widener".to_owned());
+        }
+        points.sort();
+        points.dedup();
+        points
+    }
+
+    /// The verdict the launcher shows, combining this metadata with what the content porter found.
+    ///
+    /// [`Coverage::verdict`] judges the *loader points* alone, and a mixin mod has none that work,
+    /// so it answers `"no"` — true of the code and misleading about the mod, whose blocks, items and
+    /// recipes do port. Two verdicts exist because two things are being moved: content (which
+    /// `check::Verdict` judges) and behaviour (which this does). `carries_content` is the porter's
+    /// answer for the first.
+    pub fn verdict(&self, coverage: &Coverage, carries_content: bool) -> &'static str {
+        if self.needs_class_patching() {
+            // Its behaviour cannot run here. Content alone is "partly": something works.
+            return if carries_content { "partly" } else { "no" };
+        }
+        coverage.verdict()
+    }
+
+    /// Whether the mod cannot work here whatever the content porter carries: it patches game
+    /// classes at load time, which is code, not content.
+    pub fn needs_class_patching(&self) -> bool {
+        !self.mixins.is_empty() || !self.access_wideners.is_empty()
+    }
+
+    /// One sentence for the launcher, in the player's terms. Says what happened, what will not, and
+    /// what to do about it — the three things a verdict is for.
+    pub fn summary(&self, coverage: &Coverage) -> String {
+        if self.needs_class_patching() {
+            return format!(
+                "Uses {} mixin config(s){}: it patches the game's own Java classes when it loads, \
+                 which a native Rust build cannot host. Its blocks, items, recipes and textures \
+                 still port; the behaviour its code adds does not.",
+                self.mixins.len().max(self.access_wideners.len()),
+                if !self.access_wideners.is_empty() {
+                    " and an access widener"
+                } else {
+                    ""
+                }
+            );
+        }
+        match coverage.working_share() {
+            Some(share) if share >= 1.0 => {
+                "Every loader feature it asks for is served. Its content ports and its behaviour runs."
+                    .to_owned()
+            }
+            Some(share) => format!(
+                "{:.0}% of what it asks for is served; {} will not run.",
+                share * 100.0,
+                if coverage.absent.is_empty() {
+                    "the rest".to_owned()
+                } else {
+                    coverage.absent.join(", ")
+                }
+            ),
+            // Nothing declarable: the jar's `assets/` and `data/` are all it has.
+            None => "Content only as far as its metadata says: no entrypoints and no API modules."
+                .to_owned(),
+        }
+    }
+}
+
+/// A Fabric API module's name as a loader point: `fabric-key-binding-api-v1` keeps its own name.
+fn normalise_module(module: &str) -> String {
+    if module.starts_with("fabric-") {
+        module.to_owned()
+    } else {
+        format!("fabric-{module}")
+    }
+}
+
+/// `depends` values are `">=1.20"`, `"*"`, or a list of alternatives.
+fn versions(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn strings(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter(|v| v.is_string() || v.is_object())
+            .filter_map(|v| {
+                v.as_str().map(str::to_owned).or_else(|| {
+                    v.get("config")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_owned)
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// Look up one loader point. Exact match on the loader's own name.
 pub fn lookup(loader_point: &str) -> Option<&'static Entry> {
@@ -628,5 +863,92 @@ mod tests {
         assert!(Fidelity::Native.works());
         assert!(Fidelity::Adapted.works());
         assert!(!Fidelity::Absent.works());
+    }
+    /// The whole point of [`FabricDeclaration`]: a mixin mod is not "partly working", it cannot work
+    /// at all on a native build, and the verdict has to say so before the player installs it rather
+    /// than after they wonder why nothing happens.
+    #[test]
+    fn a_mixin_mod_is_absent_not_partly() {
+        let text = r#"{
+            "schemaVersion": 1,
+            "id": "example",
+            "entrypoints": { "main": ["com.example.Example"] },
+            "mixins": ["example.mixins.json"],
+            "depends": { "fabricloader": ">=0.15", "minecraft": "~1.21", "fabric-api": "*" }
+        }"#;
+        let declaration = FabricDeclaration::parse(text).expect("a fabric.mod.json");
+        assert!(declaration.needs_class_patching());
+        let coverage = judge(&declaration.points_with_java_level());
+        assert!(
+            coverage.absent.contains(&"fabric-mixin".to_owned()),
+            "a mixin config must be named absent, got {:?}",
+            coverage
+        );
+        // The loader points alone: nothing of what it asks for runs.
+        assert_eq!(coverage.verdict(), "no");
+        // The mod: its content still ports, so the launcher says "partly" rather than "no".
+        assert_eq!(declaration.verdict(&coverage, true), "partly");
+        assert_eq!(declaration.verdict(&coverage, false), "no");
+        let summary = declaration.summary(&coverage);
+        assert!(summary.contains("mixin"), "{summary}");
+        // It does not pretend the whole mod is dead: content still ports.
+        assert!(summary.contains("still port"), "{summary}");
+    }
+
+    /// A content-only Fabric mod — a jar of `assets/`, `data/` and no entrypoints — is the case the
+    /// porter handles well, and the summary must not imply a JVM it does not need.
+    #[test]
+    fn a_content_only_mod_declares_nothing_judgeable() {
+        let text = r#"{ "schemaVersion": 1, "id": "example", "depends": { "minecraft": "1.21" } }"#;
+        let declaration = FabricDeclaration::parse(text).expect("a fabric.mod.json");
+        assert!(!declaration.needs_class_patching());
+        let coverage = judge(&declaration.points_with_java_level());
+        assert_eq!(coverage.working_share(), None, "0/0 is not 0%");
+        assert!(declaration.summary(&coverage).contains("Content only"));
+    }
+
+    /// The API modules in `depends` are what the code will call: a keybind module is a keybind.
+    #[test]
+    fn api_modules_in_depends_become_the_points_the_code_uses() {
+        let text = r#"{
+            "schemaVersion": 1,
+            "id": "example",
+            "entrypoints": { "client": ["com.example.Client"] },
+            "depends": {
+                "fabric-key-binding-api-v1": "*",
+                "fabric-lifecycle-events-v1": ">=2.0"
+            }
+        }"#;
+        let declaration = FabricDeclaration::parse(text).expect("a fabric.mod.json");
+        assert!(declaration.points.contains(&"fabric-loader:client".to_owned()));
+        assert!(
+            declaration
+                .points
+                .contains(&"fabric-key-binding-api-v1".to_owned())
+        );
+        // And the table knows that module, so the verdict is evidence, not a guess.
+        assert!(lookup("fabric-key-binding-api-v1").is_some());
+    }
+
+    /// `accessWidener` and the `aw` dependency both mean load-time Java; neither is content.
+    #[test]
+    fn an_access_widener_alone_still_blocks_the_behaviour() {
+        let text = r#"{
+            "schemaVersion": 1,
+            "id": "example",
+            "accessWidener": "example.accesswidener"
+        }"#;
+        let declaration = FabricDeclaration::parse(text).expect("a fabric.mod.json");
+        assert!(declaration.needs_class_patching());
+        assert_eq!(declaration.access_wideners.len(), 1);
+        let coverage = judge(&declaration.points_with_java_level());
+        assert!(coverage.absent.contains(&"fabric-access-widener".to_owned()));
+    }
+
+    /// Not a Fabric jar: the parser answers `None` rather than inventing a verdict.
+    #[test]
+    fn a_jar_without_fabric_metadata_is_not_fabric() {
+        assert!(FabricDeclaration::parse("{}").is_none());
+        assert!(FabricDeclaration::parse("not json").is_none());
     }
 }

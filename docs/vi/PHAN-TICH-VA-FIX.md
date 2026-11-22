@@ -839,3 +839,108 @@ Lý do: nhánh `#[cfg(target_vendor = "apple")]` **không được biên dịch*
 1. phần **không phụ thuộc SDK** phải được đưa ra chỗ CI Linux kiểm được (như `task_vm_info_layout`),
    kèm test khoá offset/kích thước;
 2. khẳng định "đã sửa xong" chỉ được đưa ra **sau khi job iOS xanh**, không phải sau `cargo check`.
+
+---
+
+# §12 — Request #5: bạn đã chạy bản đó. Log nói gì, và vì sao "hiệu năng không khác gì"
+
+Cảm ơn bạn đã gửi `Horizon-diagnostics (6).txt` — nó trả lời dứt khoát ba câu hỏi khác nhau, và
+câu trả lời **không** giống nhau cho cả ba.
+
+## 12.1 Cơ chế đã chạy thật (đây là tin tốt, có bằng chứng)
+
+```
+[11:42:24] Horizon: device iPhone10,5 (DeviceProfile { tier: Legacy, soc: Some(A11),
+           promotion: false, physical_mib: 3072, available_mib: Some(1200) });
+           RAM Some(2973) MiB, jetsam limit Some(2098) MiB
+[11:40:45] Horizon: RAM 1363 MiB ceiling (measured, jetsam 2098 MiB), peak 8%, 0 warning(s)
+```
+
+Ba nhánh `unsafe` của §11 — `task_info(TASK_VM_INFO).phys_footprint`,
+`os_proc_available_memory()`, `sysctlbyname("hw.machine")` — **đã chạy và trả số thật**:
+- `hw.machine` = **`iPhone10,5`** ⇒ `A11` ⇒ `tier: Legacy`. Trước §11 nó rơi về `A12` cho mọi máy.
+- `phys_footprint + available` = **2098 MiB** đúng bằng iPhone X-class jetsam (nghiên cứu §9 dự đoán
+  ~2.1 GiB cho máy 3 GB, thực đo 2098).
+- Trần làm việc 1363 MiB = 2098 − 700 reserve của Legacy. Đỉnh dùng **8 %**.
+
+**Nhưng đó cũng chính là lý do hiệu năng không đổi:** đỉnh 8 % nghĩa là game **chưa bao giờ** chạm
+trần RAM. Cơ chế RAM đúng, chỉ là nó không phải nút thắt trên A11. Cùng lý do với nhiệt độ: máy ở
+`nominal` suốt. Bốn cơ chế "quản lý toàn diện" hiện **không có gì để cắt** trên máy này.
+
+## 12.2 Lỗi tôi gây ra ở §11, log bắt được: spam 131 dòng
+
+```
+Horizon: thermal nominal (100% resolution, 65% particles, 32 chunks)   × 131 trong 40 giây
+```
+
+Nguyên nhân: `Thermal::tick` **vừa** ghi `announced` **vừa** trả "có thay đổi", nên `take_change()`
+luôn trả `None`; `heat_tick` lại log khi `!described()`, và `take_change` không bao giờ đánh dấu
+⇒ log mỗi 2 giây, mãi mãi. Đã sửa: `tick` sở hữu đúng một lần chuyển trạng thái, `take_change` sở hữu
+`announced`, và test `a_level_is_announced_once_and_then_left_alone` khoá lại.
+
+## 12.3 Nhiệt độ: **chưa từng đọc được trên máy** — đã sửa
+
+`platform_level()` chỉ đọc biến môi trường `HORIZON_THERMAL`, thứ không ai set trên điện thoại.
+`horizon-ios-launcher::thermal_state()` có tồn tại nhưng **không có một dòng nào gọi**
+`set_thermal_state` trong toàn bộ repo, và phía Swift (`packaging/ios/Launcher`) **không có** chỗ nào
+nghe `thermalStateDidChangeNotification`. Nghĩa là: 131 dòng "nominal" kia là **hằng số giả**, không
+phải số đo. Nhiệt độ chưa bao giờ là tín hiệu thật.
+
+Đã sửa (3 lớp):
+1. `horizon-ios-launcher`: export `horizon_thermal_state(i32)` (`#[no_mangle]`, chỉ iOS).
+2. `Bridge.swift`: `Thermal.watch()` — đọc `ProcessInfo.thermalState` một lần và nghe notification,
+   đẩy sang Rust; gọi từ `horizonLauncherPresent`.
+3. `game/thermal.rs::platform_level()`: `thermal_state()` là nguồn thật; env chỉ để QA.
+   Thêm chống nhấp nháy: mức **xấu hơn** phải sống qua 1 lần poll mới được cắt chất lượng
+   (hạ res là hướng đắt tiền: một lần tạo lại target), mức tốt hơn thì tin ngay.
+
+## 12.4 Hiệu năng: nút thắt thật không nằm ở bốn cơ chế đó
+
+Log 5 phút này **không có một dòng** `pipelines ready`, `frame generation`, `first frame`,
+`GPU over budget`, `Draw resolution`. Bundle là `Game current` chỉ 2 dòng, nên **không thể** kết luận
+gì về FPS từ nó — nói thẳng: **tôi chưa có số đo FPS/frame time nào của bạn**. Muốn chẩn đoán hiệu
+năng thì cần một bundle có phần "Game current" đầy đủ (chơi ≥ 60 giây rồi mới xuất).
+
+Điều đọc được từ mã, và nó là nút thắt thật trên A11:
+- `budget = (count / 8).max(15)` — số section được vẽ lại mỗi frame, **không phụ thuộc GPU**.
+- `draw_budget` chỉ cắt **đuôi** danh sách solid khi `gpu_ms` vượt ngân sách. Trên iOS điều kiện tiên
+  quyết là `TIMESTAMP_QUERY`; nếu adapter Metal không cấp, `gpu_timer = None`,
+  `gpu_ms = None`, governor **không bao giờ** chạy ⇒ draw budget thành số trang trí. Đây là giả thuyết
+  số 1 cho "hiệu năng không cải thiện", và log lần này không đủ để xác nhận (thiếu dòng
+  `pipelines ready`). Dòng đó **đã có sẵn** trong `gfx.rs:4966` và in đúng
+  `GPU timer on|off`, nên chỉ cần một bundle có phần "Game current" đầy đủ là biết ngay. Nếu là `off`
+  thì `draw_budget` không có số đo và **không bao giờ** cắt gì — đó là lỗi phải sửa, không phải tinh chỉnh.
+
+## 12.5 Fabric: câu trả lời trung thực, và phần tôi đã làm được
+
+Yêu cầu của bạn là "port cho mod Fabric hoạt động". Tôi phải nói thẳng ranh giới kỹ thuật, vì hứa sai
+sẽ tệ hơn: **Horizon là build Rust native, không có JVM và không có class Java của game.** Trong toàn
+bộ repo, porter là **carry nội dung, không phải chạy code** — `carry.rs` tự ghi: *"Files are copied,
+never code"*. Vì vậy:
+
+| Loại mod Fabric | Kết quả thật trên Horizon |
+| --- | --- |
+| Chỉ `assets/` + `data/` (recipe, loot, tag, model, texture, lang) | **Chạy được**, porter carry sang content mod |
+| Thêm block/item khai báo bằng JSON | **Chạy được** (overlay registry, `data/<ns>/horizon/`) |
+| Có `mixins` (Sodium, Lithium, Iris, hầu hết mod tối ưu & mod cơ chế) | **Không thể chạy code**. Nội dung vẫn port, hành vi thì không |
+| Có `accessWidener` | Như trên |
+| Event/keybind/HUD bằng Java | Chỉ chạy nếu mod được viết lại thành **native mod** (Rust mixin bundle) — đó là con đường chính thức của Horizon (`docs/native-mods.md`) |
+
+Vì vậy "port Fabric" theo nghĩa **chạy được mọi mod Fabric** là điều không thể làm đúng; bất kỳ ai
+hứa điều đó là đang fake. Cái **làm được thật** và tôi đã làm ở vòng này:
+
+**`crates/horizon-mod-shim`: `FabricDeclaration`** — đọc chính `fabric.mod.json` của jar và trả lời
+trước khi cài, thay vì để người chơi đoán:
+- `entrypoints` (`main`/`client`/`server`/`modmenu`) → loader point tương ứng;
+- `depends`/`suggests` → các module Fabric API mà **code sẽ gọi** (`fabric-key-binding-api-v1`,
+  `fabric-lifecycle-events-v1`, …) ⇒ chấm theo bảng `TABLE` (13 native / 22 adapted / 8 absent);
+- `mixins`, `accessWidener` → **absent by construction**, và `needs_class_patching()`;
+- `verdict(&coverage, carries_content)` tách hai lớp: **nội dung** (porter quyết) và **hành vi**
+  (bảng shim quyết) — mod có mixin + có nội dung ⇒ `"partly"`, không có nội dung ⇒ `"no"`;
+- `summary()` nói bằng lời người chơi: cái gì port, cái gì không, vì sao.
+
+**17/17 test pass** trên crate này.
+
+**Giới hạn (nói thật):** `FabricDeclaration` hiện là **thư viện đã test**, chưa được launcher gọi.
+Bước tiếp theo cần nối vào `launcher_mods::port_jar` để verdict hiện trong app — tôi chưa làm vì nó
+đụng luồng cài đặt (một thay đổi lớn hơn, và cần bạn xác nhận hướng đi trước).

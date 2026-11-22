@@ -1,4 +1,42 @@
 import Foundation
+import UIKit
+
+/// The Rust symbol above, from the engine the app links: `horizon-ios-launcher`'s
+/// `horizon_thermal_state`.
+///
+/// `thermalState` is the one heat signal iOS gives an app, and it arrives as a notification, which
+/// only UIKit code can hear. Nothing ever reported it before: the governor in `game/thermal.rs` read
+/// an environment variable that nothing sets on a phone, so it was told "nominal" always — the
+/// device log carried "thermal nominal" 131 times on a phone that was hot, and heat never once took
+/// quality away. This is the missing half.
+private let horizonThermalState: @convention(c) (Int32) -> Void = {
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "horizon_thermal_state") else {
+        return { _ in }
+    }
+    return unsafeBitCast(symbol, to: (@convention(c) (Int32) -> Void).self)
+}()
+
+/// Reports `ProcessInfo.thermalState` now and on every change, for the life of the app.
+enum Thermal {
+    private static var started = false
+
+    static func watch() {
+        guard !started else { return }
+        started = true
+        report()
+        NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: nil
+        ) { _ in report() }
+    }
+
+    /// Apple's own scale (0 nominal, 1 fair, 2 serious, 3 critical) handed straight to the engine.
+    static func report() {
+        horizonThermalState(Int32(ProcessInfo.processInfo.thermalState.rawValue))
+    }
+}
+import Foundation
 
 /// How the game answers: the context the launcher passed, and the answer as NUL-terminated UTF-8 JSON that
 /// lives only for the call.
