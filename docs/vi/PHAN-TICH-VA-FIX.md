@@ -944,3 +944,28 @@ trước khi cài, thay vì để người chơi đoán:
 **Giới hạn (nói thật):** `FabricDeclaration` hiện là **thư viện đã test**, chưa được launcher gọi.
 Bước tiếp theo cần nối vào `launcher_mods::port_jar` để verdict hiện trong app — tôi chưa làm vì nó
 đụng luồng cài đặt (một thay đổi lớn hơn, và cần bạn xác nhận hướng đi trước).
+
+## 12.6 CI cho vòng này — đỏ rồi xanh, và cả hai lần đều do nhánh Apple
+
+| Commit | Job iOS | Lỗi / ghi chú |
+| --- | --- | --- |
+| `7c23a93` | ❌ failure | **6 error** trong `horizon-ios-launcher`: 5 `error: usage of an unsafe block` + 1 `unsafe no_mangle`. **Do tôi**: tôi thêm `deny(unsafe_code)` cho iOS vào một crate mà cả lý do tồn tại của nó là `dlopen`/`transmute` (chính vì `horizon-client` cấm `unsafe`). `cargo check` trên Linux **không thấy** vì không block nào ở đó được biên dịch. |
+| `d62146e` | ✅ success | `Finished release profile in 14m 34s`. Warning: **đúng 5 cái có sẵn** (`ride_is_tamed`, `hud_editor_drag_target`, `native_recipe_lookup`, `recipe_lookups_now`, `http_get`) — **không có warning mới nào**. |
+
+Đây là lần thứ hai trong hai request liên tiếp mà lỗi chỉ xuất hiện ở nhánh Apple; quy tắc §11.7
+(lấy "job iOS xanh" làm điều kiện, không phải `cargo check`) đã bắt được cả hai trước khi tới tay bạn.
+
+## 12.7 Tổng kết trung thực cho câu hỏi của bạn
+
+| Điều bạn nói | Sự thật từ log |
+| --- | --- |
+| "fix lỗi mod không có tác dụng" | **Chưa sửa được, và không thể sửa bằng shim.** Porter carry nội dung, không chạy code. Mod Fabric có `mixins` cần JVM. Vòng này tôi làm được phần **nói đúng sự thật trước khi cài** (`FabricDeclaration`, 17 test). |
+| "hiệu năng không cải thiện gì đáng kể" | **Khớp với log**: đỉnh RAM 8 % trần, nhiệt `nominal` ⇒ bốn cơ chế kia không có gì để cắt trên A11. Nút thắt thật là redraw mỗi frame và **khả năng đo GPU**; bundle lần này thiếu hẳn phần khởi động nên **chưa có số FPS nào** để chứng minh. |
+| "hệ thống tối ưu quản lý hoạt động thật" | Phần **đo** giờ hoạt động thật (3 probe kernel trả số đúng). Phần **hành động** (evict, hạ chất lượng vì nhiệt) vẫn chưa từng kích hoạt vì chưa có điều kiện kích hoạt trên máy này. |
+
+**Điều tôi cần từ bạn để làm tiếp, theo đúng thứ tự hiệu quả:**
+1. Một bundle chẩn đoán có **phần "Game current" đầy đủ**: chơi ≥ 60 giây trong world rồi mới xuất.
+   Cần thấy các dòng `pipelines ready (… GPU timer on|off)`, `frame generation …`, `first frame after`.
+   Chỉ một dòng `GPU timer off` là đủ để biết vì sao draw budget im lặng.
+2. Tên một mod Fabric cụ thể bạn muốn chạy. Tôi sẽ chạy porter trên jar đó và nói chính xác cái gì
+   port được, cái gì không — thay vì nói chung về "mod Fabric".
