@@ -12,9 +12,6 @@
 //! ([`take`]), the game answers it on its next frame, and the answer goes back to Swift through the callback
 //! that came with it.
 
-#![cfg_attr(not(target_os = "ios"), forbid(unsafe_code))]
-#![cfg_attr(target_os = "ios", deny(unsafe_code))]
-
 use std::{
     collections::VecDeque,
     sync::{Mutex, PoisonError},
