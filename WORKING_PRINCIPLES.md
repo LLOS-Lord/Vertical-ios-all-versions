@@ -111,3 +111,27 @@ Kết quả 3 lần push: `b02651b` ❌ (4 error Apple) → `cf73b92` ✅ (dead-
 `ram.rs`/`thermal.rs`/`draw_budget.rs` biến mất: `horizon-client` 11→4, `horizon-client-render` 2→1)
 → `5a7ef88`/`fcaa154` ✅ (thêm `[lints]` cho 3 crate: hết 3 warning `missing [lints]`).
 Tổng: **16 vấn đề trong log Apple trước request #4 → 5**, và 5 cái còn lại không thuộc request này.
+
+### 2026-11-22 — request #5 (log thiết bị thật: cơ chế chạy, nhưng hành vi thì không)
+
+**Bài học:** "đo được" ≠ "có tác dụng". Log máy thật chứng minh ba probe kernel của §11 trả số đúng
+(`iPhone10,5 → A11 → Legacy`, `jetsam 2098 MiB`, `ceiling 1363 MiB`), nhưng **đỉnh dùng chỉ 8 % trần
+RAM** và nhiệt `nominal` — nên không cơ chế nào có điều kiện kích hoạt. Nút thắt hiệu năng trên A11
+không phải RAM/nhiệt.
+
+**Lỗi của tôi mà log bắt được:** `thermal nominal` × 131 trong 40 giây. `Thermal::tick` vừa ghi
+`announced` vừa báo "đổi" ⇒ `take_change()` luôn `None` ⇒ logger chạy mỗi 2 giây. Đã tách quyền sở hữu:
+`tick` sở hữu đúng một lần chuyển, `take_change` sở hữu latch; có test khoá lại.
+
+**Nhiệt độ chưa từng là tín hiệu thật:** `platform_level()` chỉ đọc env, `set_thermal_state` không có
+caller, Swift không nghe `thermalStateDidChangeNotification`. Đã nối 3 lớp (Rust export + Bridge.swift
+watcher + đọc `thermal_state()` trước), thêm chống nhấp nháy (mức xấu hơn phải sống 1 poll).
+
+**Fabric — nói thật:** porter `carry.rs` ghi rõ "Files are copied, never code". Mod Fabric có mixins
+cần JVM, không thể chạy trên build Rust native; hứa khác là fake. Đã làm phần làm được thật:
+`horizon-mod-shim::FabricDeclaration` đọc `fabric.mod.json` của jar, chấm theo `TABLE`, tách verdict
+**nội dung** vs **hành vi** ("partly" khi content port được còn code thì không). 17/17 test.
+
+**Lại đỏ vì nhánh Apple:** `7c23a93` fail với 6 lỗi `unsafe` trong `horizon-ios-launcher` do tôi thêm
+`deny(unsafe_code)` vào crate sống bằng `dlopen`/`transmute`. `d62146e` xanh (14m34s), 5 warning còn
+lại đều có sẵn. Quy tắc "chỉ tin job iOS xanh" đã bắt được.
