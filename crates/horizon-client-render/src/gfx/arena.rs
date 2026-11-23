@@ -681,6 +681,23 @@ impl Arena {
         }
         released
     }
+    /// Bytes of the pages that hold nothing: what `trim` hands back to the driver on the next
+    /// frame, and therefore the only part of an eviction the kernel's `phys_footprint` sees.
+    ///
+    /// `release` gives a range back to its page's free list. A page is a `wgpu::Buffer`, so the
+    /// range is reusable but not *returned*: nothing shrinks until the page is empty and `trim`
+    /// takes it. A RAM budget that counts released ranges as freed bytes reports an eviction that
+    /// freed nothing — which is exactly what the device log showed, `freed 0 MiB` at 88% of the
+    /// ceiling, twice in a row, while the plan had in fact run.
+    pub fn retirable_bytes(&self) -> u64 {
+        self.pages
+            .iter()
+            .flatten()
+            .filter(|p| p.free.0.len() == 1 && p.free.0.get(&0) == Some(&p.capacity))
+            .map(|p| p.capacity * self.stride)
+            .sum()
+    }
+
     /// Drops every page; gives back their buffers, for a [`Graveyard`].
     pub fn clear(&mut self) -> Vec<wgpu::Buffer> {
         self.closing = None;

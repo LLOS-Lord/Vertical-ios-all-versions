@@ -58,6 +58,16 @@ pub struct Manifest {
     /// accepted here, so the manifest keeps loading once it is promoted.
     #[serde(default)]
     pub experimental: Vec<Capability>,
+    /// The licence, from a manifest written for a platform whose format has one. Kept because a
+    /// ported mod's pack carries it, and shown in the mods list.
+    ///
+    /// `deny_unknown_fields` on this struct is why it is here at all: the device's log carried
+    /// `horizon-mod.toml: TOML parse error ... unknown field \`license\``, which refused an entire
+    /// mod - it never appeared in the list - over a field that describes nothing the game runs.
+    /// A manifest is written by hand and by other platforms' packagers, so a key that only records
+    /// provenance must never be the reason a mod cannot be installed.
+    #[serde(default)]
+    pub license: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -449,6 +459,44 @@ mod tests {
         assert!(error.contains("is over"));
     }
     use super::*;
+
+    /// The exact manifest the device's log could not load, from the launcher's own error:
+    /// `horizon-mod.toml: TOML parse error at line 6, column 1 ... unknown field \`license\``.
+    /// A whole mod was refused, and never appeared in the list, over a key that records who wrote
+    /// it. Nothing the game runs depends on it, so it must parse - and be kept, because the mods
+    /// list shows it.
+    #[test]
+    fn a_manifest_that_states_a_licence_loads() {
+        let text = r#"
+id = "towers"
+name = "Towns and Towers"
+version = "1.0.0"
+api = "0.2"
+capabilities = ["registries"]
+license = "CC-BY-NC-SA-4.0"
+"#;
+        let manifest: Manifest = toml::from_str(text).expect("a licence must not refuse a mod");
+        assert_eq!(manifest.id, "towers");
+        assert_eq!(manifest.license.as_deref(), Some("CC-BY-NC-SA-4.0"));
+        // And a manifest without one is unchanged.
+        let plain: Manifest = toml::from_str(EXAMPLE).unwrap();
+        assert_eq!(plain.license, None);
+    }
+
+    /// `deny_unknown_fields` still holds: accepting a licence did not turn the manifest into a
+    /// free-for-all, where a misspelt capability would load as though the mod had not asked for it.
+    #[test]
+    fn a_misspelt_key_is_still_refused() {
+        let text = r#"
+id = "towers"
+name = "Towns and Towers"
+version = "1.0.0"
+api = "0.2"
+capabilites = ["registries"]
+"#;
+        let error = toml::from_str::<Manifest>(text).unwrap_err().to_string();
+        assert!(error.contains("capabilites"), "{error}");
+    }
 
     const EXAMPLE: &str = r#"
 id = "coords_hud"

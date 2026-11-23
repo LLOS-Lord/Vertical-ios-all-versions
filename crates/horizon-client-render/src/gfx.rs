@@ -1093,6 +1093,11 @@ pub struct Renderer {
     frame_ms: f32,
     /// The frame generation gate's last answer, so the reason is logged once per change.
     fg_reason: Option<horizon_frame_sched::Reason>,
+    /// When the frame time was last written to the log. The line below only fires when the
+    /// scheduler's *reason* changes, so a bundle carried two frame times in four minutes -
+    /// 16.7 ms at the title and 31.3 ms at the one stall. That is not enough to say whether the
+    /// game is smooth, which is the question the log exists to answer.
+    frame_log_due: Option<Instant>,
     /// How many section draws the GPU is given this frame (`draw_budget`): the governor's answer
     /// to the GPU's own frame time, applied as a cut to the tail of the solid range.
     draw_budget: draw_budget::DrawBudget,
@@ -5017,6 +5022,7 @@ impl Renderer {
             heat_scale_ceiling: 1.0,
             frame_ms: 16.7,
             fg_reason: None,
+            frame_log_due: None,
             window,
             target: previous.and_then(|renderer| renderer.target.clone()),
             parked: Vec::new(),
@@ -12298,6 +12304,38 @@ impl Renderer {
         // mesh landing) does not turn the scheduler off and one short one does not turn it on.
         let period_ms = started.elapsed().as_secs_f32() * 1000.0;
         self.frame_ms = self.frame_ms * 0.9 + period_ms.min(250.0) * 0.1;
+        // The frame time, on a clock of its own: once every five seconds of drawing, plus the
+        // per-frame counters that say what the frame was made of. A bundle then carries a trace
+        // across a whole session - walking, a chunk burst, a teleport, a menu - instead of the one
+        // number a reason change happened to coincide with.
+        //
+        // Five seconds and not one: this is on the render thread, it is the same `format!`-to-file
+        // cost the touch lines taught us about, and a trace is what is wanted rather than a stream.
+        // `frame_ms` is already smoothed over ten frames, so a burst shows as a rise rather than as
+        // one spiked sample.
+        let due = self
+            .frame_log_due
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5));
+        if due && !frame.title && !self.suspended {
+            self.frame_log_due = Some(Instant::now());
+            log::info!(
+                "Horizon: {:.1} ms/frame ({} gpu, {} waits {} ms), {} sections drawn of {} resident, \
+                 {} draw call(s), {}",
+                self.frame_ms,
+                gpu_ms
+                    .map(|g| format!("{g:.1} ms"))
+                    .unwrap_or_else(|| "no".into()),
+                if self.paced_elsewhere { "present" } else { "none" },
+                self.last_wait.as_secs_f32() * 1000.0,
+                self.drawn_sections,
+                self.sections.len(),
+                self.section_draw_calls,
+                // `(hidden, tested)` from the CPU's occluder test, or nothing when it is off.
+                self.culled_sections()
+                    .map(|(hidden, _)| format!("{} culled of {}", hidden[0] + hidden[1], hidden[0] + hidden[1] + self.drawn_sections))
+                    .unwrap_or_else(|| "no CPU occluder test".into()),
+            );
+        }
         // The draw budget aims at the display's own period: a frame that fits in one refresh window
         // needed no shortening, whatever the CPU did with the rest of it.
         let hz = self.display_hz();

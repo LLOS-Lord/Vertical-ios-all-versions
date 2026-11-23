@@ -33,7 +33,14 @@ impl Renderer {
         let on_screen: std::collections::HashSet<SectionKey> =
             self.visible.iter().map(|v| v.key).collect();
         if on_screen.len() >= self.sections.len() {
-            return 0;
+            // Nothing to drop *here* - but returning 0 is what made the budget report
+            // `freed 0 MiB` on a device at 88% and keep asking every frame. The sections and the
+            // LOD tiles both live in the arena, and `Arena::release` hands a range back to the
+            // page's free list without giving the page back: the buffer, the kernel's
+            // `phys_footprint` and jetsam's view of it are unchanged until a page is empty and
+            // `Arena::trim` returns it. So the honest figure for "what did that eviction give
+            // back" includes the pages the arena can now retire.
+            return self.retirable_page_bytes();
         }
         let stride = std::mem::size_of::<TerrainVertex>() as u64;
         let mut freed = 0u64;
@@ -49,7 +56,22 @@ impl Renderer {
             }
             self.release_section(key);
         }
-        freed
+        // Ranges given back are not bytes returned: a page whose last range this was is now
+        // empty and `Arena::trim` will hand its buffer over on the next frame. Counting them is
+        // the difference between a plan that says it freed 0 MiB and one that says what it will
+        // actually give the device.
+        if freed > 0 {
+            self.retirable_page_bytes()
+        } else {
+            0
+        }
+    }
+
+    /// Bytes of the arena pages that hold nothing at all, and that `Arena::trim` returns to the
+    /// driver on the next frame. What an eviction actually gives back to the device.
+    pub fn retirable_page_bytes(&self) -> u64 {
+        self.arena.retirable_bytes() + self.translucent_arena.as_ref().map_or(0, |a| a.retirable_bytes())
+            + self.sorted_indices.retirable_bytes()
     }
 
     /// Bytes of the block sprites and their mips. They are a *costly* cache, not a rebuildable

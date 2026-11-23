@@ -62,8 +62,10 @@ pub(super) fn touch_log_due() -> bool {
     static DROPPED: AtomicU32 = AtomicU32::new(0);
     if log_due("touch-drip", TOUCH_DRIP) {
         let dropped = DROPPED.swap(0, Ordering::Relaxed);
-        if dropped > 0 {
-            log::info!("touch: {dropped} finger event(s) went unlogged to keep this log readable");
+        // Only a gap worth explaining: the count being reported at all was 341 of the bundle's
+        // lines, one per burst, which is the flood arriving by another door.
+        if dropped >= 20 {
+            log::info!("touch: {dropped} finger events went unlogged in the last stretch");
         }
         true
     } else {
@@ -72,9 +74,13 @@ pub(super) fn touch_log_due() -> bool {
     }
 }
 
-/// The longest a touch diagnostic waits: a gesture's shape survives 33 ms, and a hundred fingers a
-/// second do not each get a line.
-const TOUCH_DRIP: std::time::Duration = std::time::Duration::from_millis(33);
+/// The longest a touch diagnostic waits. This is the *whole* input budget, and it has to be small:
+/// the first version of this gate allowed one line per 33 ms, which is 30 a second, and the bundle
+/// that followed still carried 3 989 `touch` lines of 4 473 - a third of the file - because the
+/// budget was generous enough that almost every event fitted. A log is read by a person looking for
+/// the one line that explains a stutter; at one line every two seconds, a minute of play costs 30
+/// lines of input and the RAM plan, the culling states and the frame time stay visible.
+const TOUCH_DRIP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
 /// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
@@ -725,10 +731,10 @@ impl Game<'_> {
                     self.settings.touch.interact,
                     self.entity_targeted()
                 ),
-                Out::MineStart => log::info!("touch hold: mining starts"),
-                Out::MineEnd => log::info!("touch hold: mining ends"),
-                Out::Press(control) => log::info!("touch press {control:?}"),
-                Out::Release(control) => log::info!("touch release {control:?}"),
+                Out::MineStart => log::debug!("touch hold: mining starts"),
+                Out::MineEnd => log::debug!("touch hold: mining ends"),
+                Out::Press(control) => log::debug!("touch press {control:?}"),
+                Out::Release(control) => log::debug!("touch release {control:?}"),
                 Out::Look(..) | Out::Move(..) => {}
             }
             match o {
@@ -789,7 +795,7 @@ impl Game<'_> {
                     let (dx, dy) = (f64::from(dx * scale), f64::from(dy * scale));
                     // Relative motion, as an agent's `mouse-move` adds it: no pointer position to compare with.
                     if log_due("look", std::time::Duration::from_secs(1)) {
-                        log::info!(
+                        log::debug!(
                             "touch look {dx:.2}, {dy:.2}; captured={} agent_pointer={} focused={}",
                             self.captured,
                             self.agent_pointer,

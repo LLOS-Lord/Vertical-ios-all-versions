@@ -1098,3 +1098,98 @@ và các sự kiện bị bỏ được **đếm** rồi nói trong dòng kế t
 hình dạng (bắt đầu / kết thúc), `press`/`release`/`hold` vẫn ở INFO vì đó là những dòng để chẩn đoán
 một nút bị kẹt. Test: `finger_events_cannot_fill_the_log` (8 000 sự kiện ⇒ không quá số dòng cho
 phép), `a_gesture_still_gets_a_line`.
+
+# §14 — Bundle 27.1: cơ chế đã chạy, và ba lỗi mới nó lộ ra
+
+Log `(8)`, 4 473 dòng. Đây là bundle đầu tiên **chứng minh** các cơ chế §13 hoạt động.
+
+## 14.1 Ba cơ chế đã chạy (bằng chứng)
+
+```
+Horizon renderer: pipelines ready (multi-draw on, occlusion culling on,
+                  GPU culling not offered here: a shader pack draws flat, GPU timer on)
+Horizon: culling — caves on, GPU off, entities async, particles async, leaves hidden;
+         25 columns of 24 sections, 2 draw section(s) resident, 32% of the mesh visible
+Horizon: RAM 1363 MiB ceiling (measured, jetsam 2098 MiB), peak 80%, ...
+Horizon: RAM high-water — freed 0 MiB, 86% of the 1363 MiB ceiling in use
+```
+
+- **`shortfall()` trả lời câu hỏi treo từ §13.7**: không phải iOS 16, mà là **shader pack đang bật
+  đang "draws flat"**. Đây là thứ *bạn* bật/tắt được — tắt pack shader là GPU culling có lại.
+  Đó chính là lý do tôi viết `shortfall`: một chữ `unavailable` đã làm cả hai lần điều tra trước
+  hiểu sai.
+- **Bốn chế độ culling đã được nêu tên** — đúng thứ bạn nói là "không rõ".
+- **Peak RAM nhảy 0% → 68% → 80% → 88%** thay vì kẹt ở 0–8%: budget giờ đọc đúng số kernel.
+
+## 14.2 Lỗi #1 — `freed 0 MiB`: plan chạy nhưng không trả lại gì
+
+`RAM high-water — freed 0 MiB, 86%` rồi `88%`, rồi **im lặng 4 phút** ở 88%.
+
+Nguyên nhân gốc: `Arena::release()` trả một range về **free list của page**, không trả page.
+Buffer, `phys_footprint`, và cái jetsam nhìn thấy **không đổi** cho tới khi page rỗng và
+`Arena::trim()` thu hồi nó. Nên `release_offscreen_sections()` trả `0` — và tệ hơn, `done(0)` báo
+governor "đã evict xong", nên nó **thôi hỏi**. Cơ chế duy nhất để kéo process về dưới design share
+đã tự tắt, trong khi con số vẫn 88%.
+
+Đã sửa:
+- `Arena::retirable_bytes()` — byte của các page **rỗng** (thứ `trim` thật sự trả lại).
+- `release_offscreen_sections()` trả về số đó thay vì 0.
+- `Budget` đếm `reclaimed_bytes` và `barren_plans`; `barren()` nói thẳng khi ≥2 plan liên tiếp
+  không free được gì mà vẫn >50%. `describe()` in `N MiB reclaimed, M plan(s) that freed nothing`.
+
+Test: `a_plan_that_frees_nothing_is_counted_not_hidden` — dựng đúng trạng thái log (1200/1363 MiB,
+visible_share 1.0, không section nào evictable).
+
+## 14.3 Lỗi #2 — touch vẫn chiếm 89% log
+
+Bundle trước 15 505/15 693 dòng. Bundle này **3 989/4 473 = 89%**. Drip tôi thêm ở §13.8 **không
+phải** thứ giới hạn: nó cho 1 dòng/33 ms = **30 dòng/giây**, quá rộng, nên gần như mọi sự kiện vẫn
+lọt. Và mỗi cú tap ghi **5 dòng**: `Started`, `look`, `press`, `Ended`, `release`.
+
+| dòng | số lượng |
+|---|---|
+| `touch … Started` | 915 |
+| `touch … Ended` | 852 |
+| `touch menu …` | 653 |
+| `touch press` / `release` | 430 + 430 |
+| `touch look` | 218 |
+| `touch: N finger events…` | 341 |
+
+Đã sửa: budget còn **1 dòng / 2 giây** (cả module); `press`/`release`/`hold`/`look` xuống `debug`;
+dòng "N events went unlogged" chỉ in khi ≥20 bị bỏ (341 dòng đó chính là flood đến bằng cửa khác).
+Ước tính: một phút chơi còn ~30 dòng input thay vì ~1 000.
+
+## 14.4 Lỗi #3 — log không có số FPS
+
+`frame_ms` **có tồn tại** nhưng chỉ được in khi *lý do* frame-generation đổi ⇒ cả bundle có đúng
+**2** con số frame: `16.7 ms` (title) và `31.3 ms` (một stall). Không thể nói gì về độ mượt.
+
+Đã thêm: mỗi **5 giây** một dòng
+```
+Horizon: 16.7 ms/frame (4.2 ms gpu, none waits 0.3 ms), 1840 sections drawn of 2100 resident,
+         312 draw call(s), 260 culled of 2100
+```
+Đây là thứ để lần sau trả lời "có cải thiện không" bằng số, không bằng cảm giác.
+
+## 14.5 Mod không cài được — đúng yêu cầu #3
+
+```
+Launcher error: horizon-mod.toml: TOML parse error at line 6, column 1
+  license = "CC-BY-NC-SA-4.0"
+unknown field `license`, expected one of id, name, version, ...
+```
+`deny_unknown_fields` từ chối **cả mod** chỉ vì một trường ghi công giấy phép. Không có gì game
+chạy phụ thuộc vào nó. Đã thêm `license: Option<String>` vào `Manifest` (hiện trong danh sách mod).
+Test: `a_manifest_that_states_a_licence_loads` (đúng nội dung file của bạn),
+`a_misspelt_key_is_still_refused` (vẫn bắt lỗi chính tả thật).
+
+## 14.6 Nói thật
+
+- `frame generation unsupported (31.3 ms real, 32.26 Hz)` — đo được **31 ms/frame** ở thời điểm đó,
+  tức ~32 fps, và A11 bị loại khỏi frame generation theo thiết kế. Giờ nó sẽ nằm trong dòng 5 giây.
+- `startup handoff 2832 ms (renderer 2392 ms)` — chậm hơn §13 (948 ms); 2392 ms là **tạo pipeline**
+  (12:03:04 → 12:03:14). Đây là chi phí lần đầu, không phải trong game.
+- 2 worker thread trên A11 6 nhân vẫn chưa sửa (iOS 16.7 thiếu `hw.perflevel0.physicalcpu`).
+- Chưa có test chạy được cho `ram.rs`/`touch.rs` (target `--lib` của `horizon-client` có 74 lỗi cũ);
+  đã type-check, không thêm lỗi nào. Test ở crate khác: arena 19/19, gpu_culling 20/20,
+  mods manifest 9/9.

@@ -63,6 +63,12 @@ const FLOOR_MIB: u64 = 256;
 /// chunk burst in the next second would spend it.
 pub const OUT_OF_HEADROOM_BYTES: u64 = 32 << 20;
 
+/// How many plans in a row may free nothing before the budget says it has run out of caches to
+/// evict. Two, because the first can be a plan whose ranges went back to a page that is not yet
+/// empty (`Arena::trim` returns it on the next frame): the second, at the same utilisation, means
+/// the caches really are gone.
+const BARREN_PLANS: u32 = 2;
+
 /// What the probe learned about the device this run.
 ///
 /// Every field is `Option` because every one of them comes from a platform call that a non-Apple
@@ -211,6 +217,16 @@ pub struct Budget {
     peak: f32,
     /// Evictions forced by jetsam headroom rather than by a watermark.
     emergencies: u32,
+    /// How many bytes the plans this run made actually took out of the process, and how many of
+    /// them took out nothing at all.
+    ///
+    /// The device's log said `RAM high-water — freed 0 MiB` twice in a row at 88% of the ceiling:
+    /// the governor had stopped asking (`plan_done(0)` tells it the eviction is spent), so the one
+    /// mechanism meant to bring the process back under the design share had already given up while
+    /// the figure stayed where it was. A budget has to know that it is failing, and say so, rather
+    /// than reporting the utilisation and hoping.
+    reclaimed_bytes: u64,
+    barren_plans: u32,
 }
 
 impl Budget {
@@ -229,6 +245,8 @@ impl Budget {
             warnings: 0,
             peak: 0.0,
             emergencies: 0,
+            reclaimed_bytes: 0,
+            barren_plans: 0,
         }
     }
 
@@ -260,11 +278,14 @@ impl Budget {
             None => String::new(),
         };
         format!(
-            "RAM {} MiB ceiling ({source}{limit}), peak {:.0}%, {} warning(s), {} headroom eviction(s)",
+            "RAM {} MiB ceiling ({source}{limit}), peak {:.0}%, {} warning(s), {} headroom \
+             eviction(s); {} MiB reclaimed, {} plan(s) that freed nothing",
             self.ceiling_mib,
             self.peak * 100.0,
             self.warnings,
-            self.emergencies
+            self.emergencies,
+            self.reclaimed_bytes >> 20,
+            self.barren_plans
         )
     }
 
@@ -356,7 +377,19 @@ impl Budget {
     /// The eviction plan finished and freed `bytes`. The governor needs it to know whether to keep
     /// evicting or to stop; withholding it is how a governor evicts every frame forever.
     pub fn done(&mut self, bytes: u64) {
+        self.reclaimed_bytes = self.reclaimed_bytes.saturating_add(bytes);
+        if bytes == 0 {
+            self.barren_plans = self.barren_plans.saturating_add(1);
+        }
         self.governor.plan_done(bytes);
+    }
+
+    /// Whether the last plans have stopped giving anything back: over [`BARREN_PLANS`] plans in a
+    /// row that freed nothing, at a utilisation still above the low-water mark. That is a budget
+    /// that has run out of things to evict - a state worth saying out loud, because the alternative
+    /// is a log that reports 88% forever and looks like a policy that is working.
+    pub fn barren(&self) -> bool {
+        self.barren_plans >= BARREN_PLANS && self.peak > 0.5
     }
 
     /// The report counters: `(ceiling, plan bytes, plans made)`.
@@ -723,6 +756,37 @@ mod tests {
         };
         assert!(budget.frame(census, Instant::now(), 0.016).is_none());
         assert_eq!(budget.utilisation(), 0.0);
+    }
+
+    /// The device's log, again: `RAM high-water — freed 0 MiB, 86%` and `88%` on consecutive
+    /// frames, then nothing more at 88%. The governor had been told the eviction was spent
+    /// (`plan_done(0)`), so it stopped asking, and the budget went on reporting a peak that had
+    /// stopped moving. A budget that cannot tell "there was nothing to give back" from "the
+    /// pressure is gone" is the one thing this module exists to avoid.
+    #[test]
+    fn a_plan_that_frees_nothing_is_counted_not_hidden() {
+        let device = device(Some(2098), 1200, 898);
+        let mut budget = Budget::for_device(&device);
+        let census = Census {
+            measured_bytes: Some(1200 << 20),
+            available_bytes: Some(898 << 20),
+            mesh_bytes: 40 << 20,
+            visible_share: 1.0,
+            ..Census::default()
+        };
+        // Every section visible: nothing is evictable, which is the state the log was in.
+        let plan = budget.frame(census, Instant::now(), 0.016);
+        assert!(plan.is_some(), "1200 of 1363 is over the high mark");
+        budget.done(0);
+        budget.done(0);
+        assert!(budget.barren(), "two plans that freed nothing, still over half: say so");
+        assert!(budget.describe().contains("2 plan(s) that freed nothing"));
+        // A plan that does give bytes back is not counted as barren.
+        let mut budget = Budget::for_device(&device);
+        let _ = budget.frame(census, Instant::now(), 0.016);
+        budget.done(3 << 20);
+        assert!(!budget.barren());
+        assert!(budget.describe().contains("3 MiB reclaimed"));
     }
 
 }
